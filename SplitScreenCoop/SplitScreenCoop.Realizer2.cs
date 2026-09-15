@@ -30,6 +30,9 @@ namespace SplitScreenCoop
             realizer2 = null;
             orig(self, warpUsed);
             if (rebuild || self.game?.session?.Players?.Count > 1) MakeRealizer2(self.game);
+            EnsureStableCameraAssignments(self.game);
+            RefreshActiveCameraRendering(self.game, "world loaded");
+            LogCameraSnapshot(self.game, "world loaded", true);
             ConsiderColapsing(self.game, true);
         }
 

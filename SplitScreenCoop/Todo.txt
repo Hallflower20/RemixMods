@@ -1,9 +1,9 @@
-SplitScreen Co-op 0.2.0 status
+SplitScreen Co-op 0.2.2 status
 ================================
 
 Implemented
 -----------
-[x] Remix menu for permanent split and preferred two-player split direction.
+[x] Automatic split mode with Remix options for permanent split and dual display.
 [x] Smooth split-camera following.
 [x] Stable camera ownership: player 1/player 2 remain left/right.
 [x] Three-player triangle and four-player corner layouts.
@@ -14,16 +14,20 @@ Implemented
 [x] Self-sufficient shelter, starvation, game-over, and gate checks.
 [x] Players captured into a den are considered missing for shelter/gate checks.
 [x] Death gong for each player.
-[x] Player 2 class selector and Remix color pickers.
 [x] Separate shelter persistence and wake placement within the loaded world/region.
 [x] Player 2 karma-flower death position.
 [x] Friends saved by non-primary players count at cycle end.
 [x] Player 2 sign-in/input initialization without Jolly enabled.
 [x] Watcher per-camera level textures, ripple buffers, masks, and shader keywords.
+[x] Camera health diagnostics and stalled render-target recovery.
+[x] Delayed room-camera resync after missed transitions.
+[x] Split-camera map input no longer enters vanilla camera cycling.
+[x] Adaptive layouts use only living players and reflow after deaths.
 
 Release validation
 ------------------
 [ ] Run a full Watcher cycle with players in different rooms and shelters.
 [ ] Exercise Watcher warp/ripple rooms with two, three, and four players.
+[ ] Repeatedly open each player's map before, during, and after region changes.
 [ ] Exercise dual-display enable/disable across a game restart.
 [ ] Confirm Hunter cycle expiry and all campaign-specific endings in co-op.

@@ -9,19 +9,18 @@ namespace SplitScreenCoop
     {
         internal static bool restoringShaderState;
         internal static int lastCompositorClearFrame = -1;
-        internal static readonly Dictionary<string, bool> globalShaderKeywords = new Dictionary<string, bool>();
         //Envelop camera-related stuff that does shader.set calls so we know the calling camera index and can re-apply those in a sane way later
         //not 100% robust (currently we don't store "global" assignments that one camera might choose to overwrite or not)
 
         public void RoomCamera_MoveCamera_Room_int(On.RoomCamera.orig_MoveCamera_Room_int orig, RoomCamera self, Room newRoom, int camPos)
         {
-            ConsiderColapsing(self.game, false); // this one is special
-
             var prev = curCamera;
             try
             {
                 curCamera = self.cameraNumber;
                 orig(self, newRoom, camPos);
+                NoteRoomCameraMoved(self, "MoveCamera(room)");
+                CaptureRoomCameraShaderKeywords(self);
             }
             finally
             {
@@ -36,6 +35,8 @@ namespace SplitScreenCoop
             {
                 curCamera = self.cameraNumber;
                 orig(self, camPos);
+                NoteRoomCameraMoved(self, "MoveCamera(position)");
+                CaptureRoomCameraShaderKeywords(self);
             }
             finally
             {
@@ -50,6 +51,8 @@ namespace SplitScreenCoop
             {
                 curCamera = self.cameraNumber;
                 orig(self, timeStacker, timeSpeed);
+                NoteRoomCameraDrawn(self);
+                CaptureRoomCameraShaderKeywords(self);
                 OffsetHud(self);
             }
             finally
@@ -65,6 +68,8 @@ namespace SplitScreenCoop
             {
                 curCamera = self.cameraNumber;
                 orig(self);
+                NoteRoomCameraUpdated(self);
+                CaptureRoomCameraShaderKeywords(self);
             }
             finally
             {
@@ -232,26 +237,37 @@ namespace SplitScreenCoop
                 listener.ShaderTextures[Shader.PropertyToID(name)] = value;
         }
 
-        public delegate void delShaderKeyword(string keyword);
-        public void Shader_EnableKeyword(delShaderKeyword orig, string keyword)
+        private static void CaptureRoomCameraShaderKeywords(RoomCamera camera)
         {
-            orig(keyword);
-            RecordShaderKeyword(keyword, true);
+            if (camera == null || camera.cameraNumber < 0 || camera.cameraNumber >= cameraListeners.Length) return;
+            CameraListener listener = cameraListeners[camera.cameraNumber];
+            if (listener == null) return;
+
+            Room room = camera.room ?? camera.loadingRoom;
+            listener.ShaderKeywords["VOIDSEA"] = camera.voidSeaMode;
+            listener.ShaderKeywords["COMBINEDLEVEL"] = camera.levelTexCombiner != null && camera.levelTexCombiner.isActive;
+            listener.ShaderKeywords["RIPPLE"] = camera.rippleData != null &&
+                (camera.rippleData.isPassAdded || camera.rippleData.gameplayRippleActive);
+            listener.ShaderKeywords["GAMEPLAYRIPPLETEXTURE"] = camera.rippleData != null &&
+                camera.rippleData.hasGameplayScreen;
+
+            if (room == null) return;
+            listener.ShaderKeywords["RoomHasWater"] = !room.abstractRoom.gate && !room.abstractRoom.shelter && room.waterObject != null;
+            listener.ShaderKeywords["RoomHasBrainMold"] = room.brainMold != null;
+            listener.ShaderKeywords["RoomHasDeathFall"] = room.deathFallGraphic != null;
+            listener.ShaderKeywords["Gutter"] = room.roomSettings.GetEffectAmount(RoomSettings.RoomEffect.Type.DirtyWater) > 0f;
+            listener.ShaderKeywords["SNOW_ON"] = room.snowObject != null && room.snowObject.visibleSnow > 0;
+            listener.ShaderKeywords["URBANLIFE"] = room.urbanLifeCount > 0;
+            listener.ShaderKeywords["HR"] = Region.IsRubiconRegion(room.world.name) ||
+                room.roomSettings.GetEffect(RoomSettings.RoomEffect.Type.LavaSurface) != null;
         }
 
-        public void Shader_DisableKeyword(delShaderKeyword orig, string keyword)
+        private static void RecordCameraShaderKeyword(RoomCamera camera, string keyword, bool enabled)
         {
-            orig(keyword);
-            RecordShaderKeyword(keyword, false);
-        }
-
-        private static void RecordShaderKeyword(string keyword, bool enabled)
-        {
-            if (restoringShaderState || string.IsNullOrEmpty(keyword)) return;
-            if (curCamera >= 0 && curCamera < cameraListeners.Length && cameraListeners[curCamera] != null)
-                cameraListeners[curCamera].ShaderKeywords[keyword] = enabled;
-            else
-                globalShaderKeywords[keyword] = enabled;
+            if (camera == null || string.IsNullOrEmpty(keyword)) return;
+            int index = camera.cameraNumber;
+            if (index >= 0 && index < cameraListeners.Length && cameraListeners[index] != null)
+                cameraListeners[index].ShaderKeywords[keyword] = enabled;
         }
     }
 }

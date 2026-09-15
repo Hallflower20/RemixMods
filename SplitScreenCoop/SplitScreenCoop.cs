@@ -19,7 +19,7 @@ using System.Runtime.CompilerServices;
 
 namespace SplitScreenCoop
 {
-    [BepInPlugin("com.henpemaz.splitscreencoop", "SplitScreen Co-op", "0.2.0")]
+    [BepInPlugin("com.henpemaz.splitscreencoop", "SplitScreen Co-op", "0.2.2")]
     public partial class SplitScreenCoop : BaseUnityPlugin
     {
         public static SplitScreenCoopOptions Options;
@@ -63,7 +63,6 @@ namespace SplitScreenCoop
         }
 
         public static SplitMode CurrentSplitMode;
-        public static SplitMode preferedSplitMode = SplitMode.SplitVertical;
         public static bool alwaysSplit;
         public static bool dualDisplays;
         public static bool stickTogetherEnabled;
@@ -71,6 +70,7 @@ namespace SplitScreenCoop
         public static Camera[] fcameras = new Camera[4];
         public static CameraListener[] cameraListeners = new CameraListener[4];
         public static List<DisplayExtras> displayExtras = new();
+        public static readonly List<int> renderedCameraNumbers = new List<int>();
 
         public static Camera camera2;
         public static Camera camera3;
@@ -183,9 +183,6 @@ namespace SplitScreenCoop
                 On.MoreSlugcats.GourmandMeter.Draw += GourmandMeter_Draw;
 
                 On.Player.ctor += Player_ctor;
-                On.Player.GetInitialSlugcatClass += Player_GetInitialSlugcatClass;
-                On.PlayerGraphics.ApplyPalette += PlayerGraphics_ApplyPalette;
-                On.PlayerGraphics.DrawSprites += PlayerGraphics_DrawSprites;
                 IL.HUD.HUD.InitSinglePlayerHud += InitSinglePlayerHud;
                 HookEndpointManager.Modify(typeof(JollyCoop.JollyHUD.JollyPlayerSpecificHud).GetProperty("Camera").GetGetMethod(),
                     new ILContext.Manipulator(JollyPlayerSpecificHud_get_Camera));
@@ -228,6 +225,8 @@ namespace SplitScreenCoop
                 On.Watcher.RippleCameraData.SetGlobals += RippleCameraData_SetGlobals;
                 On.Watcher.LevelTexCombiner.Initialize += LevelTexCombiner_Initialize;
                 On.Watcher.LevelTexCombiner.CreateBuffer += LevelTexCombiner_CreateBuffer;
+                On.Watcher.LevelTexCombiner.RemovePass += LevelTexCombiner_RemovePass;
+                On.Watcher.LevelTexCombiner.RemoveAllBuffers += LevelTexCombiner_RemoveAllBuffers;
                 On.Watcher.LevelTexCombiner.SetGlobals += LevelTexCombiner_SetGlobals;
                 On.Watcher.LevelTexCombiner.UnSetGlobals += LevelTexCombiner_UnSetGlobals;
                 On.Watcher.DynamicLevelElement.AddLevelCombiner += DynamicLevelElement_AddLevelCombiner;
@@ -267,13 +266,7 @@ namespace SplitScreenCoop
                     typeof(SplitScreenCoop).GetMethod("Shader_SetGlobalTexture"), this);
                 new Hook(typeof(Shader).GetMethod("SetGlobalTexture", new Type[] { typeof(string), typeof(Texture) }),
                     typeof(SplitScreenCoop).GetMethod("Shader_SetGlobalTextureString"), this);
-                new Hook(typeof(Shader).GetMethod("EnableKeyword", new Type[] { typeof(string) }),
-                    typeof(SplitScreenCoop).GetMethod("Shader_EnableKeyword"), this);
-                new Hook(typeof(Shader).GetMethod("DisableKeyword", new Type[] { typeof(string) }),
-                    typeof(SplitScreenCoop).GetMethod("Shader_DisableKeyword"), this);
-                new Hook(typeof(Camera).GetProperty("main", BindingFlags.Public | BindingFlags.Static).GetGetMethod(),
-                    typeof(SplitScreenCoop).GetMethod("Camera_get_main"), this);
-                new Hook(typeof(Watcher.MaskSource).GetProperty("IsVisible", BindingFlags.Public | BindingFlags.Instance).GetGetMethod(),
+                new Hook(typeof(Watcher.MaskSource).GetProperty("isVisible", BindingFlags.Public | BindingFlags.Instance).GetGetMethod(),
                     typeof(SplitScreenCoop).GetMethod("MaskSource_get_IsVisible"), this);
 
                 Logger.LogInfo("OnModsInit done");
@@ -326,7 +319,6 @@ namespace SplitScreenCoop
 
         public void ReadSettings()
         {
-            preferedSplitMode = Options.PreferredSplitMode.Value;
             dualDisplays = Options.DualDisplays.Value;
             alwaysSplit = Options.AlwaysSplit.Value;
 
@@ -334,7 +326,6 @@ namespace SplitScreenCoop
             {
                 Screen.fullScreen = true;
                 InitSecondDisplay();
-                preferedSplitMode = SplitMode.NoSplit;
                 alwaysSplit = false;
             }
             else
@@ -424,6 +415,9 @@ namespace SplitScreenCoop
             for (int i = 0; i < fcameras.Length; i++)
             {
                 fcameras[i].depth = 100f + i;
+                // Watcher depth effects use Camera.main in their constructors. Give
+                // every split camera the required depth texture up front instead.
+                fcameras[i].depthTextureMode |= DepthTextureMode.Depth;
                 var listener = fcameras[i].gameObject.AddComponent<CameraListener>();
                 cameraListeners[i] = listener;
                 listener.AttachTo(fcameras[i], Display.main);
@@ -443,10 +437,15 @@ namespace SplitScreenCoop
         {
             orig(self, displayWidth);
 
+            var refreshedDisplays = new HashSet<Display>();
+            foreach (var listener in cameraListeners)
+                if (listener?.display != null && refreshedDisplays.Add(listener.display))
+                    listener.display.Extras().ReinitRenderTexture();
             foreach (var l in cameraListeners)
             {
-                l?.ReinitRenderTexture();
+                l?.ReinitRenderTexture(false);
             }
+            Logger.LogInfo($"[CameraRenderTarget] frame={Time.frameCount} rebuilt after FScreen resize; displayWidth={displayWidth}");
         }
 
         /// <summary>
@@ -486,7 +485,7 @@ namespace SplitScreenCoop
                 c.EmitDelegate<Action<RainWorldGame>>((self) =>
                 {
                     Logger.LogInfo("RainWorldGame_ctor1 hookpoint");
-                    if (self.IsStorySession && self.session.Players.Count > 1 && (preferedSplitMode != SplitMode.NoSplit || dualDisplays))
+                    if (self.IsStorySession && self.session.Players.Count > 1)
                     {
                         Logger.LogInfo("RainWorldGame_ctor1 creating roomcamera2");
                         var cams = self.cameras;
@@ -527,6 +526,7 @@ namespace SplitScreenCoop
             additionalRealizers.Clear();
             pendingKarmaFlowerPosition = null;
             CurrentSplitMode = SplitMode.NoSplit;
+            ResetCameraDiagnostics();
 
             orig(self, manager);
 
@@ -542,12 +542,12 @@ namespace SplitScreenCoop
                     else
                         self.cameras[i].followAbstractCreature = self.session.Players[0];
                 }
-                SetSplitMode(alwaysSplit ? ResolveSplitMode(preferedSplitMode, self.session.Players.Count) : SplitMode.NoSplit, self);
+                SetSplitMode(alwaysSplit ? ResolveSplitMode(self.session.Players.Count) : SplitMode.NoSplit, self, "game start");
             }
             else
             {
                 Logger.LogInfo("no camera2");
-                SetSplitMode(SplitMode.NoSplit, self);
+                SetSplitMode(SplitMode.NoSplit, self, "single camera game start");
             }
             Logger.LogInfo("RainWorldGame_ctor done");
         }
@@ -580,7 +580,7 @@ namespace SplitScreenCoop
         public void RainWorldGame_ShutDownProcess(On.RainWorldGame.orig_ShutDownProcess orig, RainWorldGame self)
         {
             Logger.LogInfo("RainWorldGame_ShutDownProcess cleanups");
-            SetSplitMode(SplitMode.NoSplit, self);
+            SetSplitMode(SplitMode.NoSplit, self, "game shutdown");
             if (dualDisplays && DualDisplaySupported())
             {
                 cameraListeners[1].mirrorMain = true;
@@ -632,14 +632,27 @@ namespace SplitScreenCoop
             if (self.cameras.Length > 1)
             {
                 EnsureStableCameraAssignments(self);
-                bool splitTargets = self.cameras.Select(x => x.room != null ? new RoomTarget(x.room.abstractRoom.index, x.currentCameraPosition) : new RoomTarget()).Distinct().Count() != 1;
-                if (CurrentSplitMode == SplitMode.NoSplit && preferedSplitMode != SplitMode.NoSplit && splitTargets)
+                List<int> aliveCameras = GetAliveCameraNumbers(self);
+                bool splitTargets = aliveCameras
+                    .Select(cameraNumber => self.cameras.FirstOrDefault(camera => camera.cameraNumber == cameraNumber))
+                    .Where(camera => camera != null)
+                    .Select(camera => camera.room != null
+                        ? new RoomTarget(camera.room.abstractRoom.index, camera.currentCameraPosition)
+                        : new RoomTarget())
+                    .Distinct()
+                    .Count() > 1;
+                SplitMode desiredMode = !dualDisplays && aliveCameras.Count > 1 && (alwaysSplit || splitTargets)
+                    ? ResolveSplitMode(aliveCameras.Count)
+                    : SplitMode.NoSplit;
+                List<int> desiredRenderedCameras = dualDisplays
+                    ? aliveCameras.Take(2).ToList()
+                    : desiredMode == SplitMode.NoSplit ? aliveCameras.Take(1).ToList() : aliveCameras;
+                if (desiredMode != CurrentSplitMode || !renderedCameraNumbers.SequenceEqual(desiredRenderedCameras))
                 {
-                    SetSplitMode(ResolveSplitMode(preferedSplitMode, self.session.Players.Count), self);
-                }
-                else if (CurrentSplitMode != SplitMode.NoSplit && !splitTargets && !alwaysSplit)
-                {
-                    SetSplitMode(SplitMode.NoSplit, self);
+                    string reason = desiredMode != CurrentSplitMode
+                        ? (desiredMode == SplitMode.NoSplit ? "camera targets converged or one survivor" : "camera targets diverged or survivor count changed")
+                        : "active survivor cameras changed";
+                    SetSplitMode(desiredMode, self, reason);
                 }
 
                 if (CurrentSplitMode != SplitMode.NoSplit && self.cameras[0].room != null && self.cameras[0].room.abstractRoom.name == "SB_L01") // honestly jolly
@@ -665,25 +678,46 @@ namespace SplitScreenCoop
             {
                 CoopUpdate(self);
             }
+
+            MonitorCameraHealth(self);
         }
 
         /// <summary>
         /// Switches between split modes, only call from outside of camera-related code? untested if that actually breaks anything
         /// </summary>
-        public void SetSplitMode(SplitMode split, RainWorldGame game)
+        public void SetSplitMode(SplitMode split, RainWorldGame game, string reason = null)
         {
-            Logger.LogInfo("SetSplitMode");
+            SplitMode previousMode = CurrentSplitMode;
+            List<int> aliveCameras = GetAliveCameraNumbers(game);
+            if (aliveCameras.Count == 0 && game?.cameras?.Length > 0) aliveCameras.Add(game.cameras[0].cameraNumber);
             if (game.cameras.Length > 1)
             {
-                Logger.LogInfo("multicam");
-                CurrentSplitMode = split == SplitMode.NoSplit ? SplitMode.NoSplit : ResolveSplitMode(split, game.session.Players.Count);
+                CurrentSplitMode = split == SplitMode.NoSplit || aliveCameras.Count <= 1
+                    ? SplitMode.NoSplit
+                    : ResolveSplitMode(aliveCameras.Count);
+                renderedCameraNumbers.Clear();
+                renderedCameraNumbers.AddRange(dualDisplays
+                    ? aliveCameras.Take(2)
+                    : CurrentSplitMode == SplitMode.NoSplit ? aliveCameras.Take(1) : aliveCameras);
+                Logger.LogInfo($"[CameraMode] frame={Time.frameCount} {previousMode} -> {CurrentSplitMode}; reason={reason ?? "unspecified"}; players={game.session.Players.Count}; aliveCameras=[{string.Join(",", aliveCameras)}]; renderedCameras=[{string.Join(",", renderedCameraNumbers)}]; cameras={game.cameras.Length}; dualDisplay={dualDisplays}");
+
+                for (int i = 0; i < fcameras.Length; i++)
+                {
+                    if (fcameras[i] != null) fcameras[i].enabled = false;
+                    cameraZoomed[i] = false;
+                }
 
                 if (dualDisplays)
                 {
-                    cameraListeners[0].direct = true;
-                    cameraListeners[1].fcamera.enabled = true;
-                    cameraListeners[1].mirrorMain = false;
-                    cameraListeners[1].direct = true;
+                    for (int slot = 0; slot < renderedCameraNumbers.Count; slot++)
+                    {
+                        int cameraNumber = renderedCameraNumbers[slot];
+                        Display targetDisplay = slot == 0 ? Display.main : Display.displays[1];
+                        cameraListeners[cameraNumber].BindToDisplay(targetDisplay);
+                        cameraListeners[cameraNumber].direct = true;
+                        cameraListeners[cameraNumber].mirrorMain = false;
+                        fcameras[cameraNumber].enabled = true;
+                    }
                 }
                 else
                 {
@@ -691,53 +725,56 @@ namespace SplitScreenCoop
                     {
                         case SplitMode.NoSplit:
                             Logger.LogInfo("NoSplit");
-                            for (int i = 1; i < fcameras.Length; i++)
+                            if (renderedCameraNumbers.Count > 0)
                             {
-                                fcameras[i].enabled = false;
+                                int cameraNumber = renderedCameraNumbers[0];
+                                cameraListeners[cameraNumber].BindToDisplay(Display.main);
+                                cameraListeners[cameraNumber].direct = true;
+                                fcameras[cameraNumber].enabled = true;
                             }
-                            cameraListeners[0].direct = true;
                             break;
                         case SplitMode.SplitHorizontal:
                             Logger.LogInfo("SplitHorizontal");
-                            for (int i = 0; i < 2; i++)
+                            for (int slot = 0; slot < renderedCameraNumbers.Count; slot++)
                             {
-                                fcameras[i].enabled = true;
-                                cameraListeners[i].direct = false;
-                                cameraListeners[i].SetMap(horizontalSplitScreenPart, InsetForSeparator(horizontalSplitCameraTargetPos[i]));
-                                cameraZoomed[i] = false;
+                                int cameraNumber = renderedCameraNumbers[slot];
+                                cameraListeners[cameraNumber].BindToDisplay(Display.main);
+                                cameraListeners[cameraNumber].direct = false;
+                                cameraListeners[cameraNumber].SetMap(horizontalSplitScreenPart, InsetForSeparator(horizontalSplitCameraTargetPos[slot]));
+                                fcameras[cameraNumber].enabled = true;
                             }
-                            for (int i = 2; i < fcameras.Length; i++) fcameras[i].enabled = false;
                             break;
                         case SplitMode.SplitVertical:
                             Logger.LogInfo("SplitVertical");
-                            for (int i = 0; i < 2; i++)
+                            for (int slot = 0; slot < renderedCameraNumbers.Count; slot++)
                             {
-                                fcameras[i].enabled = true;
-                                cameraListeners[i].direct = false;
-                                cameraListeners[i].SetMap(verticalSplitScreenPart, InsetForSeparator(verticalSplitCameraTargetPos[i]));
-                                cameraZoomed[i] = false;
+                                int cameraNumber = renderedCameraNumbers[slot];
+                                cameraListeners[cameraNumber].BindToDisplay(Display.main);
+                                cameraListeners[cameraNumber].direct = false;
+                                cameraListeners[cameraNumber].SetMap(verticalSplitScreenPart, InsetForSeparator(verticalSplitCameraTargetPos[slot]));
+                                fcameras[cameraNumber].enabled = true;
                             }
-                            for (int i = 2; i < fcameras.Length; i++) fcameras[i].enabled = false;
                             break;
                         case SplitMode.Split3Screen:
                             Logger.LogInfo("Split3Screen");
-                            for (int i = 0; i < 3; i++)
+                            for (int slot = 0; slot < renderedCameraNumbers.Count; slot++)
                             {
-                                fcameras[i].enabled = true;
-                                cameraListeners[i].direct = false;
-                                cameraListeners[i].SetMap(fourSplitScreenPart, InsetForSeparator(threeSplitCameraTargetPos[i]));
-                                cameraZoomed[i] = false;
+                                int cameraNumber = renderedCameraNumbers[slot];
+                                cameraListeners[cameraNumber].BindToDisplay(Display.main);
+                                cameraListeners[cameraNumber].direct = false;
+                                cameraListeners[cameraNumber].SetMap(fourSplitScreenPart, InsetForSeparator(threeSplitCameraTargetPos[slot]));
+                                fcameras[cameraNumber].enabled = true;
                             }
-                            for (int i = 3; i < fcameras.Length; i++) fcameras[i].enabled = false;
                             break;
                         case SplitMode.Split4Screen:
                             Logger.LogInfo("Split4Screen");
-                            for (int i = 0; i < 4; i++)
+                            for (int slot = 0; slot < renderedCameraNumbers.Count; slot++)
                             {
-                                fcameras[i].enabled = true;
-                                cameraListeners[i].direct = false;
-                                cameraListeners[i].SetMap(fourSplitScreenPart, InsetForSeparator(fourSplitCameraTargetPos[i]));
-                                cameraZoomed[i] = false;
+                                int cameraNumber = renderedCameraNumbers[slot];
+                                cameraListeners[cameraNumber].BindToDisplay(Display.main);
+                                cameraListeners[cameraNumber].direct = false;
+                                cameraListeners[cameraNumber].SetMap(fourSplitScreenPart, InsetForSeparator(fourSplitCameraTargetPos[slot]));
+                                fcameras[cameraNumber].enabled = true;
                             }
                             break;
                         default:
@@ -747,6 +784,8 @@ namespace SplitScreenCoop
             }
             else
             {
+                renderedCameraNumbers.Clear();
+                renderedCameraNumbers.Add(0);
                 Logger.LogInfo("single cam NoSplit");
                 for (int i = 1; i < fcameras.Length; i++)
                 {
@@ -754,6 +793,19 @@ namespace SplitScreenCoop
                 }
                 cameraListeners[0].direct = true;
             }
+            RefreshActiveCameraRendering(game, reason ?? "split mode update");
+        }
+
+        private List<int> GetAliveCameraNumbers(RainWorldGame game)
+        {
+            if (game?.session?.Players == null || game.cameras == null) return new List<int>();
+            return game.session.Players
+                .Where(player => !IsCreatureDead(player))
+                .OrderBy(player => (player.state as PlayerState)?.playerNumber ?? int.MaxValue)
+                .Select(player => (player.state as PlayerState)?.playerNumber ?? game.session.Players.IndexOf(player))
+                .Where(playerNumber => game.cameras.Any(camera => camera.cameraNumber == playerNumber))
+                .Distinct()
+                .ToList();
         }
 
         /// <summary>
@@ -793,9 +845,8 @@ namespace SplitScreenCoop
             }
         }
 
-        private static SplitMode ResolveSplitMode(SplitMode preferred, int playerCount)
+        private static SplitMode ResolveSplitMode(int playerCount)
         {
-            if (preferred == SplitMode.NoSplit) return SplitMode.NoSplit;
             if (playerCount >= 4) return SplitMode.Split4Screen;
             if (playerCount == 3) return SplitMode.Split3Screen;
             if (playerCount == 2) return SplitMode.SplitVertical;
@@ -809,8 +860,8 @@ namespace SplitScreenCoop
 
         private static float SmoothCameraAxis(float current, float target, float screenSize)
         {
-            if (Mathf.Abs(target - current) > screenSize) return target;
-            return Mathf.Lerp(current, target, 0.22f);
+            if (Mathf.Abs(target - current) > screenSize * 0.5f) return target;
+            return Mathf.Lerp(current, target, 0.55f);
         }
 
         private static AbstractCreature GetPlayerForCamera(RainWorldGame game, int cameraNumber)
@@ -828,7 +879,10 @@ namespace SplitScreenCoop
                 if (player?.realizedCreature is Player realized && camera.followAbstractCreature != player)
                     AssignCameraToPlayer(camera, realized);
                 else if (player != null)
+                {
                     camera.followAbstractCreature = player;
+                    ReconcileCameraRoom(camera, player, false, "stable assignment check");
+                }
             }
         }
 
@@ -847,12 +901,7 @@ namespace SplitScreenCoop
             Logger.LogInfo($"AssignCameraToPlayer cam {camera.cameraNumber} to p {player.playerState.playerNumber}");
             //Logger.LogInfo(Environment.StackTrace);
             camera.followAbstractCreature = player.abstractCreature;
-            var newroom = player.room ?? player.abstractCreature.Room.realizedRoom;
-            if (newroom != null && camera.room != null && camera.room != newroom)
-            {
-                int node = player.abstractCreature.pos.abstractNode;
-                camera.MoveCamera(newroom, newroom.CameraViewingNode(node != -1 ? node : 0));
-            }
+            ReconcileCameraRoom(camera, player.abstractCreature, true, "player assignment");
             if (camera.hud != null) camera.hud.owner = player;
         }
 
@@ -1299,11 +1348,13 @@ namespace SplitScreenCoop
         public void ToggleCameraZoom(RoomCamera cam)
         {
             SetCameraZoom(cam, !cameraZoomed[cam.cameraNumber]);
+            Logger.LogInfo($"[CameraZoom] frame={Time.frameCount} cam={cam.cameraNumber} zoomed={cameraZoomed[cam.cameraNumber]} room={cam.room?.abstractRoom?.name ?? "null"}");
         }
 
         public void SetCameraZoom(RoomCamera cam, bool enabled)
         {
             var camNum = cam.cameraNumber;
+            int layoutSlot = Mathf.Max(0, renderedCameraNumbers.IndexOf(camNum));
             cameraZoomed[camNum] = enabled;
             if (enabled)
             {
@@ -1311,16 +1362,16 @@ namespace SplitScreenCoop
                 switch (CurrentSplitMode)
                 {
                     case SplitMode.SplitHorizontal:
-                        cameraListeners[camNum].SetMap(wholeScreen, InsetForSeparator(horizontalSplitCameraTargetPosZoomed[camNum]));
+                        cameraListeners[camNum].SetMap(wholeScreen, InsetForSeparator(horizontalSplitCameraTargetPosZoomed[layoutSlot]));
                         break;
                     case SplitMode.SplitVertical:
-                        cameraListeners[camNum].SetMap(wholeScreen, InsetForSeparator(verticalSplitCameraTargetPosZoomed[camNum]));
+                        cameraListeners[camNum].SetMap(wholeScreen, InsetForSeparator(verticalSplitCameraTargetPosZoomed[layoutSlot]));
                         break;
                     case SplitMode.Split4Screen:
-                        cameraListeners[camNum].SetMap(wholeScreen, InsetForSeparator(fourSplitCameraTargetPos[camNum]));
+                        cameraListeners[camNum].SetMap(wholeScreen, InsetForSeparator(fourSplitCameraTargetPos[layoutSlot]));
                         break;
                     case SplitMode.Split3Screen:
-                        cameraListeners[camNum].SetMap(wholeScreen, InsetForSeparator(threeSplitCameraTargetPos[camNum]));
+                        cameraListeners[camNum].SetMap(wholeScreen, InsetForSeparator(threeSplitCameraTargetPos[layoutSlot]));
                         break;
                 }
                 
@@ -1330,16 +1381,16 @@ namespace SplitScreenCoop
                 switch (CurrentSplitMode)
                 {
                     case SplitMode.SplitHorizontal:
-                        cameraListeners[camNum].SetMap(horizontalSplitScreenPart, InsetForSeparator(horizontalSplitCameraTargetPos[camNum]));
+                        cameraListeners[camNum].SetMap(horizontalSplitScreenPart, InsetForSeparator(horizontalSplitCameraTargetPos[layoutSlot]));
                         break;
                     case SplitMode.SplitVertical:
-                        cameraListeners[camNum].SetMap(verticalSplitScreenPart, InsetForSeparator(verticalSplitCameraTargetPos[camNum]));
+                        cameraListeners[camNum].SetMap(verticalSplitScreenPart, InsetForSeparator(verticalSplitCameraTargetPos[layoutSlot]));
                         break;
                     case SplitMode.Split4Screen:
-                        cameraListeners[camNum].SetMap(fourSplitScreenPart, InsetForSeparator(fourSplitCameraTargetPos[camNum]));
+                        cameraListeners[camNum].SetMap(fourSplitScreenPart, InsetForSeparator(fourSplitCameraTargetPos[layoutSlot]));
                         break;
                     case SplitMode.Split3Screen:
-                        cameraListeners[camNum].SetMap(fourSplitScreenPart, InsetForSeparator(threeSplitCameraTargetPos[camNum]));
+                        cameraListeners[camNum].SetMap(fourSplitScreenPart, InsetForSeparator(threeSplitCameraTargetPos[layoutSlot]));
                         break;
                 }
             }

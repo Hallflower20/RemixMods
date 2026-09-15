@@ -37,6 +37,11 @@ namespace SplitScreenCoop
             public int dstY;
             public int dstWidth;
             public int dstHeight;
+            public int lastPreRenderFrame = -1;
+            public int lastPostRenderFrame = -1;
+            public int lastCompositeFrame = -1;
+            public int renderingExpectedSinceFrame = -1;
+            public int lastRecoveryFrame = -10000;
 
 
             public bool _direct = true;
@@ -66,6 +71,7 @@ namespace SplitScreenCoop
 
             public void Retarget()
             {
+                if (fcamera == null || display == null) return;
                 fcamera.targetTexture = _direct ? display.Extras().renderTexture : this.renderTexture;
             }
 
@@ -81,16 +87,51 @@ namespace SplitScreenCoop
                 Retarget();
             }
 
-            public void ReinitRenderTexture()
+            public void ReinitRenderTexture(bool reinitDisplay = true)
             {
                 if (fcamera != null) fcamera.targetTexture = null;
                 ReleaseTexture(ref renderTexture);
                 ReleaseTexture(ref tempTex);
-                display.Extras().ReinitRenderTexture();
+                if (display == null || Futile.screen?.renderTexture == null) return;
+                if (reinitDisplay) display.Extras().ReinitRenderTexture();
                 renderTexture = new RenderTexture(Futile.screen.renderTexture);
                 renderTexture.name = $"SplitScreen camera {Array.IndexOf(cameraListeners, this)}";
+                renderTexture.Create();
                 SetMap(this.sourceRect, this.targetRect);
                 Retarget();
+            }
+
+            public void MarkRenderingExpected(bool expected)
+            {
+                if (expected)
+                {
+                    if (renderingExpectedSinceFrame < 0) renderingExpectedSinceFrame = Time.frameCount;
+                }
+                else
+                {
+                    renderingExpectedSinceFrame = -1;
+                }
+            }
+
+            public void PrepareForRendering()
+            {
+                if (Futile.screen?.renderTexture == null) return;
+                bool invalid = renderTexture == null || !renderTexture.IsCreated() ||
+                    renderTexture.width != Futile.screen.renderTexture.width ||
+                    renderTexture.height != Futile.screen.renderTexture.height;
+                if (invalid) ReinitRenderTexture(false);
+                else Retarget();
+            }
+
+            public void RecoverRendering()
+            {
+                if (fcamera == null) return;
+                bool shouldBeEnabled = fcamera.enabled;
+                fcamera.enabled = false;
+                ReinitRenderTexture(false);
+                fcamera.enabled = shouldBeEnabled;
+                renderingExpectedSinceFrame = Time.frameCount;
+                lastRecoveryFrame = Time.frameCount;
             }
 
             private static void ReleaseTexture(ref RenderTexture texture)
@@ -129,6 +170,7 @@ namespace SplitScreenCoop
             /// </summary>
             public void OnPreRender()
             {
+                lastPreRenderFrame = Time.frameCount;
                 restoringShaderState = true;
                 try
                 {
@@ -138,7 +180,6 @@ namespace SplitScreenCoop
                     foreach (var kv in ShaderVectorLists) Shader.SetGlobalVectorArray(kv.Key, kv.Value);
                     foreach (var kv in ShaderFloats) Shader.SetGlobalFloat(kv.Key, kv.Value);
                     foreach (var kv in ShaderTextures) Shader.SetGlobalTexture(kv.Key, kv.Value);
-                    foreach (var kv in globalShaderKeywords) SetKeyword(kv.Key, kv.Value);
                     foreach (var kv in ShaderKeywords) SetKeyword(kv.Key, kv.Value);
                 }
                 finally
@@ -158,12 +199,14 @@ namespace SplitScreenCoop
             /// </summary>
             public void OnPostRender()
             {
+                lastPostRenderFrame = Time.frameCount;
                 if (!_direct)
                 {
                     RenderTexture destination = display.Extras().renderTexture;
                     if (destination == null || srcWidth <= 0 || srcHeight <= 0 || dstWidth <= 0 || dstHeight <= 0) return;
 
-                    if (Array.IndexOf(cameraListeners, this) == 0 && lastCompositorClearFrame != Time.frameCount)
+                    int cameraNumber = Array.IndexOf(cameraListeners, this);
+                    if (renderedCameraNumbers.Count > 0 && cameraNumber == renderedCameraNumbers[0] && lastCompositorClearFrame != Time.frameCount)
                     {
                         var previous = RenderTexture.active;
                         Graphics.SetRenderTarget(destination);
@@ -191,13 +234,16 @@ namespace SplitScreenCoop
                     {
                         Graphics.CopyTexture(renderTexture, 0, 0, srcX, srcY, srcWidth, srcHeight, destination, 0, 0, dstX, dstY);
                     }
+                    lastCompositeFrame = Time.frameCount;
                 }
+                else lastCompositeFrame = Time.frameCount;
             }
 
             public void OnDestroy()
             {
                 ShaderTextures.Clear();
                 ShaderKeywords.Clear();
+                renderingExpectedSinceFrame = -1;
                 if (fcamera != null) fcamera.targetTexture = null;
                 fcamera = null;
                 display = null;

@@ -397,6 +397,7 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="SplitScreenCoop.CameraListener.cs" />
+    <Compile Include="SplitScreenCoop.CameraDiagnostics.cs" />
     <Compile Include="SplitScreenCoop.Coop.cs" />
     <Compile Include="SplitScreenCoop.CoopFixes.cs" />
     <Compile Include="SplitScreenCoop.cs" />

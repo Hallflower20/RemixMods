@@ -46,83 +46,56 @@ namespace SplitScreenCoop
         {
             orig(self, manager, game);
 
-            if (game.cameras.Length > 1 && !inpause)
+            if (CurrentSplitMode != SplitMode.NoSplit && renderedCameraNumbers.Count > 1 && !inpause)
             {
-                if (CurrentSplitMode == SplitMode.SplitVertical)
+                inpause = true;
+                try
                 {
-                    self.container.SetPosition(manager.rainWorld.screenSize.x / 4f, 0);
-                    inpause = true;
-                    try
+                    for (int slot = 0; slot < renderedCameraNumbers.Count; slot++)
                     {
-                        for (int i = 0; i < game.cameras.Count(); i++)
-                        {
-                            oldCameraZoom[i] = cameraZoomed[i];
-                            SetCameraZoom(game.cameras[i], false);
-                        }
-                        var otherpause = new Menu.PauseMenu(manager, game);
-                        otherpause.container.SetPosition(camOffsets[game.cameras[1].cameraNumber] + new Vector2(-manager.rainWorld.screenSize.x / 4f, 0));
-                        manager.sideProcesses.Add(otherpause);
+                        int cameraNumber = renderedCameraNumbers[slot];
+                        RoomCamera roomCamera = game.cameras.FirstOrDefault(camera => camera.cameraNumber == cameraNumber);
+                        if (roomCamera == null) continue;
+                        oldCameraZoom[cameraNumber] = cameraZoomed[cameraNumber];
+                        SetCameraZoom(roomCamera, false);
                     }
-                    finally
-                    {
-                        inpause = false;
-                    }
-                }
-                else if (CurrentSplitMode == SplitMode.SplitHorizontal)
-                {
-                    self.container.SetPosition(0, -manager.rainWorld.screenSize.y / 4f);
-                    inpause = true;
-                    try
-                    {
-                        for (int i = 0; i < game.cameras.Count(); i++)
-                        {
-                            oldCameraZoom[i] = cameraZoomed[i];
-                            SetCameraZoom(game.cameras[i], false);
-                        }
-                        var otherpause = new Menu.PauseMenu(manager, game);
-                        otherpause.container.SetPosition(camOffsets[game.cameras[1].cameraNumber] + new Vector2(0, manager.rainWorld.screenSize.y / 4f));
-                        manager.sideProcesses.Add(otherpause);
-                    }
-                    finally
-                    {
-                        inpause = false;
-                    }
-                }
-                else if (IsGridSplit(CurrentSplitMode))
-                {
-                    float xOffset = manager.rainWorld.screenSize.x / 4f;
-                    float yOffset = manager.rainWorld.screenSize.y / 4f;
-                    self.container.SetPosition(CurrentSplitMode == SplitMode.Split3Screen ? 0f : xOffset, -yOffset);
-                    inpause = true;
-                    try
-                    {
-                        for (int i = 0; i < game.cameras.Count(); i++)
-                        {
-                            oldCameraZoom[i] = cameraZoomed[i];
-                            SetCameraZoom(game.cameras[i], false);
-                        }
 
-                        var pause2 = new Menu.PauseMenu(manager, game);
-                        var pause3 = new Menu.PauseMenu(manager, game);
-                        pause2.container.SetPosition(camOffsets[game.cameras[1].cameraNumber] +
-                            (CurrentSplitMode == SplitMode.Split3Screen ? new Vector2(xOffset, yOffset) : new Vector2(-xOffset, -yOffset)));
-                        pause3.container.SetPosition(camOffsets[game.cameras[2].cameraNumber] +
-                            (CurrentSplitMode == SplitMode.Split3Screen ? new Vector2(-xOffset, yOffset) : new Vector2(xOffset, yOffset)));
-                        manager.sideProcesses.Add(pause2);
-                        manager.sideProcesses.Add(pause3);
-                        if (game.cameras.Length > 3)
-                        {
-                            var pause4 = new Menu.PauseMenu(manager, game);
-                            pause4.container.SetPosition(camOffsets[game.cameras[3].cameraNumber] + new Vector2(-xOffset, yOffset));
-                            manager.sideProcesses.Add(pause4);
-                        }
-                    }
-                    finally
+                    int firstCamera = renderedCameraNumbers[0];
+                    self.container.SetPosition(camOffsets[firstCamera] + PauseOffsetForSlot(CurrentSplitMode, 0, manager.rainWorld.screenSize));
+                    for (int slot = 1; slot < renderedCameraNumbers.Count; slot++)
                     {
-                        inpause = false;
+                        int cameraNumber = renderedCameraNumbers[slot];
+                        var additionalPause = new Menu.PauseMenu(manager, game);
+                        additionalPause.container.SetPosition(camOffsets[cameraNumber] + PauseOffsetForSlot(CurrentSplitMode, slot, manager.rainWorld.screenSize));
+                        manager.sideProcesses.Add(additionalPause);
                     }
+                }
+                finally
+                {
+                    inpause = false;
                 }
             }
+        }
+
+        private static Vector2 PauseOffsetForSlot(SplitMode mode, int slot, Vector2 screenSize)
+        {
+            float x = screenSize.x / 4f;
+            float y = screenSize.y / 4f;
+            if (mode == SplitMode.SplitVertical) return slot == 0 ? new Vector2(x, 0f) : new Vector2(-x, 0f);
+            if (mode == SplitMode.SplitHorizontal) return slot == 0 ? new Vector2(0f, -y) : new Vector2(0f, y);
+            if (mode == SplitMode.Split3Screen)
+            {
+                if (slot == 0) return new Vector2(0f, -y);
+                return slot == 1 ? new Vector2(x, y) : new Vector2(-x, y);
+            }
+            if (mode == SplitMode.Split4Screen)
+            {
+                if (slot == 0) return new Vector2(x, -y);
+                if (slot == 1) return new Vector2(-x, -y);
+                if (slot == 2) return new Vector2(x, y);
+                return new Vector2(-x, y);
+            }
+            return Vector2.zero;
         }
 
         /// <summary>
@@ -133,9 +106,10 @@ namespace SplitScreenCoop
             orig(self);
             if (CurrentSplitMode != SplitMode.NoSplit)
             {
-                for (int i = 0; i < self.game.cameras.Count(); i++)
+                foreach (int cameraNumber in renderedCameraNumbers.ToArray())
                 {
-                    SetCameraZoom(self.game.cameras[i], oldCameraZoom[i]);
+                    RoomCamera roomCamera = self.game.cameras.FirstOrDefault(camera => camera.cameraNumber == cameraNumber);
+                    if (roomCamera != null) SetCameraZoom(roomCamera, oldCameraZoom[cameraNumber]);
                 }
             }
             var otherpause = self.manager?.sideProcesses?.FirstOrDefault(t => t is Menu.PauseMenu);
@@ -369,7 +343,7 @@ namespace SplitScreenCoop
                                 Vector2? vector = rc.room.game.shortcuts.OnScreenPositionOfInShortCutCreature(rc.room, cr);
                                 if (vector != null)
                                 {
-                                    rc.pos.y = vector.Value.y - 2 * pad;
+                                    rc.pos.y = SmoothCameraAxis(rc.pos.y, vector.Value.y - 2 * pad, rc.sSize.y);
                                 }
                             }
                             rc.pos.y += rc.followCreatureInputForward.y * 2f;
@@ -386,7 +360,7 @@ namespace SplitScreenCoop
                                 Vector2? vector = rc.room.game.shortcuts.OnScreenPositionOfInShortCutCreature(rc.room, cr);
                                 if (vector != null)
                                 {
-                                    rc.pos.x = vector.Value.x - 2 * pad;
+                                    rc.pos.x = SmoothCameraAxis(rc.pos.x, vector.Value.x - 2 * pad, rc.sSize.x);
                                 }
                             }
                             rc.pos.x += rc.followCreatureInputForward.x * 2f;
@@ -408,8 +382,8 @@ namespace SplitScreenCoop
                                 Vector2? vector = rc.room.game.shortcuts.OnScreenPositionOfInShortCutCreature(rc.room, cr);
                                 if (vector != null)
                                 {
-                                    rc.pos.x = vector.Value.x - 2 * pad;
-                                    rc.pos.y = vector.Value.y - 2 * pad2;
+                                    rc.pos.x = SmoothCameraAxis(rc.pos.x, vector.Value.x - 2 * pad, rc.sSize.x);
+                                    rc.pos.y = SmoothCameraAxis(rc.pos.y, vector.Value.y - 2 * pad2, rc.sSize.y);
                                 }
                             }
                             rc.pos.x += rc.followCreatureInputForward.x * 2f;

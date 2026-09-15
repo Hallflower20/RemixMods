@@ -44,14 +44,6 @@ namespace SplitScreenCoop
             rippleOwners.Add(data, new WatcherCameraOwner { camera = camera });
         }
 
-        public delegate Camera orig_CameraMain();
-        public Camera Camera_get_main(orig_CameraMain orig)
-        {
-            if (curCamera >= 0 && curCamera < fcameras.Length && fcameras[curCamera] != null)
-                return fcameras[curCamera];
-            return orig();
-        }
-
         public delegate bool orig_MaskSourceVisible(Watcher.MaskSource self);
         public bool MaskSource_get_IsVisible(orig_MaskSourceVisible orig, Watcher.MaskSource self)
         {
@@ -69,6 +61,38 @@ namespace SplitScreenCoop
             finally
             {
                 curCamera = previous;
+            }
+        }
+
+        private static void WithUnityMainCamera(RoomCamera camera, Action action)
+        {
+            int ownerIndex = camera?.cameraNumber ?? -1;
+            if (ownerIndex < 0 || ownerIndex >= fcameras.Length || fcameras[ownerIndex] == null)
+            {
+                WithWatcherCamera(camera, action);
+                return;
+            }
+
+            string[] originalTags = new string[fcameras.Length];
+            bool ownerWasEnabled = fcameras[ownerIndex].enabled;
+            try
+            {
+                for (int i = 0; i < fcameras.Length; i++)
+                {
+                    if (fcameras[i] == null) continue;
+                    originalTags[i] = fcameras[i].gameObject.tag;
+                    fcameras[i].gameObject.tag = i == ownerIndex ? "MainCamera" : "Untagged";
+                }
+                // Camera.main ignores disabled cameras on some Unity versions.
+                fcameras[ownerIndex].enabled = true;
+                WithWatcherCamera(camera, action);
+            }
+            finally
+            {
+                fcameras[ownerIndex].enabled = ownerWasEnabled;
+                for (int i = 0; i < fcameras.Length; i++)
+                    if (fcameras[i] != null && originalTags[i] != null)
+                        fcameras[i].gameObject.tag = originalTags[i];
             }
         }
 
@@ -107,26 +131,91 @@ namespace SplitScreenCoop
         {
             WithWatcherCamera(owner, () => orig(self, owner));
             RegisterRippleOwner(self, owner);
+            RecordCameraShaderKeyword(owner, "GAMEPLAYRIPPLETEXTURE", false);
         }
 
         private void RippleCameraData_AddCommandBuffer(On.Watcher.RippleCameraData.orig_AddCommandBuffer orig, Watcher.RippleCameraData self)
         {
-            WithWatcherCamera(RippleOwner(self), () => orig(self));
+            RoomCamera owner = RippleOwner(self);
+            WithUnityMainCamera(owner, () => orig(self));
+            RecordCameraShaderKeyword(owner, "RIPPLE", true);
         }
 
         private void RippleCameraData_RemoveCommandBuffer(On.Watcher.RippleCameraData.orig_RemoveCommandBuffer orig, Watcher.RippleCameraData self)
         {
-            WithWatcherCamera(RippleOwner(self), () => orig(self));
+            RoomCamera owner = RippleOwner(self);
+            WithUnityMainCamera(owner, () => orig(self));
+            RecordCameraShaderKeyword(owner, "RIPPLE", false);
         }
 
         private void RippleCameraData_SetGlobals(On.Watcher.RippleCameraData.orig_SetGlobals orig, Watcher.RippleCameraData self)
         {
-            WithWatcherCamera(RippleOwner(self), () => orig(self));
+            RoomCamera owner = RippleOwner(self);
+            WithWatcherCamera(owner, () => orig(self));
+            RecordCameraShaderKeyword(owner, "GAMEPLAYRIPPLETEXTURE", self.hasGameplayScreen);
         }
 
         private void LevelTexCombiner_Initialize(On.Watcher.LevelTexCombiner.orig_Initialize orig, Watcher.LevelTexCombiner self)
         {
-            WithWatcherCamera(LevelOwner(self), () => orig(self));
+            RoomCamera owner = LevelOwner(self);
+            WithUnityMainCamera(owner, () => orig(self));
+            RecordCameraShaderKeyword(owner, "COMBINEDLEVEL", true);
+        }
+
+        private void LevelTexCombiner_RemovePass(On.Watcher.LevelTexCombiner.orig_RemovePass orig,
+            Watcher.LevelTexCombiner self, string id)
+        {
+            RoomCamera owner = LevelOwner(self);
+            if (owner == null || owner.cameraNumber < 0 || owner.cameraNumber >= fcameras.Length || fcameras[owner.cameraNumber] == null)
+            {
+                orig(self, id);
+                return;
+            }
+
+            WithWatcherCamera(owner, () =>
+            {
+                RemoveWatcherBuffers(fcameras[owner.cameraNumber], CameraEvent.AfterForwardOpaque, id);
+                RemoveWatcherBuffers(fcameras[owner.cameraNumber], CameraEvent.BeforeForwardAlpha, id);
+                self.bufferIDs.Remove(id);
+            });
+        }
+
+        private void LevelTexCombiner_RemoveAllBuffers(On.Watcher.LevelTexCombiner.orig_RemoveAllBuffers orig,
+            Watcher.LevelTexCombiner self)
+        {
+            RoomCamera owner = LevelOwner(self);
+            if (owner == null || owner.cameraNumber < 0 || owner.cameraNumber >= fcameras.Length || fcameras[owner.cameraNumber] == null)
+            {
+                orig(self);
+                return;
+            }
+
+            WithWatcherCamera(owner, () =>
+            {
+                Camera target = fcameras[owner.cameraNumber];
+                RemoveWatcherBuffers(target, CameraEvent.BeforeForwardOpaque, self.bufferIDs);
+                RemoveWatcherBuffers(target, CameraEvent.AfterForwardOpaque, self.bufferIDs);
+                RemoveWatcherBuffers(target, CameraEvent.BeforeForwardAlpha, self.bufferIDs);
+                self.bufferIDs.Clear();
+                Shader.DisableKeyword("COMBINEDLEVEL");
+                RecordCameraShaderKeyword(owner, "COMBINEDLEVEL", false);
+                self.UnSetGlobals();
+                self.DisposeRenderTextures();
+            });
+        }
+
+        private static void RemoveWatcherBuffers(Camera camera, CameraEvent cameraEvent, string id)
+        {
+            foreach (CommandBuffer buffer in camera.GetCommandBuffers(cameraEvent))
+                if (buffer.name == id)
+                    camera.RemoveCommandBuffer(cameraEvent, buffer);
+        }
+
+        private static void RemoveWatcherBuffers(Camera camera, CameraEvent cameraEvent, System.Collections.Generic.ICollection<string> ids)
+        {
+            foreach (CommandBuffer buffer in camera.GetCommandBuffers(cameraEvent))
+                if (ids.Contains(buffer.name))
+                    camera.RemoveCommandBuffer(cameraEvent, buffer);
         }
 
         private void LevelTexCombiner_CreateBuffer(On.Watcher.LevelTexCombiner.orig_CreateBuffer orig, Watcher.LevelTexCombiner self,
@@ -187,7 +276,7 @@ namespace SplitScreenCoop
         private void DynamicLevelElement_AddLevelCombiner(On.Watcher.DynamicLevelElement.orig_AddLevelCombiner orig, RoomCamera camera)
         {
             if (camera?.levelTexCombiner == null || camera.levelTexCombiner.bufferIDs.Contains("DynamicLevelElement")) return;
-            WithWatcherCamera(camera, () => camera.levelTexCombiner.AddPass(
+            WithUnityMainCamera(camera, () => camera.levelTexCombiner.AddPass(
                 RenderTexture.GetTemporary(1, 1),
                 new Material(Shader.Find("Futile/DynamicLevelElementCombiner")),
                 "DynamicLevelElement",
