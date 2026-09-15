@@ -13,6 +13,12 @@ namespace SplitScreenCoop
         /// </summary>
         public Vector2 DialogBox_DrawPos(On.HUD.DialogBox.orig_DrawPos orig, HUD.DialogBox self, float timeStacker)
         {
+            if (dynamicStyle && !dualDisplays)
+            {
+                // The native HUD texture is translated to the region centroid by
+                // DrawDynamicHud; shifting this twice would push dialog off-screen.
+                return orig(self, timeStacker);
+            }
             if (CurrentSplitMode == SplitMode.SplitVertical)
             {
                 return orig(self, timeStacker) - new Vector2(self.hud.rainWorld.screenSize.x / 4f, 0f);
@@ -25,6 +31,21 @@ namespace SplitScreenCoop
         /// </summary>
         public void VirtualMicrophone_DrawUpdate(On.VirtualMicrophone.orig_DrawUpdate orig, VirtualMicrophone self, float timeStacker, float timeSpeed)
         {
+            if (dynamicStyle && !dualDisplays)
+            {
+                var view = DynamicViewportForCamera(self.camera.cameraNumber);
+                if (view?.sharesImageWith >= 0)
+                {
+                    RoomCamera source = CameraByNumber(self.camera.game, view.sharesImageWith);
+                    if (source?.virtualMicrophone is VirtualMicrophone other)
+                        self.volumeGroups[0] *= Mathf.InverseLerp(100f, 1000f,
+                            (self.listenerPoint - other.listenerPoint).magnitude);
+                    self.volumeGroups[1] = 0f;
+                    self.volumeGroups[2] = 0f;
+                }
+                orig(self, timeStacker, timeSpeed);
+                return;
+            }
             if (self.camera.cameraNumber > 0 && self.camera.room == self.camera.game.cameras[0].room)
             {
                 if (self.camera.game.cameras[0].virtualMicrophone is VirtualMicrophone other)
@@ -45,6 +66,35 @@ namespace SplitScreenCoop
         public void PauseMenu_ctor(On.Menu.PauseMenu.orig_ctor orig, Menu.PauseMenu self, ProcessManager manager, RainWorldGame game)
         {
             orig(self, manager, game);
+
+            if (dynamicStyle && !dualDisplays && dynamicLayout != null)
+            {
+                if (!inpause)
+                {
+                    inpause = true;
+                    try
+                    {
+                        var leaders = new System.Collections.Generic.List<int>();
+                        foreach (var view in dynamicLayout.viewports)
+                        {
+                            int leader = view.sharesImageWith >= 0 ? view.sharesImageWith : view.cameraNumber;
+                            if (!leaders.Contains(leader)) leaders.Add(leader);
+                        }
+                        if (leaders.Count > 0)
+                        {
+                            MovePauseMenuIntoRegion(self, leaders[0], manager.rainWorld.screenSize);
+                            for (int slot = 1; slot < leaders.Count; slot++)
+                            {
+                                var additionalPause = new Menu.PauseMenu(manager, game);
+                                MovePauseMenuIntoRegion(additionalPause, leaders[slot], manager.rainWorld.screenSize);
+                                manager.sideProcesses.Add(additionalPause);
+                            }
+                        }
+                    }
+                    finally { inpause = false; }
+                }
+                return;
+            }
 
             if (CurrentSplitMode != SplitMode.NoSplit && renderedCameraNumbers.Count > 1 && !inpause)
             {
@@ -123,6 +173,7 @@ namespace SplitScreenCoop
         {
             orig(self, player);
             AssignCameraToPlayer(self, player);
+            MoveCameraHudToOverlay(self);
         }
 
         public delegate bool delget_ShouldBeCulled(GraphicsModule gm);
@@ -136,6 +187,8 @@ namespace SplitScreenCoop
                 bool result = orig(gm);
                 for (int i = 1; i < gm.owner.room.game.cameras.Length; i++)
                 {
+                    if (dynamicActive && !renderedCameraNumbers.Contains(gm.owner.room.game.cameras[i].cameraNumber))
+                        continue;
                     result = result &&
                     !gm.owner.room.game.cameras[i].PositionCurrentlyVisible(gm.owner.firstChunk.pos, gm.cullRange + ((!gm.culled) ? 100f : 0f), true) &&
                     !gm.owner.room.game.cameras[i].PositionVisibleInNextScreen(gm.owner.firstChunk.pos, (!gm.culled) ? 100f : 50f, true);
@@ -151,7 +204,7 @@ namespace SplitScreenCoop
         public void Water_InitiateSprites(On.Water.orig_InitiateSprites orig, Water self, RoomCamera.SpriteLeaser sLeaser, RoomCamera rCam)
         {
             orig(self, sLeaser, rCam);
-            if (CurrentSplitMode != SplitMode.NoSplit)
+            if (dynamicActive || CurrentSplitMode != SplitMode.NoSplit)
             {
                 var camPos = rCam.pos + rCam.offset;
                 float y = -10f;
@@ -330,6 +383,7 @@ namespace SplitScreenCoop
                 c.Emit(OpCodes.Ldarg_0);
                 c.EmitDelegate<Action<RoomCamera>>((rc) =>
                 {
+                    if (ApplyDynamicCameraFollow(rc)) return;
                     if (cameraZoomed[rc.cameraNumber])
                         return;
                     if (CurrentSplitMode == SplitMode.SplitHorizontal)
@@ -399,6 +453,7 @@ namespace SplitScreenCoop
                     c.Emit(OpCodes.Ldarg_0); // RoomCamera
                     c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                     {
+                        if (dynamicStyle && !dualDisplays) return v - DynamicClampWiden(rc, true, true);
                         if ((CurrentSplitMode == SplitMode.SplitVertical || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                         {
                             return v - rc.sSize.x / 4f;
@@ -411,6 +466,7 @@ namespace SplitScreenCoop
                     c.Emit(OpCodes.Ldarg_0); // RoomCamera
                     c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                     {
+                        if (dynamicStyle && !dualDisplays) return v + DynamicClampWiden(rc, true, false);
                         if ((CurrentSplitMode == SplitMode.SplitVertical || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                         {
                             return v + rc.sSize.x / 4f;
@@ -423,6 +479,7 @@ namespace SplitScreenCoop
                     c.Emit(OpCodes.Ldarg_0); // RoomCamera
                     c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                     {
+                        if (dynamicStyle && !dualDisplays) return v - DynamicClampWiden(rc, false, true);
                         if ((CurrentSplitMode == SplitMode.SplitHorizontal || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                         {
                             return v - rc.sSize.y / 4f;
@@ -436,6 +493,7 @@ namespace SplitScreenCoop
                     c.Emit(OpCodes.Ldarg_0); // RoomCamera
                     c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                     {
+                        if (dynamicStyle && !dualDisplays) return v + DynamicClampWiden(rc, false, false);
                         if ((CurrentSplitMode == SplitMode.SplitHorizontal || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                         {
                             return v + rc.sSize.y / 4f;
@@ -501,6 +559,7 @@ namespace SplitScreenCoop
                         c.Emit(OpCodes.Ldarg_0); // RoomCamera
                         c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                         {
+                            if (dynamicStyle && !dualDisplays) return v - DynamicClampWiden(rc, true, true);
                             if ((CurrentSplitMode == SplitMode.SplitVertical || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                             {
                                 return v - rc.sSize.x / 4f;
@@ -513,6 +572,7 @@ namespace SplitScreenCoop
                         c.Emit(OpCodes.Ldarg_0); // RoomCamera
                         c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                         {
+                            if (dynamicStyle && !dualDisplays) return v + DynamicClampWiden(rc, true, false);
                             if ((CurrentSplitMode == SplitMode.SplitVertical || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                             {
                                 return v + rc.sSize.x / 4f;
@@ -525,6 +585,7 @@ namespace SplitScreenCoop
                         c.Emit(OpCodes.Ldarg_0); // RoomCamera
                         c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                         {
+                            if (dynamicStyle && !dualDisplays) return v - DynamicClampWiden(rc, false, true);
                             if ((CurrentSplitMode == SplitMode.SplitHorizontal || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                             {
                                 return v - rc.sSize.y / 4f;
@@ -538,6 +599,7 @@ namespace SplitScreenCoop
                         c.Emit(OpCodes.Ldarg_0); // RoomCamera
                         c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                         {
+                            if (dynamicStyle && !dualDisplays) return v + DynamicClampWiden(rc, false, false);
                             if ((CurrentSplitMode == SplitMode.SplitHorizontal || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                             {
                                 return v + rc.sSize.y / 4f;

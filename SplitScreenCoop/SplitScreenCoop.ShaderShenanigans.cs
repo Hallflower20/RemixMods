@@ -54,6 +54,7 @@ namespace SplitScreenCoop
                 NoteRoomCameraDrawn(self);
                 CaptureRoomCameraShaderKeywords(self);
                 OffsetHud(self);
+                RouteGlobalMeters(self);
             }
             finally
             {

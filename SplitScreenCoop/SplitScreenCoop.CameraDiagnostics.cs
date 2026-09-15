@@ -104,7 +104,9 @@ namespace SplitScreenCoop
                 Camera unityCamera = i < fcameras.Length ? fcameras[i] : null;
                 if (listener == null || unityCamera == null) continue;
                 listener.MarkRenderingExpected(true);
-                int lastCompletedFrame = listener.direct ? listener.lastPostRenderFrame : listener.lastCompositeFrame;
+                int lastCompletedFrame = listener.dynamicCompositing
+                    ? Math.Min(listener.lastPostRenderFrame, listener.lastCompositeFrame)
+                    : listener.direct ? listener.lastPostRenderFrame : listener.lastCompositeFrame;
                 int newestRenderFrame = Math.Max(listener.renderingExpectedSinceFrame, lastCompletedFrame);
                 int renderAge = Time.frameCount - newestRenderFrame;
                 if (renderAge <= RenderStallFrames || Time.frameCount - listener.lastRecoveryFrame <= RenderRecoveryCooldown) continue;
@@ -113,6 +115,49 @@ namespace SplitScreenCoop
                 listener.RecoverRendering();
                 unityCamera.enabled = true;
                 lastCameraStateKeys[i] = null;
+            }
+
+            if (dynamicActive && dynamicCompositorCamera != null && dynamicCompositorCamera.enabled &&
+                dynamicCompositor != null && Time.frameCount - Math.Max(0, dynamicCompositor.lastCompositeFrame) > RenderStallFrames)
+            {
+                Logger.LogWarning($"[CameraHealth] frame={Time.frameCount} final polygon compositor has not completed for {Time.frameCount - dynamicCompositor.lastCompositeFrame} frames; enabled={dynamicCompositorCamera.enabled}; target={dynamicCompositorCamera.targetTexture?.name ?? "null"}; resetting compositor camera");
+                dynamicCompositorCamera.enabled = false;
+                ReinitDynamicCompositorTexture();
+                dynamicCompositorCamera.enabled = true;
+                dynamicCompositor.lastCompositeFrame = Time.frameCount;
+                if (++compositorRecoveries >= 2)
+                {
+                    Logger.LogError("[CameraHealth] polygon compositor stalled after recovery; scheduling Classic fallback");
+                    dynamicPipelineFailed = true;
+                }
+            }
+            if (dynamicActive)
+            {
+                for (int i = 0; i < hudCameras.Length; i++)
+                {
+                    if (hudCameras[i] == null || !hudCameras[i].enabled || hudExpectedSinceFrames[i] < 0) continue;
+                    int age = Time.frameCount - Math.Max(hudExpectedSinceFrames[i], lastHudPostFrames[i]);
+                    if (age <= RenderStallFrames || Time.frameCount - lastHudRecoveryFrames[i] <= RenderRecoveryCooldown) continue;
+                    Logger.LogWarning($"[CameraHealth] frame={Time.frameCount} unzoomed HUD cam={i} stalled for {age} frames; rebuilding its mod-owned render texture");
+                    hudCameras[i].enabled = false;
+                    ReinitHudTexture(i);
+                    hudCameras[i].enabled = true;
+                    lastHudRecoveryFrames[i] = Time.frameCount;
+                    hudExpectedSinceFrames[i] = Time.frameCount;
+                }
+                if (globalHudCamera != null && globalHudCamera.enabled && globalHudExpectedSinceFrame >= 0)
+                {
+                    int age = Time.frameCount - Math.Max(globalHudExpectedSinceFrame, lastGlobalHudPostFrame);
+                    if (age > RenderStallFrames && Time.frameCount - lastGlobalHudRecoveryFrame > RenderRecoveryCooldown)
+                    {
+                        Logger.LogWarning($"[CameraHealth] frame={Time.frameCount} global HUD camera stalled for {age} frames; rebuilding its mod-owned render texture");
+                        globalHudCamera.enabled = false;
+                        ReinitGlobalHudTexture();
+                        globalHudCamera.enabled = true;
+                        lastGlobalHudRecoveryFrame = Time.frameCount;
+                        globalHudExpectedSinceFrame = Time.frameCount;
+                    }
+                }
             }
         }
 

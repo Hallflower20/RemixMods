@@ -187,6 +187,7 @@ namespace SplitScreenCoop
                 HookEndpointManager.Modify(typeof(JollyCoop.JollyHUD.JollyPlayerSpecificHud).GetProperty("Camera").GetGetMethod(),
                     new ILContext.Manipulator(JollyPlayerSpecificHud_get_Camera));
                 IL.JollyCoop.JollyHUD.JollyPlayerSpecificHud.JollyOffRoom.Update += JollyOffRoom_Update1;
+                On.JollyCoop.JollyHUD.JollyPlayerSpecificHud.JollyOffRoom.Update += JollyOffRoom_Update;
                 IL.HUD.Map.Draw += HudMap_Draw;
                 On.HUD.KarmaMeter.Draw += KarmaMeter_Draw;
                 On.HUD.FoodMeter.Draw += FoodMeter_Draw;
@@ -321,6 +322,21 @@ namespace SplitScreenCoop
         {
             dualDisplays = Options.DualDisplays.Value;
             alwaysSplit = Options.AlwaysSplit.Value;
+            dynamicStyle = Options.SplitStyle.Value != "Classic" && dynamicPipelineAvailable &&
+                !dynamicPipelineFailed;
+            dynamicSettings.mergeDistance = Options.MergeDistance.Value;
+            dynamicSettings.blendWidth = Options.BlendWidth.Value;
+            dynamicSettings.minZoom = Options.MinZoom.Value;
+            dynamicSettings.zoomExponent = Options.ZoomExponent.Value;
+            dynamicSettings.dividerWidth = Options.DividerWidth.Value;
+            dynamicSettings.smoothingTime = Options.SmoothingTime.Value;
+            dynamicDebugOverlay = Options.DebugOverlay.Value;
+            FilterMode zoomFilter = Options.ZoomedFilter.Value == "Point"
+                ? FilterMode.Point : FilterMode.Bilinear;
+            foreach (CameraListener listener in cameraListeners)
+                if (listener?.renderTexture != null)
+                    listener.renderTexture.filterMode = dynamicStyle ? zoomFilter :
+                        Futile.screen?.renderTexture?.filterMode ?? FilterMode.Point;
 
             if (dualDisplays && DualDisplaySupported())
             {
@@ -426,6 +442,7 @@ namespace SplitScreenCoop
             camera2.enabled = false;
             camera3.enabled = false;
             camera4.enabled = false;
+            InitDynamicCompositor(self);
             self.UpdateCameraPosition();
             Logger.LogInfo("Futile_Init camera2 success");
         }
@@ -445,6 +462,8 @@ namespace SplitScreenCoop
             {
                 l?.ReinitRenderTexture(false);
             }
+            ReinitDynamicCompositorTexture();
+            ReinitHudTextures();
             Logger.LogInfo($"[CameraRenderTarget] frame={Time.frameCount} rebuilt after FScreen resize; displayWidth={displayWidth}");
         }
 
@@ -463,7 +482,9 @@ namespace SplitScreenCoop
                 var x = (Futile.screen.originX - 0.5f) * -Futile.screen.pixelWidth * Futile.displayScaleInverse + Futile.screenPixelOffset.x + offset.x;
                 var y = (Futile.screen.originY - 0.5f) * -Futile.screen.pixelHeight * Futile.displayScaleInverse - Futile.screenPixelOffset.y + offset.y;
                 fcameras[i].transform.position = new Vector3(x, y, -10f);
+                if (hudCameras[i] != null) hudCameras[i].transform.position = new Vector3(x, y, -10f);
             }
+            if (globalHudCamera != null) globalHudCamera.transform.position = fcameras[0].transform.position;
         }
 
 
@@ -527,6 +548,7 @@ namespace SplitScreenCoop
             pendingKarmaFlowerPosition = null;
             CurrentSplitMode = SplitMode.NoSplit;
             ResetCameraDiagnostics();
+            ResetDynamicLayout();
 
             orig(self, manager);
 
@@ -541,8 +563,10 @@ namespace SplitScreenCoop
                         self.cameras[i].followAbstractCreature = player;
                     else
                         self.cameras[i].followAbstractCreature = self.session.Players[0];
+                    MoveCameraHudToOverlay(self.cameras[i]);
                 }
-                SetSplitMode(alwaysSplit ? ResolveSplitMode(self.session.Players.Count) : SplitMode.NoSplit, self, "game start");
+                SetSplitMode(dynamicStyle && !dualDisplays ? SplitMode.NoSplit :
+                    alwaysSplit ? ResolveSplitMode(self.session.Players.Count) : SplitMode.NoSplit, self, "game start");
             }
             else
             {
@@ -572,6 +596,7 @@ namespace SplitScreenCoop
             self.splitScreenMode = false; // don't, mine is better
             self.offset = Vector2.zero;
             foreach (var c in self.SpriteLayers) c.SetPosition(camOffsets[self.cameraNumber]);
+            MoveCameraHudToOverlay(self);
         }
 
         /// <summary>
@@ -580,6 +605,7 @@ namespace SplitScreenCoop
         public void RainWorldGame_ShutDownProcess(On.RainWorldGame.orig_ShutDownProcess orig, RainWorldGame self)
         {
             Logger.LogInfo("RainWorldGame_ShutDownProcess cleanups");
+            ResetDynamicLayout();
             SetSplitMode(SplitMode.NoSplit, self, "game shutdown");
             if (dualDisplays && DualDisplaySupported())
             {
@@ -631,8 +657,21 @@ namespace SplitScreenCoop
 
             if (self.cameras.Length > 1)
             {
+                if (dynamicStyle && dynamicPipelineFailed)
+                {
+                    Logger.LogWarning($"[CameraLayout] frame={Time.frameCount} restoring Classic after compositor failure");
+                    RestoreClassicHud(self);
+                    dynamicStyle = false;
+                    ResetDynamicLayout();
+                }
                 EnsureStableCameraAssignments(self);
                 List<int> aliveCameras = GetAliveCameraNumbers(self);
+                if (dynamicStyle && !dualDisplays)
+                {
+                    UpdateDynamicLayout(self, aliveCameras);
+                }
+                else
+                {
                 bool splitTargets = aliveCameras
                     .Select(cameraNumber => self.cameras.FirstOrDefault(camera => camera.cameraNumber == cameraNumber))
                     .Where(camera => camera != null)
@@ -653,6 +692,7 @@ namespace SplitScreenCoop
                         ? (desiredMode == SplitMode.NoSplit ? "camera targets converged or one survivor" : "camera targets diverged or survivor count changed")
                         : "active survivor cameras changed";
                     SetSplitMode(desiredMode, self, reason);
+                }
                 }
 
                 if (CurrentSplitMode != SplitMode.NoSplit && self.cameras[0].room != null && self.cameras[0].room.abstractRoom.name == "SB_L01") // honestly jolly
@@ -687,6 +727,10 @@ namespace SplitScreenCoop
         /// </summary>
         public void SetSplitMode(SplitMode split, RainWorldGame game, string reason = null)
         {
+            dynamicActive = false;
+            if (dynamicCompositorCamera != null) dynamicCompositorCamera.enabled = false;
+            foreach (var listener in cameraListeners)
+                if (listener != null) listener.dynamicCompositing = false;
             SplitMode previousMode = CurrentSplitMode;
             List<int> aliveCameras = GetAliveCameraNumbers(game);
             if (aliveCameras.Count == 0 && game?.cameras?.Length > 0) aliveCameras.Add(game.cameras[0].cameraNumber);
@@ -945,6 +989,7 @@ namespace SplitScreenCoop
 
         public void FoodMeter_Draw(On.HUD.FoodMeter.orig_Draw orig, HUD.FoodMeter self, float timeStacker)
         {
+            if (dynamicStyle && !dualDisplays) { orig(self, timeStacker); return; }
             var oldPos = self.pos;
             var oldLastPos = self.lastPos;
             RoomCamera cam = GetHUDPartCurrentCamera(self);
@@ -964,6 +1009,7 @@ namespace SplitScreenCoop
 
         public void KarmaMeter_Draw(On.HUD.KarmaMeter.orig_Draw orig, HUD.KarmaMeter self, float timeStacker)
         {
+            if (dynamicStyle && !dualDisplays) { orig(self, timeStacker); return; }
             var oldPos = self.pos;
             var oldLastPos = self.lastPos;
             RoomCamera cam = GetHUDPartCurrentCamera(self);
@@ -983,6 +1029,7 @@ namespace SplitScreenCoop
 
         public void RainMeter_Draw(On.HUD.RainMeter.orig_Draw orig, HUD.RainMeter self, float timeStacker)
         {
+            if (dynamicStyle && !dualDisplays) { orig(self, timeStacker); return; }
             List<Vector2> oldPoses = new List<Vector2>();
             List<Vector2> oldLastPoses = new List<Vector2>();
             RoomCamera cam = GetHUDPartCurrentCamera(self);
@@ -1011,6 +1058,7 @@ namespace SplitScreenCoop
         public void TextPrompt_Draw(On.HUD.TextPrompt.orig_Draw orig, HUD.TextPrompt self, float timeStacker)
         {
             orig(self, timeStacker);
+            if (dynamicStyle && !dualDisplays) return;
             RoomCamera cam = GetHUDPartCurrentCamera(self);
             if (cam != null)
             {
@@ -1058,6 +1106,7 @@ namespace SplitScreenCoop
 
         public void HypothermiaMeter_Draw(On.MoreSlugcats.HypothermiaMeter.orig_Draw orig, MoreSlugcats.HypothermiaMeter self, float timeStacker)
         {
+            if (dynamicStyle && !dualDisplays) { orig(self, timeStacker); return; }
             List<Vector2> oldPoses = new List<Vector2>();
             List<Vector2> oldLastPoses = new List<Vector2>();
             RoomCamera cam = GetHUDPartCurrentCamera(self);
@@ -1085,6 +1134,7 @@ namespace SplitScreenCoop
 
         public void GourmandMeter_Draw(On.MoreSlugcats.GourmandMeter.orig_Draw orig, MoreSlugcats.GourmandMeter self, float timeStacker)
         {
+            if (dynamicStyle && !dualDisplays) { orig(self, timeStacker); return; }
             List<Vector2> oldPoses = new List<Vector2>();
             List<Vector2> oldGoalPoses = new List<Vector2>();
             RoomCamera cam = GetHUDPartCurrentCamera(self);
@@ -1193,6 +1243,8 @@ namespace SplitScreenCoop
                         return returnValue;
                     if (returnValue)
                     {
+                        if (dynamicStyle && !dualDisplays && TryProjectJollyPlayer(self, out Vector2 projected))
+                            return PointInsideDynamicRegion(self.jollyHud.Camera.cameraNumber, projected);
                         if (followedCreature == null || followedCreature.realizedCreature == null || followedCreature.Room == null)
                         {
                             return true;
@@ -1347,12 +1399,14 @@ namespace SplitScreenCoop
 
         public void ToggleCameraZoom(RoomCamera cam)
         {
+            if (dynamicStyle && !dualDisplays) return; // automatic region zoom replaces the manual toggle
             SetCameraZoom(cam, !cameraZoomed[cam.cameraNumber]);
             Logger.LogInfo($"[CameraZoom] frame={Time.frameCount} cam={cam.cameraNumber} zoomed={cameraZoomed[cam.cameraNumber]} room={cam.room?.abstractRoom?.name ?? "null"}");
         }
 
         public void SetCameraZoom(RoomCamera cam, bool enabled)
         {
+            if (dynamicStyle && !dualDisplays) return;
             var camNum = cam.cameraNumber;
             int layoutSlot = Mathf.Max(0, renderedCameraNumbers.IndexOf(camNum));
             cameraZoomed[camNum] = enabled;
@@ -1398,6 +1452,7 @@ namespace SplitScreenCoop
 
         public Vector2 GetGlobalHudOffset(RoomCamera camera)
         {
+            if (dynamicStyle && !dualDisplays) return Vector2.zero;
             if (!cameraZoomed[camera.cameraNumber])
                 return GetRelativeSplitScreenOffset(camera);
             return new Vector2(0, 0);
@@ -1405,6 +1460,7 @@ namespace SplitScreenCoop
 
         public Vector2 GetSplitScreenHudOffset(RoomCamera camera, int cameraNumber)
         {
+            if (dynamicStyle && !dualDisplays) return camOffsets[cameraNumber];
             Vector2 offset = camOffsets[cameraNumber];
             if (!cameraZoomed[camera.cameraNumber])
                 offset += GetRelativeSplitScreenOffset(camera);
@@ -1413,6 +1469,7 @@ namespace SplitScreenCoop
 
         public Vector2 GetRelativeSplitScreenOffset(RoomCamera camera)
         {
+            if (dynamicStyle && !dualDisplays) return Vector2.zero;
             Vector2 offset = new Vector2();
             if (CurrentSplitMode == SplitMode.SplitHorizontal)
             {

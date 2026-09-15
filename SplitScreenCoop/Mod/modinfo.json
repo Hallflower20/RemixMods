@@ -4,7 +4,7 @@
   "version": "0.2.2",
   "target_game_version": "v1.11.1",
   "authors": "Henpemaz, Kert",
-  "description": "Stable two-to-four-player split-screen co-op, including Watcher shader and ripple support. Players keep fixed screen positions: player 1 left and player 2 right, a triangle for three players, and four corners for four players.<LINE><LINE>Self-sufficient co-op supports shared food, separate shelter wake locations, player 2 class and custom colors, death feedback, gates, and remote rooms.<LINE><LINE>Originally by Henpemaz<LINE>Github link: https://github.com/henpemaz/RemixMods<LINE>Special thanks to:<LINE>- Intikus, helped with the trailer<LINE>- NoirCatto, playtesting and support<LINE>- Kert, implemented 4-way split and zoom feature!",
+  "description": "Dynamic two-to-four-player split-screen co-op with distance-based merging, rotating weighted regions, automatic bounded zoom, and Watcher shader and ripple support. Camera ownership stays with each player while screen sides follow their relative world positions. Classic fixed layouts and Dual Display remain available in options.<LINE><LINE>Self-sufficient co-op supports shared food, separate shelter wake locations, death feedback, gates, and remote rooms.<LINE><LINE>Originally by Henpemaz<LINE>Github link: https://github.com/henpemaz/RemixMods<LINE>Special thanks to:<LINE>- Intikus, helped with the trailer<LINE>- NoirCatto, playtesting and support<LINE>- Kert, implemented 4-way split and zoom feature!",
   "requirements": [],
   "requirements_names": [],
   "tags": [ "Game Modes", "Accessibility" ],
