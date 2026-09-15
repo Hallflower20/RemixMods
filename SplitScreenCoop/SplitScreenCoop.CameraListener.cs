@@ -26,6 +26,7 @@ namespace SplitScreenCoop
             public Dictionary<int, List<Vector4>> ShaderVectorLists = new Dictionary<int, List<Vector4>>();
             public Dictionary<int, float> ShaderFloats = new Dictionary<int, float>();
             public Dictionary<int, Texture> ShaderTextures = new Dictionary<int, Texture>();
+            public Dictionary<string, bool> ShaderKeywords = new Dictionary<string, bool>();
             public Rect sourceRect;
             public Rect targetRect;
             public int srcX;
@@ -82,16 +83,23 @@ namespace SplitScreenCoop
 
             public void ReinitRenderTexture()
             {
-                if (renderTexture != null)
-                {
-                    renderTexture.Release();
-                    renderTexture.DiscardContents();
-                    renderTexture = null;
-                }
+                if (fcamera != null) fcamera.targetTexture = null;
+                ReleaseTexture(ref renderTexture);
+                ReleaseTexture(ref tempTex);
                 display.Extras().ReinitRenderTexture();
                 renderTexture = new RenderTexture(Futile.screen.renderTexture);
-                tempTex = new RenderTexture(renderTexture);
+                renderTexture.name = $"SplitScreen camera {Array.IndexOf(cameraListeners, this)}";
                 SetMap(this.sourceRect, this.targetRect);
+                Retarget();
+            }
+
+            private static void ReleaseTexture(ref RenderTexture texture)
+            {
+                if (texture == null) return;
+                texture.Release();
+                texture.DiscardContents();
+                UnityEngine.Object.Destroy(texture);
+                texture = null;
             }
             
             /// <summary>
@@ -99,6 +107,8 @@ namespace SplitScreenCoop
             /// </summary>
             public void SetMap(Rect sourceRect, Rect targetRect)
             {
+                if (sourceRect.width <= 0f || sourceRect.height <= 0f) sourceRect = new Rect(0f, 0f, 1f, 1f);
+                if (targetRect.width <= 0f || targetRect.height <= 0f) targetRect = new Rect(0f, 0f, 1f, 1f);
                 var h = renderTexture.height;
                 var w = renderTexture.width;
                 srcX = Mathf.FloorToInt(w * sourceRect.x);
@@ -119,18 +129,28 @@ namespace SplitScreenCoop
             /// </summary>
             public void OnPreRender()
             {
-                foreach (var kv in ShaderColors.ToArray())
-                    Shader.SetGlobalColor(kv.Key, kv.Value);
-                foreach (var kv in ShaderVectors.ToArray())
-                    Shader.SetGlobalVector(kv.Key, kv.Value);
-                foreach (var kv in ShaderVectorArrays.ToArray())
-                    Shader.SetGlobalVectorArray(kv.Key, kv.Value);
-                foreach (var kv in ShaderVectorLists.ToArray())
-                    Shader.SetGlobalVectorArray(kv.Key, kv.Value);
-                foreach (var kv in ShaderFloats.ToArray())
-                    Shader.SetGlobalFloat(kv.Key, kv.Value);
-                foreach (var kv in ShaderTextures.ToArray())
-                    Shader.SetGlobalTexture(kv.Key, kv.Value);
+                restoringShaderState = true;
+                try
+                {
+                    foreach (var kv in ShaderColors) Shader.SetGlobalColor(kv.Key, kv.Value);
+                    foreach (var kv in ShaderVectors) Shader.SetGlobalVector(kv.Key, kv.Value);
+                    foreach (var kv in ShaderVectorArrays) Shader.SetGlobalVectorArray(kv.Key, kv.Value);
+                    foreach (var kv in ShaderVectorLists) Shader.SetGlobalVectorArray(kv.Key, kv.Value);
+                    foreach (var kv in ShaderFloats) Shader.SetGlobalFloat(kv.Key, kv.Value);
+                    foreach (var kv in ShaderTextures) Shader.SetGlobalTexture(kv.Key, kv.Value);
+                    foreach (var kv in globalShaderKeywords) SetKeyword(kv.Key, kv.Value);
+                    foreach (var kv in ShaderKeywords) SetKeyword(kv.Key, kv.Value);
+                }
+                finally
+                {
+                    restoringShaderState = false;
+                }
+            }
+
+            private static void SetKeyword(string keyword, bool enabled)
+            {
+                if (enabled) Shader.EnableKeyword(keyword);
+                else Shader.DisableKeyword(keyword);
             }
 
             /// <summary>
@@ -140,15 +160,36 @@ namespace SplitScreenCoop
             {
                 if (!_direct)
                 {
-                    if (srcWidth != dstWidth)
+                    RenderTexture destination = display.Extras().renderTexture;
+                    if (destination == null || srcWidth <= 0 || srcHeight <= 0 || dstWidth <= 0 || dstHeight <= 0) return;
+
+                    if (Array.IndexOf(cameraListeners, this) == 0 && lastCompositorClearFrame != Time.frameCount)
                     {
-                        var scale = sourceRect.width / targetRect.width;
-                        Graphics.Blit(renderTexture, tempTex, new Vector2(scale, scale), new Vector2(0, 0));
-                        Graphics.CopyTexture(tempTex, 0, 0, 0, 0, dstWidth, dstHeight, Futile.screen.renderTexture, 0, 0, dstX, dstY);
+                        var previous = RenderTexture.active;
+                        Graphics.SetRenderTarget(destination);
+                        GL.Clear(true, true, Color.black);
+                        RenderTexture.active = previous;
+                        lastCompositorClearFrame = Time.frameCount;
+                    }
+
+                    if (srcWidth != dstWidth || srcHeight != dstHeight)
+                    {
+                        if (tempTex == null || tempTex.width != dstWidth || tempTex.height != dstHeight)
+                        {
+                            ReleaseTexture(ref tempTex);
+                            tempTex = new RenderTexture(dstWidth, dstHeight, 0, renderTexture.format)
+                            {
+                                filterMode = FilterMode.Point,
+                                name = "SplitScreen scaled camera"
+                            };
+                            tempTex.Create();
+                        }
+                        Graphics.Blit(renderTexture, tempTex, new Vector2(sourceRect.width, sourceRect.height), new Vector2(sourceRect.x, sourceRect.y));
+                        Graphics.CopyTexture(tempTex, 0, 0, 0, 0, dstWidth, dstHeight, destination, 0, 0, dstX, dstY);
                     }
                     else
                     {
-                        Graphics.CopyTexture(renderTexture, 0, 0, srcX, srcY, srcWidth, srcHeight, Futile.screen.renderTexture, 0, 0, dstX, dstY);
+                        Graphics.CopyTexture(renderTexture, 0, 0, srcX, srcY, srcWidth, srcHeight, destination, 0, 0, dstX, dstY);
                     }
                 }
             }
@@ -156,17 +197,12 @@ namespace SplitScreenCoop
             public void OnDestroy()
             {
                 ShaderTextures.Clear();
+                ShaderKeywords.Clear();
+                if (fcamera != null) fcamera.targetTexture = null;
                 fcamera = null;
                 display = null;
-                if (renderTexture != null)
-                {
-                    renderTexture.Release();
-                    renderTexture.DiscardContents();
-                    renderTexture = null;
-                    tempTex.Release();
-                    tempTex.DiscardContents();
-                    tempTex = null;
-                }
+                ReleaseTexture(ref renderTexture);
+                ReleaseTexture(ref tempTex);
             }
 
             internal void BindToDisplay(Display display)

@@ -1,92 +1,29 @@
-﻿Summary:
-Immediate stuff that can be worked on:
-- menu for current settings: alwayssplit, preferredsplitmode (for the 2 people out there who like vertical split)
-	done - thanks Noir!
-- smoother camera following
-- smarter jolly camera switching
-	for instance if there's only 2 players a lot can be simplified
-- attempt at 3 and 4 camera modes
-- attempt at splitting the game in 2 or more windows, 2 or more monitors.
-	done
-- visual separator when in split mode
+SplitScreen Co-op 0.2.0 status
+================================
 
-Stuff related to the self-sufficient-coop, aka nonjollycoop
-- fix: play death gong on death
-- fix: detect player carried to den as missing so others can rest/travel
-- feature: separate remix-based color picker for player2
-- feature: save shelter of player2, wake up in that shelter
+Implemented
+-----------
+[x] Remix menu for permanent split and preferred two-player split direction.
+[x] Smooth split-camera following.
+[x] Stable camera ownership: player 1/player 2 remain left/right.
+[x] Three-player triangle and four-player corner layouts.
+[x] Black visual separators between split views.
+[x] Multi-display fullscreen activation, menu mirroring, availability fallback.
+[x] Independent room realizers for every remote player.
+[x] Self-sufficient shared food and any-survivor karma progression.
+[x] Self-sufficient shelter, starvation, game-over, and gate checks.
+[x] Players captured into a den are considered missing for shelter/gate checks.
+[x] Death gong for each player.
+[x] Player 2 class selector and Remix color pickers.
+[x] Separate shelter persistence and wake placement within the loaded world/region.
+[x] Player 2 karma-flower death position.
+[x] Friends saved by non-primary players count at cycle end.
+[x] Player 2 sign-in/input initialization without Jolly enabled.
+[x] Watcher per-camera level textures, ripple buffers, masks, and shader keywords.
 
-Self-sufficient coop mode
-	apparently saving is broken? 2 reports, needs testing
-		saving in selfsufficient coop
-	done
-		since most people play with latency, easier mode is nice to have
-			shared food meter
-			karma up (win) if ANY survived rather than ALL
-
-		food conditions check and fix
-
-		food at end of session
-		food at start of session
-			done and done!
-
-		prevent gameover prompts
-
-		Gates should work really well
-			same logic as shelters? dead/Missing or there
-
-		fix hunter start
-		fix friend to offscreenden
-
-	todo
-		fix players input without jolly
-			player 1 controls 1 and 2?
-			study inptu system
-		
-		QOL minor stuff
-			doesn't do the gong on death (gameover skipped but should still player the sfx)
-
-		2-screen mode
-			for double screens or ultra-wide
-
-		menu
-			player2 class dropdown
-			preferred split mode dropdown
-				actually do revise these requirements
-
-		gates when player aten by lizor
-			no workie
-
-		fix realizer2
-			game unloaded player 2 as it was being CARRIED into another room
-				unreproduceable?
-			I think I broke this with jolly, jolly doesn't handle players splitting up so restore real2 asap
-				done?
-	
-		sleep (and wake up) in different shelters
-			store shelter of player2
-			place player2 in stored shelter
-	
-		karma flower spawn super buggy on player 2 dying
-
-		Support remix custom colors
-
-splitscreen
-	smooth camera follow a little
-
-	3 and 4 cameras
-
-	custom colors when nojolly
-
-Multiple displays
-	It requires being in full screen, or will force full screen
-
-	If this mode is active, the game should be in double-display mode, even in menus
-		in menus ideally displays should be mirrored
-
-	turning this mode on will force fullscreen and initialize a second display
-	turning this mode on requires extra displays available
-	if this mode is already on and there's no extra displays, revert to default split
-
-	turning this mode off from the menu warns that a restart is required
-
+Release validation
+------------------
+[ ] Run a full Watcher cycle with players in different rooms and shelters.
+[ ] Exercise Watcher warp/ripple rooms with two, three, and four players.
+[ ] Exercise dual-display enable/disable across a game restart.
+[ ] Confirm Hunter cycle expiry and all campaign-specific endings in co-op.

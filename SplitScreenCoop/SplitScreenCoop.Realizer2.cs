@@ -1,107 +1,89 @@
-﻿using System;
 using System.Linq;
-using UnityEngine;
-using MonoMod.Cil;
-using Mono.Cecil.Cil;
-using HUD;
-using System.Collections.Generic;
 
 namespace SplitScreenCoop
 {
     public partial class SplitScreenCoop
     {
         /// <summary>
-        /// Creates extra RoomRealizer for p2
+        /// Give every additional player an independent room realizer. Sharing the
+        /// primary realizer's mutable lists caused duplicate mutation and freezes.
         /// </summary>
-        private void MakeRealizer2(RainWorldGame self)
+        private void MakeRealizer2(RainWorldGame game)
         {
-            Logger.LogInfo("MakeRealizer2");
-            if (self.session.Players.Count < 2 || self.roomRealizer == null) return;
-            var player = self.session.Players.FirstOrDefault(p => p != self.roomRealizer.followCreature);
-            if (player == null) return;
-            Logger.LogInfo("MakeRealizer2 making RoomRealizer");
-            realizer2 = new RoomRealizer(player, self.world)
+            additionalRealizers.Clear();
+            realizer2 = null;
+            if (game?.roomRealizer == null || game.session?.Players == null) return;
+
+            foreach (AbstractCreature player in game.session.Players.Where(p => p != game.roomRealizer.followCreature))
             {
-                realizedRooms = self.roomRealizer.realizedRooms,
-                recentlyAbstractedRooms = self.roomRealizer.recentlyAbstractedRooms,
-                realizeNeighborCandidates = self.roomRealizer.realizeNeighborCandidates
-            };
+                var realizer = new RoomRealizer(player, game.world);
+                additionalRealizers.Add(realizer);
+            }
+            realizer2 = additionalRealizers.FirstOrDefault();
+            Logger.LogInfo($"Created {additionalRealizers.Count} additional room realizer(s)");
         }
 
-        /// <summary>
-        /// Realizer2 in new world
-        /// </summary>
         public void OverWorld_WorldLoaded(On.OverWorld.orig_WorldLoaded orig, OverWorld self, bool warpUsed)
         {
-            ConsiderColapsing(self.game, true);
+            bool rebuild = additionalRealizers.Count > 0;
+            additionalRealizers.Clear();
+            realizer2 = null;
             orig(self, warpUsed);
-            if (realizer2 != null) MakeRealizer2(self.game);
+            if (rebuild || self.game?.session?.Players?.Count > 1) MakeRealizer2(self.game);
+            ConsiderColapsing(self.game, true);
         }
 
         /// <summary>
-        /// Room realizers that aren't the main one re-assigning themselves to cameras[0].followcreature
-        /// dont reasign if cam.followcreature is null, you dumb fuck
+        /// Vanilla always copies camera zero's target into a realizer. Temporarily
+        /// expose this realizer's own target there so each instance remains stable.
         /// </summary>
-        public void RoomRealizer_Update(ILContext il)
+        public void RoomRealizer_Update(On.RoomRealizer.orig_Update orig, RoomRealizer self)
         {
+            RainWorldGame game = self?.world?.game;
+            if (game?.cameras == null || game.cameras.Length == 0 || self == game.roomRealizer)
+            {
+                orig(self);
+                return;
+            }
+
+            AbstractCreature previous = game.cameras[0].followAbstractCreature;
             try
             {
-                // skip this.followCreature = cam[0].followCreature if this != game.roomRealizer || game.cam[0].follow==null || would switch to follow already followed
-                var c = new ILCursor(il);
-                c.GotoNext(MoveType.Before,
-                    i => i.MatchStfld<RoomRealizer>("followCreature"),
-                    i => i.MatchLdarg(0),
-                    i => i.MatchLdfld<RoomRealizer>("followCreature"));
-                c.Index++;
-                c.MoveAfterLabels();
-                var skip = c.MarkLabel();
-                c.GotoPrev(MoveType.Before,
-                    i => i.MatchLdarg(0),
-                    i => i.MatchLdarg(0),
-                    i => i.MatchLdfld<RoomRealizer>("world"));
-                c.Emit(OpCodes.Ldarg_0);
-                c.EmitDelegate((RoomRealizer self) =>
-                {
-                    if (self != self.world?.game?.roomRealizer // I'm realizer2
-                    || self.world?.game?.cameras[0].followAbstractCreature == null // or I'd assign null
-                    || (self.followCreature != null && realizer2 != null && self.world.game.cameras[0].followAbstractCreature == realizer2.followCreature) // or I'd reassign to a creature that is followed by re2
-                    )
-                    {
-                        return true; // then don't
-                    }
-                    return false;
-                });
-                c.Emit(OpCodes.Brtrue, skip);
+                if (self.followCreature != null) game.cameras[0].followAbstractCreature = self.followCreature;
+                orig(self);
             }
-            catch (Exception e)
+            finally
             {
-                Logger.LogError(e);
-                throw;
+                game.cameras[0].followAbstractCreature = previous;
             }
         }
 
         public bool rrNestedLock;
-        /// <summary>
-        /// Realizers work together
-        /// </summary>
-        public bool RoomRealizer_CanAbstractizeRoom(On.RoomRealizer.orig_CanAbstractizeRoom orig, RoomRealizer self, RoomRealizer.RealizedRoomTracker tracker)
-        {
 
-            var r = orig(self, tracker);
-            if (!rrNestedLock && realizer2 != null) // if other exists, not recursive
+        /// <summary>
+        /// A room may abstract only when every player realizer agrees it is safe.
+        /// </summary>
+        public bool RoomRealizer_CanAbstractizeRoom(On.RoomRealizer.orig_CanAbstractizeRoom orig,
+            RoomRealizer self, RoomRealizer.RealizedRoomTracker tracker)
+        {
+            bool result = orig(self, tracker);
+            if (!result || rrNestedLock) return result;
+
+            try
             {
-                RoomRealizer other;
-                RoomRealizer prime = self?.world?.game?.roomRealizer;
-                if (prime == self) other = realizer2;
-                else other = prime;
-                if (other != null && other.followCreature != null)
-                {
-                    rrNestedLock = true;
-                    r = r && other.CanAbstractizeRoom(tracker);
-                    rrNestedLock = false;
-                }
+                rrNestedLock = true;
+                RoomRealizer primary = self?.world?.game?.roomRealizer;
+                if (primary != null && primary != self && primary.followCreature != null)
+                    result &= primary.CanAbstractizeRoom(tracker);
+                foreach (RoomRealizer other in additionalRealizers)
+                    if (other != null && other != self && other.followCreature != null)
+                        result &= other.CanAbstractizeRoom(tracker);
+                return result;
             }
-            return r;
+            finally
+            {
+                rrNestedLock = false;
+            }
         }
     }
 }

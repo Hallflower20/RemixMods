@@ -88,11 +88,11 @@ namespace SplitScreenCoop
                         inpause = false;
                     }
                 }
-                else if (CurrentSplitMode == SplitMode.Split4Screen)
+                else if (IsGridSplit(CurrentSplitMode))
                 {
                     float xOffset = manager.rainWorld.screenSize.x / 4f;
                     float yOffset = manager.rainWorld.screenSize.y / 4f;
-                    self.container.SetPosition(xOffset, -yOffset);
+                    self.container.SetPosition(CurrentSplitMode == SplitMode.Split3Screen ? 0f : xOffset, -yOffset);
                     inpause = true;
                     try
                     {
@@ -104,13 +104,18 @@ namespace SplitScreenCoop
 
                         var pause2 = new Menu.PauseMenu(manager, game);
                         var pause3 = new Menu.PauseMenu(manager, game);
-                        var pause4 = new Menu.PauseMenu(manager, game);
-                        pause2.container.SetPosition(camOffsets[game.cameras[1].cameraNumber] + new Vector2(-xOffset, -yOffset));
-                        pause3.container.SetPosition(camOffsets[game.cameras[2].cameraNumber] + new Vector2(xOffset, yOffset));
-                        pause4.container.SetPosition(camOffsets[game.cameras[3].cameraNumber] + new Vector2(-xOffset, yOffset));
+                        pause2.container.SetPosition(camOffsets[game.cameras[1].cameraNumber] +
+                            (CurrentSplitMode == SplitMode.Split3Screen ? new Vector2(xOffset, yOffset) : new Vector2(-xOffset, -yOffset)));
+                        pause3.container.SetPosition(camOffsets[game.cameras[2].cameraNumber] +
+                            (CurrentSplitMode == SplitMode.Split3Screen ? new Vector2(-xOffset, yOffset) : new Vector2(xOffset, yOffset)));
                         manager.sideProcesses.Add(pause2);
                         manager.sideProcesses.Add(pause3);
-                        manager.sideProcesses.Add(pause4);
+                        if (game.cameras.Length > 3)
+                        {
+                            var pause4 = new Menu.PauseMenu(manager, game);
+                            pause4.container.SetPosition(camOffsets[game.cameras[3].cameraNumber] + new Vector2(-xOffset, yOffset));
+                            manager.sideProcesses.Add(pause4);
+                        }
                     }
                     finally
                     {
@@ -358,7 +363,7 @@ namespace SplitScreenCoop
                         float pad = rc.sSize.y / 4f;
                         if (rc.followAbstractCreature != null && rc.followAbstractCreature.realizedCreature is Creature cr)
                         {
-                            if (!cr.inShortcut) rc.pos.y = rc.followAbstractCreature.realizedCreature.mainBodyChunk.pos.y - 2 * pad;
+                            if (!cr.inShortcut) rc.pos.y = SmoothCameraAxis(rc.pos.y, rc.followAbstractCreature.realizedCreature.mainBodyChunk.pos.y - 2 * pad, rc.sSize.y);
                             else
                             {
                                 Vector2? vector = rc.room.game.shortcuts.OnScreenPositionOfInShortCutCreature(rc.room, cr);
@@ -375,7 +380,7 @@ namespace SplitScreenCoop
                         float pad = rc.sSize.x / 4f;
                         if (rc.followAbstractCreature != null && rc.followAbstractCreature.realizedCreature is Creature cr)
                         {
-                            if (!cr.inShortcut) rc.pos.x = rc.followAbstractCreature.realizedCreature.mainBodyChunk.pos.x - 2 * pad;
+                            if (!cr.inShortcut) rc.pos.x = SmoothCameraAxis(rc.pos.x, rc.followAbstractCreature.realizedCreature.mainBodyChunk.pos.x - 2 * pad, rc.sSize.x);
                             else
                             {
                                 Vector2? vector = rc.room.game.shortcuts.OnScreenPositionOfInShortCutCreature(rc.room, cr);
@@ -387,7 +392,7 @@ namespace SplitScreenCoop
                             rc.pos.x += rc.followCreatureInputForward.x * 2f;
                         }
                     }
-                    else if(CurrentSplitMode == SplitMode.Split4Screen)
+                    else if(IsGridSplit(CurrentSplitMode))
                     {
                         float pad = rc.sSize.x / 4f;
                         float pad2 = rc.sSize.y / 4f;
@@ -395,8 +400,8 @@ namespace SplitScreenCoop
                         {
                             if (!cr.inShortcut)
                             {
-                                rc.pos.x = rc.followAbstractCreature.realizedCreature.mainBodyChunk.pos.x - 2 * pad;
-                                rc.pos.y = rc.followAbstractCreature.realizedCreature.mainBodyChunk.pos.y - 2 * pad2;
+                                rc.pos.x = SmoothCameraAxis(rc.pos.x, rc.followAbstractCreature.realizedCreature.mainBodyChunk.pos.x - 2 * pad, rc.sSize.x);
+                                rc.pos.y = SmoothCameraAxis(rc.pos.y, rc.followAbstractCreature.realizedCreature.mainBodyChunk.pos.y - 2 * pad2, rc.sSize.y);
                             }
                             else
                             {
@@ -420,7 +425,7 @@ namespace SplitScreenCoop
                     c.Emit(OpCodes.Ldarg_0); // RoomCamera
                     c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                     {
-                        if (CurrentSplitMode == SplitMode.SplitVertical || CurrentSplitMode == SplitMode.Split4Screen && !cameraZoomed[rc.cameraNumber])
+                        if ((CurrentSplitMode == SplitMode.SplitVertical || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                         {
                             return v - rc.sSize.x / 4f;
                         }
@@ -432,7 +437,7 @@ namespace SplitScreenCoop
                     c.Emit(OpCodes.Ldarg_0); // RoomCamera
                     c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                     {
-                        if (CurrentSplitMode == SplitMode.SplitVertical || CurrentSplitMode == SplitMode.Split4Screen && !cameraZoomed[rc.cameraNumber])
+                        if ((CurrentSplitMode == SplitMode.SplitVertical || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                         {
                             return v + rc.sSize.x / 4f;
                         }
@@ -444,7 +449,7 @@ namespace SplitScreenCoop
                     c.Emit(OpCodes.Ldarg_0); // RoomCamera
                     c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                     {
-                        if (CurrentSplitMode == SplitMode.SplitHorizontal || CurrentSplitMode == SplitMode.Split4Screen && !cameraZoomed[rc.cameraNumber])
+                        if ((CurrentSplitMode == SplitMode.SplitHorizontal || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                         {
                             return v - rc.sSize.y / 4f;
                         }
@@ -457,7 +462,7 @@ namespace SplitScreenCoop
                     c.Emit(OpCodes.Ldarg_0); // RoomCamera
                     c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                     {
-                        if (CurrentSplitMode == SplitMode.SplitHorizontal || CurrentSplitMode == SplitMode.Split4Screen && !cameraZoomed[rc.cameraNumber])
+                        if ((CurrentSplitMode == SplitMode.SplitHorizontal || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                         {
                             return v + rc.sSize.y / 4f;
                         }
@@ -522,7 +527,7 @@ namespace SplitScreenCoop
                         c.Emit(OpCodes.Ldarg_0); // RoomCamera
                         c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                         {
-                            if (CurrentSplitMode == SplitMode.SplitVertical || CurrentSplitMode == SplitMode.Split4Screen && !cameraZoomed[rc.cameraNumber])
+                            if ((CurrentSplitMode == SplitMode.SplitVertical || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                             {
                                 return v - rc.sSize.x / 4f;
                             }
@@ -534,7 +539,7 @@ namespace SplitScreenCoop
                         c.Emit(OpCodes.Ldarg_0); // RoomCamera
                         c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                         {
-                            if (CurrentSplitMode == SplitMode.SplitVertical || CurrentSplitMode == SplitMode.Split4Screen && !cameraZoomed[rc.cameraNumber])
+                            if ((CurrentSplitMode == SplitMode.SplitVertical || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                             {
                                 return v + rc.sSize.x / 4f;
                             }
@@ -546,7 +551,7 @@ namespace SplitScreenCoop
                         c.Emit(OpCodes.Ldarg_0); // RoomCamera
                         c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                         {
-                            if (CurrentSplitMode == SplitMode.SplitHorizontal || CurrentSplitMode == SplitMode.Split4Screen && !cameraZoomed[rc.cameraNumber])
+                            if ((CurrentSplitMode == SplitMode.SplitHorizontal || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                             {
                                 return v - rc.sSize.y / 4f;
                             }
@@ -559,7 +564,7 @@ namespace SplitScreenCoop
                         c.Emit(OpCodes.Ldarg_0); // RoomCamera
                         c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                         {
-                            if (CurrentSplitMode == SplitMode.SplitHorizontal || CurrentSplitMode == SplitMode.Split4Screen && !cameraZoomed[rc.cameraNumber])
+                            if ((CurrentSplitMode == SplitMode.SplitHorizontal || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                             {
                                 return v + rc.sSize.y / 4f;
                             }

@@ -46,8 +46,13 @@ namespace SplitScreenCoop
             {
                 if (renderTexture != null)
                 {
-                    renderTexture.Release();
-                    renderTexture.DiscardContents();
+                    // Futile owns the primary render texture. Releasing it here used to
+                    // invalidate the texture that FScreen had just recreated.
+                    if (display != Display.main)
+                    {
+                        renderTexture.Release();
+                        renderTexture.DiscardContents();
+                    }
                     renderTexture = null;
                 }
             }

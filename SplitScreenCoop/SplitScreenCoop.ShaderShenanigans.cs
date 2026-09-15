@@ -1,11 +1,15 @@
 ﻿
 using System.Collections.Generic;
+using System.Linq;
 using UnityEngine;
 
 namespace SplitScreenCoop
 {
     public partial class SplitScreenCoop
     {
+        internal static bool restoringShaderState;
+        internal static int lastCompositorClearFrame = -1;
+        internal static readonly Dictionary<string, bool> globalShaderKeywords = new Dictionary<string, bool>();
         //Envelop camera-related stuff that does shader.set calls so we know the calling camera index and can re-apply those in a sane way later
         //not 100% robust (currently we don't store "global" assignments that one camera might choose to overwrite or not)
 
@@ -81,6 +85,7 @@ namespace SplitScreenCoop
         public void Shader_SetGlobalColor(delSetGlobalColor orig, int nameID, Color vec)
         {
             orig(nameID, vec);
+            if (restoringShaderState) return;
             if (curCamera >= 0 && cameraListeners[curCamera] is CameraListener l)
             {
                 l.ShaderColors[nameID] = vec;
@@ -95,18 +100,20 @@ namespace SplitScreenCoop
         public void Shader_SetGlobalVectorArrayArray(delSetGlobalVectorArrayArray orig, int nameID, Vector4[] values)
         {
             orig(nameID, values);
+            if (restoringShaderState) return;
             if (curCamera >= 0 && cameraListeners[curCamera] is CameraListener l)
             {
-                l.ShaderVectorArrays[nameID] = values;
+                l.ShaderVectorArrays[nameID] = values?.ToArray();
             }
         }
         public delegate void delSetGlobalVectorArrayList(int nameID, List<Vector4> values);
         public void Shader_SetGlobalVectorArrayList(delSetGlobalVectorArrayList orig, int nameID, List<Vector4> values)
         {
             orig(nameID, values);
+            if (restoringShaderState) return;
             if (curCamera >= 0 && cameraListeners[curCamera] is CameraListener l)
             {
-                l.ShaderVectorLists[nameID] = values;
+                l.ShaderVectorLists[nameID] = values == null ? null : new List<Vector4>(values);
             }
         }
 
@@ -114,6 +121,7 @@ namespace SplitScreenCoop
         public void Shader_SetGlobalVector(delSetGlobalVector orig, int nameID, Vector4 vec)
         {
             orig(nameID, vec);
+            if (restoringShaderState) return;
             if (curCamera >= 0 && cameraListeners[curCamera] is CameraListener l)
             {
                 l.ShaderVectors[nameID] = vec;
@@ -128,6 +136,7 @@ namespace SplitScreenCoop
         public void Shader_SetGlobalFloat(delSetGlobalFloat orig, int nameID, float f)
         {
             orig(nameID, f);
+            if (restoringShaderState) return;
             if (curCamera >= 0 && cameraListeners[curCamera] is CameraListener l && (nameID != RainWorld.ShadPropRain))
             {
                 l.ShaderFloats[nameID] = f;
@@ -138,6 +147,7 @@ namespace SplitScreenCoop
         public void Shader_SetGlobalInt(delSetGlobalInt orig, int nameID, int i)
         {
             orig(nameID, i);
+            if (restoringShaderState) return;
             if (curCamera >= 0 && cameraListeners[curCamera] is CameraListener l)
             {
                 l.ShaderFloats[nameID] = i; // underlying handler is the same
@@ -148,6 +158,7 @@ namespace SplitScreenCoop
         public void Shader_SetGlobalTexture(delSetGlobalTexture orig, int nameID, Texture t)
         {
             orig(nameID, t);
+            if (restoringShaderState) return;
             if (curCamera >= 0 && cameraListeners[curCamera] is CameraListener l)
             {
                 l.ShaderTextures[nameID] = t;
@@ -156,6 +167,91 @@ namespace SplitScreenCoop
             {
                 cameraListeners[0].ShaderTextures[nameID] = t;
             }
+        }
+
+        public delegate void delSetGlobalColorString(string name, Color value);
+        public void Shader_SetGlobalColorString(delSetGlobalColorString orig, string name, Color value)
+        {
+            orig(name, value);
+            if (restoringShaderState) return;
+            if (curCamera >= 0 && cameraListeners[curCamera] is CameraListener listener)
+                listener.ShaderColors[Shader.PropertyToID(name)] = value;
+        }
+
+        public delegate void delSetGlobalVectorString(string name, Vector4 value);
+        public void Shader_SetGlobalVectorString(delSetGlobalVectorString orig, string name, Vector4 value)
+        {
+            orig(name, value);
+            if (restoringShaderState) return;
+            if (curCamera >= 0 && cameraListeners[curCamera] is CameraListener listener)
+                listener.ShaderVectors[Shader.PropertyToID(name)] = value;
+        }
+
+        public delegate void delSetGlobalVectorArrayArrayString(string name, Vector4[] values);
+        public void Shader_SetGlobalVectorArrayArrayString(delSetGlobalVectorArrayArrayString orig, string name, Vector4[] values)
+        {
+            orig(name, values);
+            if (restoringShaderState) return;
+            if (curCamera >= 0 && cameraListeners[curCamera] is CameraListener listener)
+                listener.ShaderVectorArrays[Shader.PropertyToID(name)] = values?.ToArray();
+        }
+
+        public delegate void delSetGlobalVectorArrayListString(string name, List<Vector4> values);
+        public void Shader_SetGlobalVectorArrayListString(delSetGlobalVectorArrayListString orig, string name, List<Vector4> values)
+        {
+            orig(name, values);
+            if (restoringShaderState) return;
+            if (curCamera >= 0 && cameraListeners[curCamera] is CameraListener listener)
+                listener.ShaderVectorLists[Shader.PropertyToID(name)] = values == null ? null : new List<Vector4>(values);
+        }
+
+        public delegate void delSetGlobalFloatString(string name, float value);
+        public void Shader_SetGlobalFloatString(delSetGlobalFloatString orig, string name, float value)
+        {
+            orig(name, value);
+            if (restoringShaderState) return;
+            if (curCamera >= 0 && cameraListeners[curCamera] is CameraListener listener)
+                listener.ShaderFloats[Shader.PropertyToID(name)] = value;
+        }
+
+        public delegate void delSetGlobalIntString(string name, int value);
+        public void Shader_SetGlobalIntString(delSetGlobalIntString orig, string name, int value)
+        {
+            orig(name, value);
+            if (restoringShaderState) return;
+            if (curCamera >= 0 && cameraListeners[curCamera] is CameraListener listener)
+                listener.ShaderFloats[Shader.PropertyToID(name)] = value;
+        }
+
+        public delegate void delSetGlobalTextureString(string name, Texture value);
+        public void Shader_SetGlobalTextureString(delSetGlobalTextureString orig, string name, Texture value)
+        {
+            orig(name, value);
+            if (restoringShaderState) return;
+            if (curCamera >= 0 && cameraListeners[curCamera] is CameraListener listener)
+                listener.ShaderTextures[Shader.PropertyToID(name)] = value;
+        }
+
+        public delegate void delShaderKeyword(string keyword);
+        public void Shader_EnableKeyword(delShaderKeyword orig, string keyword)
+        {
+            orig(keyword);
+            RecordShaderKeyword(keyword, true);
+        }
+
+        public void Shader_DisableKeyword(delShaderKeyword orig, string keyword)
+        {
+            orig(keyword);
+            RecordShaderKeyword(keyword, false);
+        }
+
+        private static void RecordShaderKeyword(string keyword, bool enabled)
+        {
+            if (restoringShaderState || string.IsNullOrEmpty(keyword)) return;
+            if (curCamera >= 0 && curCamera < cameraListeners.Length && cameraListeners[curCamera] != null)
+                cameraListeners[curCamera].ShaderKeywords[keyword] = enabled;
+            else
+                globalShaderKeywords[keyword] = enabled;
         }
     }
 }

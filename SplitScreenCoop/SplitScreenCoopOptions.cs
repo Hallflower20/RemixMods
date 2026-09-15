@@ -6,8 +6,8 @@ using Menu.Remix.MixedUI;
 using Menu.Remix.MixedUI.ValueTypes;
 using UnityEngine;
 
-namespace SplitScreenCoop;
-
+namespace SplitScreenCoop
+{
 public class SplitScreenCoopOptions : OptionInterface
 {
     class BetterComboBox : OpComboBox
@@ -29,14 +29,23 @@ public class SplitScreenCoopOptions : OptionInterface
     {
         PreferredSplitMode = this.config.Bind("PreferredSplitMode", SplitScreenCoop.SplitMode.SplitVertical);
         AlwaysSplit = this.config.Bind("AlwaysSplit", false);
-        AllowCameraSwapping = this.config.Bind("AllowCameraSwapping", false);
         DualDisplays = this.config.Bind("DualDisplays", false);
+        Player2Class = this.config.Bind("Player2Class", "Campaign");
+        Player2BodyColor = this.config.Bind("Player2BodyColor", new Color(0.85f, 0.2f, 0.2f));
+        Player2FaceColor = this.config.Bind("Player2FaceColor", Color.white);
+        Player2AccentColor = this.config.Bind("Player2AccentColor", new Color(1f, 0.8f, 0.15f));
+        if (PreferredSplitMode.Value != SplitScreenCoop.SplitMode.NoSplit &&
+            PreferredSplitMode.Value != SplitScreenCoop.SplitMode.SplitVertical)
+            PreferredSplitMode.Value = SplitScreenCoop.SplitMode.SplitVertical;
     }
 
     public readonly Configurable<SplitScreenCoop.SplitMode> PreferredSplitMode;
     public readonly Configurable<bool> AlwaysSplit;
-    public readonly Configurable<bool> AllowCameraSwapping;
     public readonly Configurable<bool> DualDisplays;
+    public readonly Configurable<string> Player2Class;
+    public readonly Configurable<Color> Player2BodyColor;
+    public readonly Configurable<Color> Player2FaceColor;
+    public readonly Configurable<Color> Player2AccentColor;
     private UIelement[] UIArrOptions;
 
     public override void Initialize()
@@ -51,15 +60,31 @@ public class SplitScreenCoopOptions : OptionInterface
             new OpCheckBox(AlwaysSplit, 10f, 450),
             new OpLabel(40f, 450, "Permanent split mode") { verticalAlignment = OpLabel.LabelVAlignment.Center },
 
-            new OpCheckBox(AllowCameraSwapping, 10f, 410),
-            new OpLabel(40f, 410, "Allow camera swapping even if there's enough cameras") { verticalAlignment = OpLabel.LabelVAlignment.Center },
-
-            e = new OpCheckBox(DualDisplays, 10f, 370) { description = "Requires two physical displays" },
-            new OpLabel(40f, 370, "Dual Display (experimental)") { verticalAlignment = OpLabel.LabelVAlignment.Center },
+            e = new OpCheckBox(DualDisplays, 10f, 410) { description = "Requires two physical displays" },
+            new OpLabel(40f, 410, "Dual Display (experimental)") { verticalAlignment = OpLabel.LabelVAlignment.Center },
             
             // added last due to overlap
             new OpLabel(10f, 520, "Split Mode") { verticalAlignment = OpLabel.LabelVAlignment.Center },
-            new BetterComboBox(PreferredSplitMode, new Vector2(10f, 490), 200f, OpResourceSelector.GetEnumNames(null, typeof(SplitScreenCoop.SplitMode)).ToList()),
+            new BetterComboBox(PreferredSplitMode, new Vector2(10f, 490), 200f, new List<ListItem>
+            {
+                new ListItem("NoSplit", 0), new ListItem("SplitVertical", 1)
+            }),
+
+            new OpLabel(320f, 550f, "Player 2", true),
+            new OpLabel(320f, 520f, "Class"),
+            new BetterComboBox(Player2Class, new Vector2(320f, 490f), 230f, new List<ListItem>
+            {
+                new ListItem("Campaign", 0), new ListItem("White", 1), new ListItem("Yellow", 2),
+                new ListItem("Red", 3), new ListItem("Night", 4), new ListItem("Gourmand", 5),
+                new ListItem("Artificer", 6), new ListItem("Rivulet", 7), new ListItem("Spear", 8),
+                new ListItem("Saint", 9), new ListItem("Watcher", 10)
+            }),
+            new OpLabel(250f, 455f, "Body"),
+            new OpColorPicker(Player2BodyColor, new Vector2(250f, 285f)),
+            new OpLabel(415f, 455f, "Face"),
+            new OpColorPicker(Player2FaceColor, new Vector2(415f, 285f)),
+            new OpLabel(330f, 260f, "Accent"),
+            new OpColorPicker(Player2AccentColor, new Vector2(330f, 90f)),
         };
 
         e.greyedOut = !SplitScreenCoop.DualDisplaySupported();
@@ -67,4 +92,5 @@ public class SplitScreenCoopOptions : OptionInterface
         // Add items to the tab
         opTab.AddItems(UIArrOptions);
     }
+}
 }

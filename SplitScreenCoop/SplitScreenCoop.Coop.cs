@@ -13,6 +13,8 @@ namespace SplitScreenCoop
         public static bool coopSharedFood = true;
         public static bool sheltersClose;
         public static bool coopActualGameover;
+        private const string ShelterSavePrefix = "SPLITSCREEN_SHELTERS<svB>";
+        private static WorldCoordinate? pendingKarmaFlowerPosition;
 
         public void CoopUpdate(RainWorldGame game)
         {
@@ -113,7 +115,9 @@ namespace SplitScreenCoop
         // Player considered dead or missing if dead or missing or in a grasp for longer than a second
         public bool PlayerDeadOrMissing(AbstractCreature absPlayer)
         {
-            return IsCreatureDead(absPlayer) || (absPlayer.realizedCreature is Player p && p.dangerGrasp != null && p.dangerGraspTime > 40);
+            return IsCreatureDead(absPlayer)
+                || absPlayer.InDen
+                || (absPlayer.realizedCreature is Player p && p.dangerGrasp != null && p.dangerGraspTime > 40);
         }
 
         public bool PlayerHasEnoughFood(AbstractCreature p, bool toStarve)
@@ -181,7 +185,7 @@ namespace SplitScreenCoop
                 c.MoveAfterLabels();
                 
                 c.Emit(OpCodes.Ldarg_0);
-                c.EmitDelegate(ShelterUpdate);
+                c.EmitDelegate<Action<Player>>(ShelterUpdate);
             }
             catch (Exception e)
             {
@@ -266,6 +270,7 @@ namespace SplitScreenCoop
 
         public void CoopWinOrLoose(RainWorldGame game)
         {
+            SavePlayerShelters(game);
             FixMissingPlayers(game); // SessionEnd doesn't like when players are in a different region
             if(game.session.Players.Any(p => !PlayerDeadOrMissing(p)))
             {
@@ -288,9 +293,87 @@ namespace SplitScreenCoop
             }
         }
 
+        private void Player_Die(On.Player.orig_Die orig, Player self)
+        {
+            bool firstDeath = !self.dead;
+            orig(self);
+
+            if (firstDeath && selfSufficientCoop)
+            {
+                if (self.PlaceKarmaFlower && self.karmaFlowerGrowPos.HasValue)
+                    pendingKarmaFlowerPosition = self.karmaFlowerGrowPos;
+                RoomCamera camera = self.abstractCreature?.world?.game?.cameras?
+                    .FirstOrDefault(c => c.followAbstractCreature == self.abstractCreature)
+                    ?? self.abstractCreature?.world?.game?.cameras?.FirstOrDefault();
+                camera?.hud?.PlaySound(SoundID.UI_Multiplayer_Player_Dead_A);
+                camera?.hud?.PlaySound(SoundID.UI_Multiplayer_Player_Dead_B);
+            }
+        }
+
+        private void StoryGameSession_PlaceKarmaFlowerOnDeathSpot(On.StoryGameSession.orig_PlaceKarmaFlowerOnDeathSpot orig, StoryGameSession self)
+        {
+            if (!selfSufficientCoop || !pendingKarmaFlowerPosition.HasValue)
+            {
+                orig(self);
+                return;
+            }
+            self.saveState.deathPersistentSaveData.karmaFlowerPosition = pendingKarmaFlowerPosition;
+            if (ModManager.Expedition && self.saveState.progression.rainWorld.ExpeditionMode)
+                Expedition.ExpeditionGame.tempKarmaPos = pendingKarmaFlowerPosition;
+            if (self.RedIsOutOfCycles)
+                self.game.manager.rainWorld.progression.miscProgressionData.redsFlower = pendingKarmaFlowerPosition;
+            pendingKarmaFlowerPosition = null;
+        }
+
+        private static string[] ReadPlayerShelters(SaveState saveState, int count)
+        {
+            string record = saveState?.unrecognizedSaveStrings?.LastOrDefault(s => s.StartsWith(ShelterSavePrefix, StringComparison.Ordinal));
+            string[] rooms = record == null ? Array.Empty<string>() : record.Substring(ShelterSavePrefix.Length).Split(',');
+            Array.Resize(ref rooms, Mathf.Max(count, rooms.Length));
+            return rooms;
+        }
+
+        private static void SavePlayerShelters(RainWorldGame game)
+        {
+            SaveState saveState = game?.GetStorySession?.saveState;
+            if (saveState?.unrecognizedSaveStrings == null) return;
+
+            string[] rooms = ReadPlayerShelters(saveState, game.session.Players.Count);
+            foreach (AbstractCreature player in game.session.Players)
+            {
+                int playerNumber = (player.state as PlayerState)?.playerNumber ?? -1;
+                if (playerNumber >= 0 && playerNumber < rooms.Length && player.realizedCreature?.room?.abstractRoom?.shelter == true)
+                    rooms[playerNumber] = player.realizedCreature.room.abstractRoom.name;
+            }
+
+            saveState.unrecognizedSaveStrings.RemoveAll(s => s.StartsWith(ShelterSavePrefix, StringComparison.Ordinal));
+            saveState.unrecognizedSaveStrings.Add(ShelterSavePrefix + string.Join(",", rooms.Select(r => r ?? string.Empty)));
+        }
+
+        private static void RestorePlayerShelters(RainWorldGame game)
+        {
+            SaveState saveState = game?.GetStorySession?.saveState;
+            if (saveState == null || game.world == null) return;
+            string[] rooms = ReadPlayerShelters(saveState, game.session.Players.Count);
+
+            foreach (AbstractCreature player in game.session.Players)
+            {
+                int playerNumber = (player.state as PlayerState)?.playerNumber ?? -1;
+                if (playerNumber <= 0 || playerNumber >= rooms.Length || string.IsNullOrEmpty(rooms[playerNumber])) continue;
+                AbstractRoom target = game.world.GetAbstractRoom(rooms[playerNumber]);
+                if (target == null || !target.shelter) continue; // cross-region shelter records wait for that region
+
+                player.Room?.RemoveEntity(player);
+                player.pos = new WorldCoordinate(target.index, -1, -1, 0);
+                player.world = game.world;
+                target.AddEntity(player);
+            }
+        }
+
         public void FixMissingPlayers(RainWorldGame game)
         {
-            var validPlayer = game.Players.First(p => game.world.GetAbstractRoom(p.pos) != null);
+            var validPlayer = game.Players.FirstOrDefault(p => game.world.GetAbstractRoom(p.pos) != null);
+            if (validPlayer == null) return;
             game.Players.ForEach(p => { if (game.world.GetAbstractRoom(p.pos) == null) { p.pos = validPlayer.pos; p.world = validPlayer.world; } });
         }
 

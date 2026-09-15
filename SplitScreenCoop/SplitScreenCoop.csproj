@@ -13,6 +13,8 @@
     <LangVersion>latest</LangVersion>
     <FileAlignment>512</FileAlignment>
     <Deterministic>true</Deterministic>
+    <RainWorldPath Condition="'$(RainWorldPath)' == ''">D:\Steam\steamapps\common\Rain World</RainWorldPath>
+    <AssemblySearchPaths>$(RainWorldPath)\BepInEx\core;$(RainWorldPath)\BepInEx\plugins;$(RainWorldPath)\BepInEx\utils;$(RainWorldPath)\RainWorld_Data\Managed;{HintPathFromItem};{TargetFrameworkDirectory};{RawFileName};{GAC}</AssemblySearchPaths>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <DebugSymbols>true</DebugSymbols>
@@ -68,10 +70,6 @@
       <HintPath>C:\Program Files (x86)\Steam\steamapps\common\Rain World\RainWorld_Data\Managed\GalaxyCSharp.dll</HintPath>
       <Private>False</Private>
     </Reference>
-    <Reference Include="GoKit">
-      <HintPath>C:\Program Files (x86)\Steam\steamapps\common\Rain World\RainWorld_Data\Managed\GoKit.dll</HintPath>
-      <Private>False</Private>
-    </Reference>
     <Reference Include="HarmonyXInterop">
       <HintPath>C:\Program Files (x86)\Steam\steamapps\common\Rain World\BepInEx\core\HarmonyXInterop.dll</HintPath>
       <Private>False</Private>
@@ -108,11 +106,6 @@
       <HintPath>C:\Program Files (x86)\Steam\steamapps\common\Rain World\BepInEx\core\MonoMod.Utils.dll</HintPath>
       <Private>False</Private>
     </Reference>
-    <Reference Include="Newtonsoft.Json, Version=13.0.0.0, Culture=neutral, PublicKeyToken=30ad4fe6b2a6aeed, processorArchitecture=MSIL">
-      <SpecificVersion>False</SpecificVersion>
-      <HintPath>C:\Program Files (x86)\Steam\steamapps\common\Rain World\RainWorld_Data\Managed\Newtonsoft.Json.dll</HintPath>
-      <Private>False</Private>
-    </Reference>
     <Reference Include="PUBLIC-Assembly-CSharp">
       <HintPath>C:\Program Files (x86)\Steam\steamapps\common\Rain World\BepInEx\utils\PUBLIC-Assembly-CSharp.dll</HintPath>
       <Private>False</Private>
@@ -125,16 +118,8 @@
       <HintPath>C:\Program Files (x86)\Steam\steamapps\common\Rain World\RainWorld_Data\Managed\Rewired_Windows.dll</HintPath>
       <Private>False</Private>
     </Reference>
-    <Reference Include="SonyNP">
-      <HintPath>C:\Program Files (x86)\Steam\steamapps\common\Rain World\RainWorld_Data\Managed\SonyNP.dll</HintPath>
-      <Private>False</Private>
-    </Reference>
     <Reference Include="SonyPS4SaveData">
       <HintPath>C:\Program Files (x86)\Steam\steamapps\common\Rain World\RainWorld_Data\Managed\SonyPS4SaveData.dll</HintPath>
-      <Private>False</Private>
-    </Reference>
-    <Reference Include="StovePCSDK.NET">
-      <HintPath>C:\Program Files (x86)\Steam\steamapps\common\Rain World\RainWorld_Data\Managed\StovePCSDK.NET.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="System" />
@@ -420,6 +405,7 @@
     <Compile Include="SplitScreenCoop.Multicamera.cs" />
     <Compile Include="SplitScreenCoop.Realizer2.cs" />
     <Compile Include="SplitScreenCoop.ShaderShenanigans.cs" />
+    <Compile Include="SplitScreenCoop.WatcherCompat.cs" />
     <Compile Include="SplitScreenCoopOptions.cs" />
   </ItemGroup>
   <ItemGroup>
@@ -433,6 +419,6 @@
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <PropertyGroup>
-    <PostBuildEvent>copy "$(TargetPath)" "$(ProjectDir)Mod\plugins\"</PostBuildEvent>
+    <PostBuildEvent>copy /Y "$(TargetPath)" "$(ProjectDir)Mod\plugins\"</PostBuildEvent>
   </PropertyGroup>
 </Project>
