@@ -1,6 +1,10 @@
 SplitScreen Co-op 0.2.2 status
 ================================
 
+See HANDOFF.md for how the dynamic pipeline renders, the invariants that are easy
+to break, the mechanism behind each recent fix, and how to build without a working
+MSBuild. Read it before changing rendering code.
+
 Implemented
 -----------
 [x] Automatic split mode with Remix options for permanent split and dual display.
@@ -36,22 +40,126 @@ Implemented
     to the camera that made them.
 [x] Karma fade circles travel with the globally routed karma meter.
 
+[x] A realizer can no longer abstractize a room another player, their camera or a
+    shortcut vessel still needs. RemoveNotVisitedRooms bypassed CanAbstractizeRoom,
+    which froze a player inside a pipe permanently.
+[x] One shared pause menu on the global stage, at native coordinates, so the
+    pointer lines up with what is drawn.
+[x] Futile's root stage is composited again, which is where Menu.MouseCursor
+    parents the cursor.
+[x] All players inside one shelter collapse to a single view and a single HUD.
+[x] Shader globals written from Room.Update are attributed to the cameras showing
+    that room instead of leaking between views.
+[x] Cameras loading the same room share a screen key, so spawn-in no longer opens
+    split for a couple of frames.
+
+[x] Layout cells are axis-aligned rectangles (2: side by side or stacked by world
+    direction; 3: the most isolated player gets a half, the others quarters; 4: a
+    2x2 grid). Each view samples one prebaked screen, and only a rectangle keeps
+    enough pan to always show its own slugcat; the Voronoi cells could not, which
+    is what the "player visibility correction" slack, the smeared edge strips and
+    the per-frame jumps were compensating for. That slack is gone.
+[x] Views pan every rendered frame from interpolated positions and are damped, so
+    following no longer steps at the 40 Hz tick or snaps when a clamp toggles.
+[x] The vanilla camera is left alone in Dynamic style; the mod no longer fights
+    RoomCamera's own clamp every tick with a follow target it could never reach.
+[x] Exiting to the menu no longer leaves a black screen: SetSplitMode stopped
+    re-isolating camera 0's culling mask after ResetDynamicLayout restored it.
+[x] Cameras that switch to a screen another camera already decoded copy its
+    pixels instead of decoding the PNG again on the main thread.
+[x] Room realizers share one performance budget (1500 + 750 per extra player) and
+    may not abstractize a room another realizer still needs, which stopped the
+    reload ping-pong of neighbour rooms between players.
+[x] Frames over 50 ms are logged as [FrameHitch] with the room loads, camera moves
+    and texture decodes that happened in them.
+[x] Default view zoom is native scale (Remix key ViewZoomExponent = 0); raise it
+    for zoomed-out cells.
+[x] MSBuild builds again (csproj targets v4.8.1, matching the installed pack).
+
+[x] Nothing fades any more. Two players on one prebaked screen merge the LEGO
+    way: both cells keep drawing the same image and each cell's pan lerps from
+    "centre my player" to "identity" as the split amount falls, so the halves
+    line up and the divider vanishes; moving apart reverses it. The split
+    amount is damped (0.25 s) so a player arriving on the other's screen
+    through a pipe glides in instead of popping. Two cells swap or reorient by
+    rotating their divider (0.45 s); three or more slide from their old
+    rectangles to their new ones over the resting layout. Cut positions slide.
+[x] Only base cameras render; a cell always draws the camera whose prebaked
+    screen its players share, so merged views are one image, not a blend.
+[x] Cameras that are not in the layout (dead players, fading ghosts) are muted;
+    their point of view no longer plays in the mix.
+[x] Rot (Watcher "red goop") renders on every camera: vanilla UpdateRotMode
+    always wrote the rot effect colours into cameras[0]'s palette, and Room.Update
+    handed cameras[0] other rooms' rot amounts. Re-implemented per camera.
+[x] Globals written while a room loads (RoofTopView's _SceneOrigoPosition and
+    friends, the city backdrop) are kept in a per-room record and copied to a
+    camera when it arrives in that room.
+[x] Any player's map button reveals the shared meters, not only the owner of the
+    camera whose HUD supplies them.
+[x] Menu camera watchdog: while no game runs, camera 0 is forced enabled, on the
+    screen texture, with the root stage in its mask, and every other camera off.
+    "[MenuCamera]" logs what it had to correct plus a snapshot per process switch.
+[x] Food pips are white again: the letterbox bars were routed onto the global
+    stage after the meters, so they were drawn over the pips. The text prompt is
+    routed first now, as vanilla builds it.
+[x] Ghost (echo) and rot palette modes are mirrored onto every camera showing the
+    room; Room.cs only ever updated cameras[0].
+[x] The game-over and pause prompts win the global prompt slot outright, so the
+    "Game Over - Press ... to restart" line cannot be left in an unrouted HUD.
+[x] [Coop] log lines mark game over, the prompt camera and GoToDeathScreen, and
+    the heartbeat carries each camera's palette state (palA/palB/blend/ghost/fog).
+
 Needs in-game confirmation
 --------------------------
+[ ] Black screen after Exit or death: read the "[MenuCamera]" lines. If they
+    show corrections, the watchdog fixed it and the correction names the cause;
+    if they show none and the screen is still black, the problem is not a
+    camera at all (look at fadeToBlack/blackDelay in the same line).
+[ ] Food pip colour: a screenshot is needed. Pips are drawn with the
+    VectorCircleFadable shader, which colours them from _PalTex, so they follow
+    the palette of the camera supplying the meters, as in vanilla. Empty pips
+    below the survival limit flash red in a shelter until sleep is possible,
+    also as in vanilla.
+[ ] Palette differences between cameras: compare the palA/palB/blend/ghost/fog
+    numbers of the two cameras in the same [CameraState] heartbeat. If they
+    match and the views still differ, the difference is not in RoomCamera state.
+[ ] Game over with everyone dead: expect "[Coop] game over" then
+    "game over prompt entered on cam=0", the prompt text at bottom left, and
+    "[Coop] GoToDeathScreen" after a key press.
+[ ] Rectangular dynamic layouts: orientation follows the players, sides do not
+    flip on jitter, nothing juts or smears at cell edges, dead players' cells
+    slide shut.
+[ ] Following: the slugcat sits at its cell centre whenever the room screen
+    allows, and the view stays smooth through pipes and screen changes.
+[ ] Stutter: read the [FrameHitch] lines from the next log. Each one names what
+    happened in that frame (realize/abstractize room, MoveCamera, level texture
+    decode or copy, GC collections). That decides what to optimize next.
+[ ] Pause: exactly one pair of letterbox bars (the global prompt camera's), one
+    pause menu, and Exit returns to the main menu.
 [ ] Death no longer stalls the other views (the forced room resync was the one
     mechanism found in code; confirm against a fresh log).
 [ ] Spawn-in flash is gone with the layout primed in RainWorldGame_ctor.
-[ ] Pause buttons land inside every region shape, including 3- and 4-player.
+[ ] The single shared pause menu is clickable, with a visible cursor, in 2-, 3- and
+    4-player layouts. (Per-region pause menus and their button re-placement were
+    removed; the menu is now drawn on the global stage at native coordinates.)
+[ ] 3- and 4-player layouts generally - the solver is covered by tests but the
+    compositor, HUD routing and player-visibility slack have only seen two players.
+[ ] Watcher secondary views: Room.cs calls UpdateGhostMode/UpdateRotMode on
+    cameras[0] only, so ghost and rot palettes are likely wrong on other views.
 [ ] Secondary-view palettes stay correct through a full day/night cycle and a
     shelter fade.
+[ ] Two players far apart in Chimney Canopy show their own room's colours; that
+    region's AboveCloudsView/RoofTopView effects were the leak.
+[ ] Watch for "[RoomRealizer] refused to abstractize" in the log - a steady stream
+    of those would mean rooms are being held realized too aggressively.
 
 Build notes
 -----------
-This machine has no .NET Framework 4.8 targeting pack, so MSBuild/Visual Studio
-fails the csproj with MSB3644. Install the .NET Framework 4.8 Developer Pack to
-build normally. Mod/plugins/SplitScreen Co-op.dll was produced with Roslyn csc
-against the same reference set the csproj declares (publicized Assembly-CSharp
-from BepInEx\utils, not the private one in Managed).
+The .NET Framework 4.8.1 Developer Pack is installed and both csproj files target
+v4.8.1, so MSBuild/Visual Studio build normally. Pass /p:RainWorldPath so the
+references resolve from the actual Steam folder (the hard-coded HintPaths point at
+a drive that does not exist here). Mod/plugins/SplitScreen Co-op.dll is the
+post-build copy of bin\Release.
 
 Release validation
 ------------------

@@ -130,6 +130,7 @@ namespace SplitScreenCoop
 
                 On.RoomCamera.ctor += RoomCamera_ctor1; // bind cam to camlistener
                 On.RainWorldGame.Update += RainWorldGame_Update; // split unsplit
+                On.RainWorldGame.GrafUpdate += RainWorldGame_GrafUpdate; // per-frame view panning, hitch logging
                 On.RainWorldGame.ShutDownProcess += RainWorldGame_ShutDownProcess; // unbind camlistener
 
                 // fixes in fixes file
@@ -156,6 +157,10 @@ namespace SplitScreenCoop
                 On.OverWorld.WorldLoaded += OverWorld_WorldLoaded; // roomrealizer 2 
                 On.RoomRealizer.Update += RoomRealizer_Update; // preserve each realizer's own follow target
                 On.RoomRealizer.CanAbstractizeRoom += RoomRealizer_CanAbstractizeRoom; // two checks
+                On.RoomRealizer.KillRoom += RoomRealizer_KillRoom; // RemoveNotVisitedRooms skips the checks
+                On.RoomRealizer.CurrentPerformanceEstimation += RoomRealizer_CurrentPerformanceEstimation; // one shared budget
+                On.AbstractRoom.RealizeRoom += AbstractRoom_RealizeRoom; // hitch diagnostics
+                On.AbstractRoom.Abstractize += AbstractRoom_Abstractize; // hitch diagnostics
                 On.ShelterDoor.Close += ShelterDoor_Close; // custom close logic
                 IL.Player.Update += Player_Update; // custom sleep update
                 On.ShelterDoor.DoorClosed += ShelterDoor_DoorClosed; // custom win condition
@@ -223,10 +228,22 @@ namespace SplitScreenCoop
                 // RoomCamera call. Its fog-amount global would then be recorded against
                 // no camera at all, so the views keep whichever value was written last
                 // and lose their own palette during fades and merges.
+                On.Room.Update += Room_Update; // scope a room's own globals to the cameras showing it
                 On.RoomCamera.ApplyPalette += RoomCamera_ApplyPalette;
                 On.RoomCamera.ApproximateLightmap += RoomCamera_ApproximateLightmap;
                 On.RoomCamera.WarpMoveCameraActual += RoomCamera_WarpMoveCameraActual;
                 On.RoomCamera.BlankWarpPointHoldFrame += RoomCamera_BlankWarpPointHoldFrame;
+                On.RoomCamera.UpdateGhostMode += RoomCamera_UpdateGhostMode; // Room.cs only updates cameras[0]
+                On.RoomCamera.UpdateRotMode += RoomCamera_UpdateRotMode; // and rot colours only ever hit cameras[0]
+                On.Room.Loaded += Room_Loaded; // load-time globals go to the room's record
+                On.RoomCamera.ChangeRoom += RoomCamera_ChangeRoom; // and reach a camera when it arrives
+                On.HUD.HUD.Update += HUD_Update; // any player's map button reveals the shared meters
+                On.ProcessManager.PostSwitchMainProcess += ProcessManager_PostSwitchMainProcess; // menu camera watchdog
+                On.RainWorldGame.GoToDeathScreen += RainWorldGame_GoToDeathScreen; // diagnostics
+                On.HUD.TextPrompt.EnterGameOverMode += TextPrompt_EnterGameOverMode; // diagnostics
+                // Cameras showing the same screen copy the decoded level image from
+                // each other instead of each decoding the PNG on the main thread.
+                IL.RoomCamera.ApplyPositionChange += RoomCamera_ApplyPositionChange;
 
                 // Watcher rendering assumes a single Unity camera. Route its command
                 // buffers, textures, masks and ripple state to the owning split camera.
@@ -697,7 +714,6 @@ namespace SplitScreenCoop
 
             if (self.cameras.Length > 1)
             {
-                EnsureStableCameraAssignments(self);
                 List<int> aliveCameras = GetAliveCameraNumbers(self);
                 if (dynamicStyle && !dualDisplays)
                 {
@@ -870,10 +886,10 @@ namespace SplitScreenCoop
                 }
                 cameraListeners[0].direct = true;
             }
-            if (dynamicStyle && !dualDisplays && game.cameras.Length > 1)
-                for (int i = 0; i < fcameras.Length; i++)
-                    if (fcameras[i] != null && worldLayers[i] > 0)
-                        fcameras[i].cullingMask = 1 << worldLayers[i];
+            // World-layer isolation belongs to ApplyDynamicCameraRendering, which runs
+            // every tick while a session is live. Doing it here too re-isolated camera
+            // 0 during shutdown, right after ResetDynamicLayout had restored its mask,
+            // and the main menu then rendered as a black screen.
             RefreshActiveCameraRendering(game, reason ?? "split mode update");
         }
 

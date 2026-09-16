@@ -4,7 +4,24 @@ using UnityEngine;
 
 namespace SplitScreenCoop
 {
-    /// <summary>Game-independent screen geometry. Coordinates in the output are normalized bottom-left to top-right.</summary>
+    /// <summary>
+    /// Game-independent screen geometry. Coordinates in the output are normalized
+    /// bottom-left to top-right.
+    ///
+    /// At rest every cell is an axis-aligned rectangle. That is not a stylistic
+    /// choice: each view samples one prebaked room screen, so a cell can only pan by
+    /// however much of the source its bounding box leaves uncovered. A rectangle of
+    /// width w keeps 1-w of horizontal pan and always has a legal pan that shows its
+    /// own player. A diagonal cell touching two opposite screen edges has no pan at
+    /// all, and the followed slugcat can end up on the far side of its own divider.
+    ///
+    /// Nothing ever fades. Two players on one prebaked screen merge the way a split
+    /// screen in a LEGO game does: their cells keep drawing the same image, and the
+    /// pan of each cell moves from "centre my player" to "identity" as the split
+    /// amount falls, so the two halves line up and the divider disappears. Layout
+    /// changes animate geometrically: two cells rotate their divider, more cells
+    /// slide from their old rectangle to their new one.
+    /// </summary>
     public sealed class SplitLayoutSolver
     {
         public sealed class Settings
@@ -12,11 +29,23 @@ namespace SplitScreenCoop
             public float mergeDistance = 850f;
             public float blendWidth = 300f;
             public float minZoom = 0.5f;
-            public float zoomExponent = 0.5f;
+            public float zoomExponent = 0f;
             public float smoothingTime = 0.18f;
             public float dividerWidth = 2f;
             public float screenAspect = 1.75f;
             public bool permanentSplit;
+            /// <summary>World-unit dead zone before two cells swap sides.</summary>
+            public float directionDeadZone = 160f;
+            /// <summary>Minimum seconds between structural changes of one layout node.</summary>
+            public float layoutHoldSeconds = 0.75f;
+            /// <summary>Seconds a rotate or slide transition takes.</summary>
+            public float transitionSeconds = 0.45f;
+            /// <summary>
+            /// Response time of the per-pair split amount. A player arriving on the
+            /// other's screen through a pipe changes the pair's screen key in one tick;
+            /// damping the amount lets the two views glide together instead of popping.
+            /// </summary>
+            public float splitSmoothingTime = 0.25f;
         }
 
         public struct PlayerInput
@@ -34,12 +63,19 @@ namespace SplitScreenCoop
             public bool ghost;
             public bool rendering;
             public int sharesImageWith = -1;
+            /// <summary>The cell as it is drawn this frame; a slide moves it towards <see cref="targetPolygon"/>.</summary>
             public Vector2[] polygon;
+            /// <summary>The resting rectangle of this cell.</summary>
+            public Vector2[] targetPolygon;
             public float areaFraction;
             public float groupAreaFraction;
             public Vector2 regionAnchor;
             public Vector2 groupSourceAnchor;
             public Vector2 groupTargetAnchor;
+            /// <summary>Bottom-left corner of the whole group's bounding box.</summary>
+            public Vector2 groupMin;
+            /// <summary>Top-right corner of the whole group's bounding box.</summary>
+            public Vector2 groupMax;
             public float zoom;
             public float splitAmount;
             public float imageBlend;
@@ -63,16 +99,14 @@ namespace SplitScreenCoop
             public DividerSegment[] dividers;
             public float[,] pairSplitAmounts;
             public PlayerInput[] effectiveInputs;
+            /// <summary>True while cells are sliding towards their target rectangles.</summary>
+            public bool sliding;
         }
 
         private sealed class Memory
         {
-            public Vector2 site;
-            public Vector2 siteVelocity;
             public Vector2 worldPos;
             public bool hasWorldPos;
-            public float weight;
-            public float weightVelocity;
             public float visibleFor;
             public PlayerInput lastInput;
             public float lastArea;
@@ -81,17 +115,89 @@ namespace SplitScreenCoop
             public bool wasPresent;
         }
 
+        /// <summary>Per layout-node hysteresis. A node is the set of cameras it partitions.</summary>
+        private sealed class NodeMemory
+        {
+            public int itemCount;
+            public int axis = -1;
+            public bool reversed;
+            public int splitOffMask;
+            public float changedAt = -1000f;
+            public float fraction = -1f;
+            public float fractionVelocity;
+        }
+
+        private sealed class PairMemory
+        {
+            public bool joined;
+            public float split = -1f;
+            public float splitVelocity;
+        }
+
+        private struct Box
+        {
+            public float x, y, w, h;
+            public Box(float x, float y, float w, float h) { this.x = x; this.y = y; this.w = w; this.h = h; }
+            public Vector2 Center { get { return new Vector2(x + w * 0.5f, y + h * 0.5f); } }
+            public float Area { get { return w * h; } }
+            public Vector2[] Polygon()
+            {
+                return new[] { new Vector2(x, y), new Vector2(x + w, y), new Vector2(x + w, y + h), new Vector2(x, y + h) };
+            }
+            public static Box Lerp(Box a, Box b, float t)
+            {
+                return new Box(Mathf.Lerp(a.x, b.x, t), Mathf.Lerp(a.y, b.y, t), Mathf.Lerp(a.w, b.w, t), Mathf.Lerp(a.h, b.h, t));
+            }
+            public static Box Of(Vector2[] polygon)
+            {
+                Vector2 min = new Vector2(1f, 1f), max = Vector2.zero;
+                Bounds(polygon, ref min, ref max);
+                return new Box(min.x, min.y, Mathf.Max(0f, max.x - min.x), Mathf.Max(0f, max.y - min.y));
+            }
+        }
+
+        private sealed class Item
+        {
+            public readonly List<int> members = new List<int>(4);
+            public int mask;
+            public float weight;
+            public float structuralWeight;
+            public Vector2 center;
+            public Box box;
+        }
+
+        private enum TransitionMode { None, Rotate, Slide }
+
         private readonly Dictionary<int, Memory> memory = new Dictionary<int, Memory>();
-        private readonly Dictionary<long, Vector2> lastPairNormals = new Dictionary<long, Vector2>();
-        private readonly Dictionary<long, bool> pairJoined = new Dictionary<long, bool>();
+        private readonly Dictionary<long, PairMemory> pairs = new Dictionary<long, PairMemory>();
+        private readonly Dictionary<int, NodeMemory> nodes = new Dictionary<int, NodeMemory>();
+        private readonly Dictionary<int, Vector2[]> lastShown = new Dictionary<int, Vector2[]>();
+        private readonly Dictionary<int, Box> lastTargets = new Dictionary<int, Box>();
+        private readonly Dictionary<int, Box> slideFrom = new Dictionary<int, Box>();
+        private TransitionMode transition = TransitionMode.None;
+        private float transitionT = 1f;
+        private int rotateLow = -1, rotateHigh = -1;
+        private Vector2 rotateFromNormal, rotateToNormal;
+        private float rotateFromArea;
+        private float clock;
         private const float Epsilon = 0.00001f;
         private const float DeathTransitionSeconds = 0.7f;
+        private const float MinCellExtent = 0.3f;
+        private const float AspectWeight = 0.75f;
+        private const float SwitchMargin = 0.25f;
+        private const float SnapThreshold = 0.04f;
 
         public void Reset()
         {
             memory.Clear();
-            lastPairNormals.Clear();
-            pairJoined.Clear();
+            pairs.Clear();
+            nodes.Clear();
+            lastShown.Clear();
+            lastTargets.Clear();
+            slideFrom.Clear();
+            transition = TransitionMode.None;
+            transitionT = 1f;
+            clock = 0f;
         }
 
         public Layout Solve(IList<PlayerInput> players, float dt, Settings settings)
@@ -100,12 +206,14 @@ namespace SplitScreenCoop
             if (settings == null) throw new ArgumentNullException(nameof(settings));
             if (players.Count > 4) throw new ArgumentOutOfRangeException(nameof(players), "At most four cameras are supported.");
             dt = Mathf.Clamp(dt, 0.001f, 0.1f);
+            clock += dt;
             int aliveCount = players.Count;
             if (aliveCount == 0)
             {
                 foreach (Memory state in memory.Values) state.wasPresent = false;
-                return new Layout { viewports = new ViewportState[0], dividers = new DividerSegment[0],
-                    pairSplitAmounts = new float[0, 0], effectiveInputs = new PlayerInput[0] };
+                lastShown.Clear();
+                lastTargets.Clear();
+                return Empty();
             }
             bool[] aliveNumbers = new bool[4];
             List<PlayerInput> effective = new List<PlayerInput>(4);
@@ -137,22 +245,15 @@ namespace SplitScreenCoop
             }
             players = effective.ToArray();
             int count = players.Count;
-            if (count == 0) return new Layout { viewports = new ViewportState[0], dividers = new DividerSegment[0],
-                pairSplitAmounts = new float[0, 0], effectiveInputs = new PlayerInput[0] };
+            if (count == 0) return Empty();
             bool[] ghosts = new bool[count];
             for (int i = 0; i < count; i++) ghosts[i] = !aliveNumbers[players[i].playerIndex];
             float aspect = Mathf.Max(0.1f, settings.screenAspect);
 
             Vector2[] world = new Vector2[count];
-            Vector2[] sites = new Vector2[count];
-            float[] weights = new float[count];
-            bool[] seen = new bool[count];
             for (int i = 0; i < count; i++)
             {
                 PlayerInput input = players[i];
-                if (input.playerIndex < 0 || input.playerIndex > 3 || seen[input.playerIndex])
-                    throw new ArgumentException("Camera numbers must be unique and in 0..3.", nameof(players));
-                seen[input.playerIndex] = true;
                 Memory state;
                 if (!memory.TryGetValue(input.playerIndex, out state))
                 {
@@ -170,30 +271,9 @@ namespace SplitScreenCoop
                     state.hasWorldPos = true;
                 }
                 world[i] = state.hasWorldPos ? state.worldPos : input.worldPos;
-            }
-
-            Vector2 center = Vector2.zero;
-            for (int i = 0; i < count; i++) center += world[i];
-            center /= count;
-            float reach = 1f;
-            for (int i = 0; i < count; i++) reach = Mathf.Max(reach, (world[i] - center).magnitude);
-            float worldScale = Mathf.Max(2f * Mathf.Max(1f, settings.mergeDistance + settings.blendWidth), 2f * reach);
-            for (int i = 0; i < count; i++)
-            {
-                Memory state = memory[players[i].playerIndex];
-                Vector2 target = new Vector2(0.5f + (world[i].x - center.x) / worldScale,
-                    0.5f + (world[i].y - center.y) * aspect / worldScale);
-                target.x = Mathf.Clamp(target.x, 0.05f, 0.95f);
-                target.y = Mathf.Clamp(target.y, 0.05f, 0.95f);
-                if (state.visibleFor <= 0f) state.site = target;
-                else state.site = Damp(state.site, target, ref state.siteVelocity, settings.smoothingTime, dt);
                 state.visibleFor += dt;
-                sites[i] = state.site;
-                weights[i] = state.weight;
             }
 
-            float[,] amounts = new float[count, count];
-            bool[,] joined = new bool[count, count];
             float[] targetAreas = new float[count];
             float ghostTotal = 0f;
             for (int i = 0; i < count; i++)
@@ -209,96 +289,38 @@ namespace SplitScreenCoop
                 }
             for (int i = 0; i < count; i++)
                 if (!ghosts[i]) targetAreas[i] = (1f - ghostTotal) / Mathf.Max(1, aliveCount);
+
+            float[,] amounts = new float[count, count];
+            bool[,] joined = new bool[count, count];
             for (int i = 0; i < count; i++)
             for (int j = i + 1; j < count; j++)
             {
                 bool sameScreen = players[i].sameScreenKey == players[j].sameScreenKey;
                 Vector2 delta = world[j] - world[i];
                 float distance = new Vector2(delta.x, delta.y * aspect).magnitude;
-                float split = ghosts[i] || ghosts[j] || settings.permanentSplit || !sameScreen ? 1f :
+                float target = ghosts[i] || ghosts[j] || settings.permanentSplit || !sameScreen ? 1f :
                     Smoothstep(settings.mergeDistance, settings.mergeDistance + Mathf.Max(1f, settings.blendWidth), distance);
-                amounts[i, j] = amounts[j, i] = split;
                 long key = PairKey(players[i].playerIndex, players[j].playerIndex);
-                bool wasJoined;
-                pairJoined.TryGetValue(key, out wasJoined);
+                PairMemory pair;
+                if (!pairs.TryGetValue(key, out pair))
+                {
+                    pair = new PairMemory();
+                    pairs.Add(key, pair);
+                }
+                float split;
+                if (pair.split < 0f || ghosts[i] || ghosts[j]) split = target;
+                else
+                {
+                    split = Mathf.SmoothDamp(pair.split, target, ref pair.splitVelocity,
+                        Mathf.Max(0.01f, settings.splitSmoothingTime), Mathf.Infinity, dt);
+                    if (Mathf.Abs(split - target) < 0.002f) { split = target; pair.splitVelocity = 0f; }
+                }
+                pair.split = split;
+                amounts[i, j] = amounts[j, i] = split;
                 bool nowJoined = !ghosts[i] && !ghosts[j] && !settings.permanentSplit && sameScreen &&
-                    (wasJoined ? split < 0.06f : split < 0.02f);
-                pairJoined[key] = nowJoined;
+                    (pair.joined ? split < 0.06f : split < 0.02f);
+                pair.joined = nowJoined;
                 joined[i, j] = joined[j, i] = nowJoined;
-                if (delta.sqrMagnitude > 1f && split > 0.02f)
-                    lastPairNormals[key] = new Vector2(delta.x, delta.y * aspect).normalized;
-            }
-
-            // Coincident sites need a persistent, tiny separation so every power cell remains defined.
-            for (int i = 0; i < count; i++)
-            for (int j = i + 1; j < count; j++)
-            {
-                if ((sites[j] - sites[i]).sqrMagnitude >= Epsilon * Epsilon) continue;
-                Vector2 normal;
-                if (!lastPairNormals.TryGetValue(PairKey(players[i].playerIndex, players[j].playerIndex), out normal))
-                    normal = new Vector2(1f, 0f);
-                sites[i] -= normal * 0.0005f;
-                sites[j] += normal * 0.0005f;
-            }
-
-            Vector2[][] cells;
-            if (count == 2)
-            {
-                Vector2 normal = sites[1] - sites[0];
-                if (normal.sqrMagnitude < Epsilon)
-                {
-                    if (!lastPairNormals.TryGetValue(PairKey(players[0].playerIndex, players[1].playerIndex), out normal))
-                        normal = new Vector2(1f, 0f);
-                }
-                normal.Normalize();
-                float minimum = Mathf.Min(0f, Mathf.Min(normal.x, Mathf.Min(normal.y, normal.x + normal.y)));
-                float maximum = Mathf.Max(0f, Mathf.Max(normal.x, Mathf.Max(normal.y, normal.x + normal.y)));
-                float cut = normal.x * 0.5f + normal.y * 0.5f;
-                for (int probe = 0; probe < 24; probe++)
-                {
-                    cut = (minimum + maximum) * 0.5f;
-                    if (Area(Clip(ScreenPolygon(), normal, cut)) < targetAreas[0]) minimum = cut;
-                    else maximum = cut;
-                }
-                cells = new[] { Clip(ScreenPolygon(), normal, cut), Clip(ScreenPolygon(), -normal, -cut) };
-            }
-            else
-            {
-                float[] solved = (float[])weights.Clone();
-                // Each cell's area grows monotonically with its power weight.
-                // Coordinate bisection is stable even for almost coincident sites,
-                // where a fixed gradient step can erase a cell in one iteration.
-                cells = PowerCells(sites, solved);
-                float maximumError = 0f;
-                for (int i = 0; i < count; i++)
-                    maximumError = Mathf.Max(maximumError, Mathf.Abs(Area(cells[i]) - targetAreas[i]));
-                int rounds = maximumError < 0.003f ? 0 : maximumError < 0.03f ? 2 : 5;
-                for (int step = 0; step < rounds; step++)
-                {
-                    for (int i = 0; i < count; i++)
-                    {
-                        float lower = solved[i] - 2f, upper = solved[i] + 2f;
-                        for (int probe = 0; probe < 26; probe++)
-                        {
-                            float middle = (lower + upper) * 0.5f;
-                            solved[i] = middle;
-                            if (Area(PowerCell(sites, solved, i)) < targetAreas[i]) lower = middle;
-                            else upper = middle;
-                        }
-                        solved[i] = (lower + upper) * 0.5f;
-                    }
-                    float mean = 0f;
-                    for (int i = 0; i < count; i++) mean += solved[i];
-                    mean /= count;
-                    for (int i = 0; i < count; i++) solved[i] -= mean;
-                }
-                for (int i = 0; i < count; i++)
-                {
-                    Memory state = memory[players[i].playerIndex];
-                    state.weight = Damp(state.weight, solved[i], ref state.weightVelocity, settings.smoothingTime, dt);
-                    weights[i] = state.weight;
-                }
-                cells = PowerCells(sites, weights);
             }
 
             int[] leaders = new int[count];
@@ -306,15 +328,141 @@ namespace SplitScreenCoop
             for (int i = 0; i < count; i++)
             for (int j = i + 1; j < count; j++)
                 if (joined[i, j]) Union(leaders, i, j);
+
+            // One layout item per image group. Ghosts are never joined, so they are
+            // always their own item and fade out through their weight.
+            List<Item> items = new List<Item>(4);
+            Item[] itemOfPlayer = new Item[count];
+            for (int i = 0; i < count; i++)
+            {
+                int leader = Find(leaders, i);
+                Item item = null;
+                for (int k = 0; k < items.Count; k++)
+                    if (Find(leaders, items[k].members[0]) == leader) { item = items[k]; break; }
+                if (item == null)
+                {
+                    item = new Item();
+                    items.Add(item);
+                }
+                item.members.Add(i);
+                item.mask |= 1 << players[i].playerIndex;
+                item.weight += targetAreas[i] * Mathf.Max(1, aliveCount);
+                item.structuralWeight += 1f;
+                item.center += Corrected(world[i], aspect);
+                itemOfPlayer[i] = item;
+            }
+            foreach (Item item in items) item.center /= item.members.Count;
+
+            Partition(new Box(0f, 0f, 1f, 1f), items, 0, aspect, settings, dt);
+
+            // Members of one group tile the group's rectangle. They all draw the same
+            // image, so only the HUD and the divider bookkeeping care about the slices.
+            Box[] cells = new Box[count];
+            foreach (Item item in items)
+            {
+                if (item.members.Count == 1)
+                {
+                    cells[item.members[0]] = item.box;
+                    continue;
+                }
+                List<Item> slices = new List<Item>(item.members.Count);
+                for (int m = 0; m < item.members.Count; m++)
+                {
+                    int p = item.members[m];
+                    Item slice = new Item();
+                    slice.members.Add(p);
+                    slice.mask = 1 << players[p].playerIndex;
+                    slice.weight = targetAreas[p] * Mathf.Max(1, aliveCount);
+                    slice.structuralWeight = 1f;
+                    slice.center = Corrected(world[p], aspect);
+                    slices.Add(slice);
+                }
+                Partition(item.box, slices, 1, aspect, settings, dt);
+                for (int m = 0; m < slices.Count; m++) cells[slices[m].members[0]] = slices[m].box;
+            }
+
+            // ---- Transitions ---------------------------------------------------
+            Vector2[][] shown = new Vector2[count][];
+            for (int i = 0; i < count; i++) shown[i] = cells[i].Polygon();
+            bool snapped = false;
+            for (int i = 0; i < count; i++)
+            {
+                Box previous;
+                if (ghosts[i] || !lastTargets.TryGetValue(players[i].playerIndex, out previous)) continue;
+                if (Mathf.Abs(previous.x - cells[i].x) > SnapThreshold || Mathf.Abs(previous.y - cells[i].y) > SnapThreshold ||
+                    Mathf.Abs(previous.w - cells[i].w) > SnapThreshold || Mathf.Abs(previous.h - cells[i].h) > SnapThreshold)
+                    snapped = true;
+            }
+            if (snapped) BeginTransition(players, ghosts, cells, count);
+            bool sliding = false;
+            if (transition != TransitionMode.None)
+            {
+                transitionT = Mathf.Min(1f, transitionT + dt / Mathf.Max(0.05f, settings.transitionSeconds));
+                float eased = Smoothstep(0f, 1f, transitionT);
+                if (transition == TransitionMode.Rotate)
+                {
+                    int low = -1, high = -1;
+                    for (int i = 0; i < count; i++)
+                    {
+                        if (players[i].playerIndex == rotateLow) low = i;
+                        if (players[i].playerIndex == rotateHigh) high = i;
+                    }
+                    if (low < 0 || high < 0 || count != 2) transition = TransitionMode.None;
+                    else if (transitionT < 1f)
+                    {
+                        Vector2 normal = RotateTowards(rotateFromNormal, rotateToNormal, eased);
+                        float area = Mathf.Lerp(rotateFromArea, cells[low].Area, eased);
+                        float cut = CutForArea(normal, area);
+                        shown[low] = Clip(ScreenPolygon(), normal, cut);
+                        shown[high] = Clip(ScreenPolygon(), -normal, -cut);
+                    }
+                }
+                else if (transition == TransitionMode.Slide && transitionT < 1f)
+                {
+                    for (int i = 0; i < count; i++)
+                    {
+                        Box from;
+                        if (ghosts[i] || !slideFrom.TryGetValue(players[i].playerIndex, out from)) continue;
+                        shown[i] = Box.Lerp(from, cells[i], eased).Polygon();
+                        sliding = true;
+                    }
+                }
+                if (transitionT >= 1f)
+                {
+                    transition = TransitionMode.None;
+                    slideFrom.Clear();
+                }
+            }
+            for (int i = 0; i < count; i++)
+            {
+                if (ghosts[i]) { lastTargets.Remove(players[i].playerIndex); lastShown.Remove(players[i].playerIndex); continue; }
+                lastTargets[players[i].playerIndex] = cells[i];
+                lastShown[players[i].playerIndex] = shown[i];
+            }
+            List<int> stale = null;
+            foreach (int key in lastShown.Keys)
+            {
+                bool present = false;
+                for (int i = 0; i < count; i++) if (players[i].playerIndex == key) { present = true; break; }
+                if (!present) (stale ?? (stale = new List<int>())).Add(key);
+            }
+            if (stale != null) foreach (int key in stale) { lastShown.Remove(key); lastTargets.Remove(key); }
+
             ViewportState[] viewports = new ViewportState[count];
             for (int i = 0; i < count; i++)
             {
-                int leaderIndex = Find(leaders, i);
-                for (int j = 0; j < count; j++)
-                    if (Find(leaders, j) == leaderIndex && players[j].playerIndex < players[leaderIndex].playerIndex)
-                        leaderIndex = j;
-                float split = 0f;
-                for (int j = 0; j < count; j++) if (j != i) split = Mathf.Max(split, amounts[i, j]);
+                Item item = itemOfPlayer[i];
+                int leaderIndex = item.members[0];
+                for (int m = 1; m < item.members.Count; m++)
+                    if (players[item.members[m]].playerIndex < players[leaderIndex].playerIndex)
+                        leaderIndex = item.members[m];
+                // Split and zoom are group properties so that every member of a
+                // shared image samples it with exactly the same transform.
+                float groupSplit = 0f;
+                for (int m = 0; m < item.members.Count; m++)
+                    for (int j = 0; j < count; j++)
+                        if (itemOfPlayer[j] != item)
+                            groupSplit = Mathf.Max(groupSplit, amounts[item.members[m], j]);
                 float imageBlend = 0f;
                 bool hasSameScreenPeer = false;
                 for (int j = 0; j < count; j++)
@@ -324,62 +472,50 @@ namespace SplitScreenCoop
                         imageBlend = Mathf.Max(imageBlend, amounts[i, j]);
                     }
                 if (!hasSameScreenPeer && count > 1) imageBlend = 1f;
-                float area = Area(cells[i]);
-                memory[players[i].playerIndex].lastArea = area;
-                float groupArea = 0f;
-                Vector2 weightedCentroid = Vector2.zero;
+                float area = Area(shown[i]);
+                memory[players[i].playerIndex].lastArea = cells[i].Area;
                 Vector2 sourceSum = Vector2.zero;
-                int groupMembers = 0;
-                for (int j = 0; j < count; j++)
-                    if (Find(leaders, j) == Find(leaders, i))
-                    {
-                        float memberArea = Area(cells[j]);
-                        groupArea += memberArea;
-                        weightedCentroid += Centroid(cells[j]) * memberArea;
-                        sourceSum += Finite(players[j].mergedScreenPos) ? players[j].mergedScreenPos : new Vector2(0.5f, 0.5f);
-                        groupMembers++;
-                    }
-                Vector2 centroid = Centroid(cells[i]);
-                Vector2 sourceAnchor = sourceSum / Mathf.Max(1, groupMembers);
-                Vector2 targetAnchor = weightedCentroid / Mathf.Max(Epsilon, groupArea);
-                Vector2 transformAnchor = Vector2.Lerp(sourceAnchor, targetAnchor, split);
-                float zoomTarget = Mathf.Clamp(Mathf.Pow(Mathf.Max(Epsilon, groupArea), Mathf.Max(0f, settings.zoomExponent)),
+                Vector2 groupMin = new Vector2(1f, 1f), groupMax = Vector2.zero;
+                for (int m = 0; m < item.members.Count; m++)
+                {
+                    Vector2 merged = players[item.members[m]].mergedScreenPos;
+                    sourceSum += Finite(merged) ? merged : new Vector2(0.5f, 0.5f);
+                    Bounds(shown[item.members[m]], ref groupMin, ref groupMax);
+                }
+                Vector2 sourceAnchor = sourceSum / Mathf.Max(1, item.members.Count);
+                Vector2 targetAnchor = (groupMin + groupMax) * 0.5f;
+                Vector2 transformAnchor = Vector2.Lerp(sourceAnchor, targetAnchor, groupSplit);
+                float zoomTarget = Mathf.Clamp(Mathf.Pow(Mathf.Max(Epsilon, item.box.Area), Mathf.Max(0f, settings.zoomExponent)),
                     Mathf.Clamp(settings.minZoom, 0.1f, 1f), 1f);
-                Vector2 min = new Vector2(1f, 1f), max = Vector2.zero;
-                for (int j = 0; j < count; j++)
-                    if (Find(leaders, j) == Find(leaders, i))
-                        for (int vertex = 0; vertex < cells[j].Length; vertex++)
-                        {
-                            Vector2 point = cells[j][vertex];
-                            min.x = Mathf.Min(min.x, point.x); min.y = Mathf.Min(min.y, point.y);
-                            max.x = Mathf.Max(max.x, point.x); max.y = Mathf.Max(max.y, point.y);
-                        }
-                // A full-height (or full-width) region cannot zoom out using only
-                // one full render-texture screen; the sample would leave the source.
-                zoomTarget = Mathf.Max(zoomTarget, Mathf.Max(max.x - min.x, max.y - min.y));
-                float zoom = Mathf.Lerp(1f, zoomTarget, split);
+                // The sampled window is the group's bounding box divided by zoom, and
+                // it has to fit inside the one prebaked screen the camera rendered.
+                // A rotating divider widens that box for a moment; the zoom follows.
+                zoomTarget = Mathf.Max(zoomTarget, Mathf.Max(groupMax.x - groupMin.x, groupMax.y - groupMin.y));
+                float zoom = Mathf.Lerp(1f, zoomTarget, groupSplit);
                 Vector2 playerSource = Finite(players[i].mergedScreenPos) ? players[i].mergedScreenPos : new Vector2(0.5f, 0.5f);
                 Vector2 anchor = transformAnchor + (playerSource - sourceAnchor) * zoom;
                 Memory state = memory[players[i].playerIndex];
                 bool mergedSource = leaderIndex != i;
+                Vector2 centroid = Centroid(shown[i]);
                 viewports[i] = new ViewportState
                 {
                     cameraNumber = players[i].playerIndex,
                     ghost = ghosts[i],
-                    // A dead player's camera no longer has a reliable live image.
-                    // Retain its cell briefly for area reflow, never its stale RT.
-                    rendering = !ghosts[i] && (!mergedSource || imageBlend > 0.01f || state.visibleFor < 0.25f),
+                    rendering = !ghosts[i] && !mergedSource,
                     sharesImageWith = ghosts[i] ? -1 : mergedSource ? players[leaderIndex].playerIndex : -1,
-                    polygon = cells[i],
+                    polygon = shown[i],
+                    targetPolygon = cells[i].Polygon(),
                     areaFraction = area,
-                    groupAreaFraction = groupArea,
+                    groupAreaFraction = item.box.Area,
                     centroid = centroid,
-                    site = sites[i],
+                    site = centroid,
                     regionAnchor = anchor,
                     groupSourceAnchor = sourceAnchor,
                     groupTargetAnchor = targetAnchor,
+                    groupMin = groupMin,
+                    groupMax = groupMax,
                     zoom = zoom,
-                    splitAmount = split,
+                    splitAmount = groupSplit,
                     imageBlend = ghosts[i] ? 1f : imageBlend
                 };
             }
@@ -389,35 +525,348 @@ namespace SplitScreenCoop
             for (int j = i + 1; j < count; j++)
             {
                 if (amounts[i, j] <= 0f) continue;
-                AddSharedEdges(cells[i], cells[j], players[i].playerIndex, players[j].playerIndex,
+                AddSharedEdges(viewports[i].polygon, viewports[j].polygon, players[i].playerIndex, players[j].playerIndex,
                     amounts[i, j], settings.dividerWidth, dividers);
             }
             return new Layout { viewports = viewports, dividers = dividers.ToArray(),
-                pairSplitAmounts = amounts, effectiveInputs = effective.ToArray() };
+                pairSplitAmounts = amounts, effectiveInputs = effective.ToArray(), sliding = sliding };
         }
 
-        private static Vector2 Damp(Vector2 from, Vector2 to, ref Vector2 velocity, float time, float dt)
+        /// <summary>
+        /// A target cell moved discontinuously. Two live cells that both existed a
+        /// frame ago rotate their divider from where it was to where it must be; any
+        /// other change slides every cell from its previous rectangle to its new one.
+        /// </summary>
+        private void BeginTransition(IList<PlayerInput> players, bool[] ghosts, Box[] cells, int count)
         {
-            float vx = velocity.x, vy = velocity.y;
-            Vector2 result = new Vector2(
-                Mathf.SmoothDamp(from.x, to.x, ref vx, Mathf.Max(0.01f, time), Mathf.Infinity, dt),
-                Mathf.SmoothDamp(from.y, to.y, ref vy, Mathf.Max(0.01f, time), Mathf.Infinity, dt));
-            velocity = new Vector2(vx, vy);
-            return result;
+            int liveCount = 0;
+            for (int i = 0; i < count; i++) if (!ghosts[i]) liveCount++;
+            if (liveCount == 2 && count == 2 &&
+                lastShown.ContainsKey(players[0].playerIndex) && lastShown.ContainsKey(players[1].playerIndex))
+            {
+                Vector2[] a = lastShown[players[0].playerIndex], b = lastShown[players[1].playerIndex];
+                Vector2 fromNormal;
+                if (SharedEdgeNormal(a, b, out fromNormal))
+                {
+                    Vector2 toNormal = (cells[1].Center - cells[0].Center).normalized;
+                    if (toNormal.sqrMagnitude > Epsilon)
+                    {
+                        transition = TransitionMode.Rotate;
+                        transitionT = 0f;
+                        rotateLow = players[0].playerIndex;
+                        rotateHigh = players[1].playerIndex;
+                        rotateFromNormal = fromNormal;
+                        rotateToNormal = toNormal;
+                        rotateFromArea = Area(a);
+                        slideFrom.Clear();
+                        return;
+                    }
+                }
+            }
+            transition = TransitionMode.Slide;
+            transitionT = 0f;
+            slideFrom.Clear();
+            foreach (var entry in lastShown) slideFrom[entry.Key] = Box.Of(entry.Value);
         }
 
-        // Native follow is the t=0 endpoint. Once fully split, the player's
-        // source-screen anchor is geometry-only, so a stale camera position
-        // cannot become the next frame's follow target.
-        public static Vector2 FollowSourcePosition(Vector2 nativeSource, Vector2 targetAnchor,
-            Vector2 boundsCenter, float zoom, float splitAmount)
+        /// <summary>The unit normal of the edge two cells share, pointing from a into b.</summary>
+        private static bool SharedEdgeNormal(Vector2[] a, Vector2[] b, out Vector2 normal)
         {
-            zoom = Mathf.Max(0.1f, zoom);
-            Vector2 centered = new Vector2(0.5f + (targetAnchor.x - boundsCenter.x) / zoom,
-                0.5f + (targetAnchor.y - boundsCenter.y) / zoom);
-            Vector2 result = Vector2.Lerp(nativeSource, centered, Mathf.Clamp01(splitAmount));
-            return new Vector2(Mathf.Clamp01(result.x), Mathf.Clamp01(result.y));
+            normal = Vector2.zero;
+            List<DividerSegment> edges = new List<DividerSegment>(2);
+            AddSharedEdges(a, b, 0, 1, 1f, 1f, edges);
+            if (edges.Count == 0) return false;
+            Vector2 along = edges[0].end - edges[0].start;
+            if (along.sqrMagnitude < Epsilon) return false;
+            normal = new Vector2(-along.y, along.x).normalized;
+            if (Vector2.Dot(normal, Centroid(b) - Centroid(a)) < 0f) normal = -normal;
+            return true;
         }
+
+        private static Vector2 RotateTowards(Vector2 from, Vector2 to, float t)
+        {
+            float a0 = (float)Math.Atan2(from.y, from.x), a1 = (float)Math.Atan2(to.y, to.x);
+            float delta = a1 - a0;
+            while (delta > Math.PI) delta -= 2f * (float)Math.PI;
+            while (delta < -Math.PI) delta += 2f * (float)Math.PI;
+            float angle = a0 + delta * t;
+            return new Vector2((float)Math.Cos(angle), (float)Math.Sin(angle));
+        }
+
+        /// <summary>The cut c such that {p : n·p ≤ c} clipped to the screen has the given area.</summary>
+        private static float CutForArea(Vector2 normal, float area)
+        {
+            float minimum = Mathf.Min(0f, Mathf.Min(normal.x, Mathf.Min(normal.y, normal.x + normal.y)));
+            float maximum = Mathf.Max(0f, Mathf.Max(normal.x, Mathf.Max(normal.y, normal.x + normal.y)));
+            float cut = (minimum + maximum) * 0.5f;
+            for (int probe = 0; probe < 26; probe++)
+            {
+                cut = (minimum + maximum) * 0.5f;
+                if (Area(Clip(ScreenPolygon(), normal, cut)) < area) minimum = cut;
+                else maximum = cut;
+            }
+            return cut;
+        }
+
+        private static Layout Empty()
+        {
+            return new Layout { viewports = new ViewportState[0], dividers = new DividerSegment[0],
+                pairSplitAmounts = new float[0, 0], effectiveInputs = new PlayerInput[0] };
+        }
+
+        private static Vector2 Corrected(Vector2 world, float aspect)
+        {
+            // Compare separations in screen heights: the screen is `aspect` times
+            // wider than it is tall, so a vertical gap is worth more than the same
+            // number of pixels horizontally.
+            return new Vector2(world.x, world.y * aspect);
+        }
+
+        // ---- Layout tree -------------------------------------------------------
+
+        private void Partition(Box box, List<Item> items, int depth, float aspect, Settings settings, float dt)
+        {
+            if (items.Count == 1)
+            {
+                items[0].box = box;
+                return;
+            }
+            int mask = 0;
+            for (int i = 0; i < items.Count; i++) mask |= items[i].mask;
+            NodeMemory node;
+            if (!nodes.TryGetValue(mask, out node))
+            {
+                node = new NodeMemory();
+                nodes.Add(mask, node);
+            }
+            bool restructured = node.itemCount != items.Count;
+            node.itemCount = items.Count;
+
+            if (items.Count == 2)
+            {
+                SplitTwo(box, items[0], items[1], node, depth, aspect, settings, dt, restructured);
+                return;
+            }
+            if (items.Count == 3)
+            {
+                Item first = ChooseSplitOff(box, items, node, depth, aspect, settings, restructured);
+                List<Item> rest = new List<Item>(2);
+                for (int i = 0; i < items.Count; i++) if (items[i] != first) rest.Add(items[i]);
+                float restWeight = 0f, restStructural = 0f;
+                for (int i = 0; i < rest.Count; i++)
+                {
+                    restWeight = Mathf.Max(restWeight, rest[i].weight);
+                    restStructural = Mathf.Max(restStructural, rest[i].structuralWeight);
+                }
+                // The odd one out is weighed against the largest of the others, not
+                // their sum: three players give one half and two quarters, a pair
+                // sharing an image against a single player gives the pair two thirds.
+                Item restItem = new Item { weight = restWeight, structuralWeight = restStructural };
+                restItem.center = (rest[0].center + rest[1].center) * 0.5f;
+                restItem.mask = rest[0].mask | rest[1].mask;
+                Box firstBox, restBox;
+                if (node.reversed)
+                    CutBox(box, restItem, first, node, depth, aspect, settings, dt, restructured, out restBox, out firstBox);
+                else
+                    CutBox(box, first, restItem, node, depth, aspect, settings, dt, restructured, out firstBox, out restBox);
+                first.box = firstBox;
+                Partition(restBox, rest, depth + 1, aspect, settings, dt);
+                return;
+            }
+            // Four items: always two against two, so the result is a grid instead of
+            // one column holding three stacked slivers.
+            {
+                int axis = ChooseAxis(box, items, node, depth, aspect, settings, restructured, true);
+                List<Item> sorted = new List<Item>(items);
+                sorted.Sort((a, b) => Axis(a.center, axis).CompareTo(Axis(b.center, axis)));
+                Item low = new Item { mask = sorted[0].mask | sorted[1].mask,
+                    weight = sorted[0].weight + sorted[1].weight,
+                    structuralWeight = sorted[0].structuralWeight + sorted[1].structuralWeight,
+                    center = (sorted[0].center + sorted[1].center) * 0.5f };
+                Item high = new Item { mask = sorted[2].mask | sorted[3].mask,
+                    weight = sorted[2].weight + sorted[3].weight,
+                    structuralWeight = sorted[2].structuralWeight + sorted[3].structuralWeight,
+                    center = (sorted[2].center + sorted[3].center) * 0.5f };
+                node.axis = axis;
+                node.reversed = false;
+                Box lowBox, highBox;
+                CutBox(box, low, high, node, depth, aspect, settings, dt, restructured, out lowBox, out highBox);
+                Partition(lowBox, new List<Item> { sorted[0], sorted[1] }, depth + 1, aspect, settings, dt);
+                Partition(highBox, new List<Item> { sorted[2], sorted[3] }, depth + 1, aspect, settings, dt);
+            }
+        }
+
+        private void SplitTwo(Box box, Item a, Item b, NodeMemory node, int depth, float aspect,
+            Settings settings, float dt, bool restructured)
+        {
+            List<Item> pair = new List<Item> { a, b };
+            int axis = ChooseAxis(box, pair, node, depth, aspect, settings, restructured, false);
+            // Which side each item takes follows the world, with a dead zone and a
+            // hold time so two players dancing around each other do not swap sides.
+            float delta = Axis(b.center, axis) - Axis(a.center, axis);
+            bool wantReversed = delta < 0f;
+            if (restructured || node.axis != axis)
+                node.reversed = wantReversed && Mathf.Abs(delta) > Epsilon;
+            else if (node.reversed != wantReversed && Mathf.Abs(delta) > settings.directionDeadZone &&
+                clock - node.changedAt > settings.layoutHoldSeconds)
+            {
+                node.reversed = wantReversed;
+                node.changedAt = clock;
+            }
+            node.axis = axis;
+            Item low = node.reversed ? b : a;
+            Item high = node.reversed ? a : b;
+            Box lowBox, highBox;
+            CutBox(box, low, high, node, depth, aspect, settings, dt, restructured, out lowBox, out highBox);
+            low.box = lowBox;
+            high.box = highBox;
+        }
+
+        /// <summary>
+        /// Cut <paramref name="box"/> along the node's axis. The cut position follows
+        /// the live weights so a dying player's cell shrinks smoothly, and it is damped
+        /// so a group forming or dissolving slides instead of popping.
+        /// </summary>
+        private void CutBox(Box box, Item low, Item high, NodeMemory node, int depth, float aspect,
+            Settings settings, float dt, bool restructured, out Box lowBox, out Box highBox)
+        {
+            float target = low.weight / Mathf.Max(Epsilon, low.weight + high.weight);
+            if (node.fraction < 0f || restructured && Mathf.Abs(node.fraction - target) > 0.45f)
+            {
+                node.fraction = target;
+                node.fractionVelocity = 0f;
+            }
+            else
+                node.fraction = Mathf.SmoothDamp(node.fraction, target, ref node.fractionVelocity,
+                    Mathf.Max(0.01f, settings.smoothingTime), Mathf.Infinity, dt);
+            float fraction = Mathf.Clamp01(node.fraction);
+            if (node.axis == 0)
+            {
+                lowBox = new Box(box.x, box.y, box.w * fraction, box.h);
+                highBox = new Box(box.x + box.w * fraction, box.y, box.w * (1f - fraction), box.h);
+            }
+            else
+            {
+                lowBox = new Box(box.x, box.y, box.w, box.h * fraction);
+                highBox = new Box(box.x, box.y + box.h * fraction, box.w, box.h * (1f - fraction));
+            }
+        }
+
+        private Item ChooseSplitOff(Box box, List<Item> items, NodeMemory node, int depth, float aspect,
+            Settings settings, bool restructured)
+        {
+            // Candidates: along either axis, peel off the lowest or the highest item.
+            // Score by the gap to its nearest neighbour, so the most isolated player
+            // takes the big cell, and by how the resulting cells are shaped.
+            float bestScore = float.NegativeInfinity, currentScore = float.NegativeInfinity;
+            int bestAxis = 0; Item best = null; bool bestReversed = false;
+            Item current = null;
+            for (int axis = 0; axis < 2; axis++)
+            {
+                List<Item> sorted = new List<Item>(items);
+                int a = axis;
+                sorted.Sort((p, q) => Axis(p.center, a).CompareTo(Axis(q.center, a)));
+                for (int side = 0; side < 2; side++)
+                {
+                    Item candidate = side == 0 ? sorted[0] : sorted[sorted.Count - 1];
+                    Item neighbour = side == 0 ? sorted[1] : sorted[sorted.Count - 2];
+                    float gap = Mathf.Abs(Axis(candidate.center, axis) - Axis(neighbour.center, axis));
+                    float total = 0f;
+                    for (int i = 0; i < items.Count; i++)
+                        total += (items[i].center - candidate.center).magnitude;
+                    float structuralRest = 0f;
+                    for (int i = 0; i < items.Count; i++)
+                        if (items[i] != candidate) structuralRest = Mathf.Max(structuralRest, items[i].structuralWeight);
+                    float fraction = candidate.structuralWeight / Mathf.Max(Epsilon, candidate.structuralWeight + structuralRest);
+                    Box cell = axis == 0 ? new Box(0f, 0f, box.w * fraction, box.h) : new Box(0f, 0f, box.w, box.h * fraction);
+                    Box rest = axis == 0 ? new Box(0f, 0f, box.w * (1f - fraction), box.h) : new Box(0f, 0f, box.w, box.h * (1f - fraction));
+                    float score = gap / Mathf.Max(1f, total) + AspectWeight * (ShapeScore(cell, aspect) + ShapeScore(rest, aspect)) * 0.5f
+                        - SizePenalty(cell) - SizePenalty(rest);
+                    if (candidate.mask == node.splitOffMask && node.axis == axis && node.reversed == (side == 1))
+                    {
+                        current = candidate;
+                        currentScore = score;
+                    }
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        best = candidate;
+                        bestAxis = axis;
+                        bestReversed = side == 1;
+                    }
+                }
+            }
+            bool keep = current != null && !restructured &&
+                (bestScore - currentScore < SwitchMargin || clock - node.changedAt < settings.layoutHoldSeconds);
+            if (!keep)
+            {
+                if (current != null && current != best || node.axis != bestAxis || node.reversed != bestReversed)
+                    node.changedAt = clock;
+                node.splitOffMask = best.mask;
+                node.axis = bestAxis;
+                node.reversed = bestReversed;
+                return best;
+            }
+            return current;
+        }
+
+        private int ChooseAxis(Box box, List<Item> items, NodeMemory node, int depth, float aspect,
+            Settings settings, bool restructured, bool pairs)
+        {
+            float[] score = new float[2];
+            for (int axis = 0; axis < 2; axis++)
+            {
+                List<Item> sorted = new List<Item>(items);
+                int a = axis;
+                sorted.Sort((p, q) => Axis(p.center, a).CompareTo(Axis(q.center, a)));
+                int cut = pairs ? 2 : 1;
+                float gap = Axis(sorted[cut].center, axis) - Axis(sorted[cut - 1].center, axis);
+                float spread = Mathf.Max(1f,
+                    Mathf.Abs(sorted[sorted.Count - 1].center.x - sorted[0].center.x) +
+                    Mathf.Abs(sorted[sorted.Count - 1].center.y - sorted[0].center.y));
+                float lowWeight = 0f, highWeight = 0f;
+                for (int i = 0; i < sorted.Count; i++)
+                    if (i < cut) lowWeight += sorted[i].structuralWeight; else highWeight += sorted[i].structuralWeight;
+                float fraction = lowWeight / Mathf.Max(Epsilon, lowWeight + highWeight);
+                Box lowCell = axis == 0 ? new Box(0f, 0f, box.w * fraction, box.h) : new Box(0f, 0f, box.w, box.h * fraction);
+                Box highCell = axis == 0 ? new Box(0f, 0f, box.w * (1f - fraction), box.h) : new Box(0f, 0f, box.w, box.h * (1f - fraction));
+                score[axis] = gap / spread + AspectWeight * (ShapeScore(lowCell, aspect) + ShapeScore(highCell, aspect)) * 0.5f
+                    - SizePenalty(lowCell) - SizePenalty(highCell);
+            }
+            int wanted = score[1] > score[0] ? 1 : 0;
+            if (restructured || node.axis < 0) return wanted;
+            if (node.axis != wanted && score[wanted] - score[node.axis] > SwitchMargin &&
+                clock - node.changedAt > settings.layoutHoldSeconds)
+            {
+                node.changedAt = clock;
+                return wanted;
+            }
+            return node.axis;
+        }
+
+        private static float ShapeScore(Box cell, float aspect)
+        {
+            // 1 for a square cell on screen, falling towards 0 for long strips.
+            float w = Mathf.Max(Epsilon, cell.w * aspect), h = Mathf.Max(Epsilon, cell.h);
+            return Mathf.Min(w, h) / Mathf.Max(w, h);
+        }
+
+        private static float SizePenalty(Box cell)
+        {
+            // Cells narrower or shorter than this show too little of a room to play
+            // in. The penalty is soft because with four players someone has to lose.
+            float penalty = 0f;
+            if (cell.w < MinCellExtent) penalty += 1f + (MinCellExtent - cell.w) * 4f;
+            if (cell.h < MinCellExtent) penalty += 1f + (MinCellExtent - cell.h) * 4f;
+            return penalty;
+        }
+
+        private static float Axis(Vector2 point, int axis)
+        {
+            return axis == 0 ? point.x : point.y;
+        }
+
+        // ---- Helpers ------------------------------------------------------------
 
         public static bool SharedCameraCanShow(Vector2 screenPosition)
         {
@@ -425,9 +874,22 @@ namespace SplitScreenCoop
                 screenPosition.y >= 0.05f && screenPosition.y <= 0.95f;
         }
 
-        private static float Damp(float from, float to, ref float velocity, float time, float dt)
+        /// <summary>
+        /// The uv translation that shows source point <paramref name="playerSource"/>
+        /// at display point <paramref name="anchor"/>, clamped so the rectangle
+        /// [<paramref name="min"/>, <paramref name="max"/>] never samples outside the
+        /// source texture. For an axis-aligned cell this clamp is exact, and a cell
+        /// of width w always keeps 1-w of pan, so the player is always displayable.
+        /// </summary>
+        public static Vector2 ClampedUvShift(Vector2 playerSource, Vector2 anchor, Vector2 min, Vector2 max, float zoom)
         {
-            return Mathf.SmoothDamp(from, to, ref velocity, Mathf.Max(0.01f, time), Mathf.Infinity, dt);
+            zoom = Mathf.Max(0.1f, zoom);
+            Vector2 shift = playerSource - anchor / zoom;
+            float minShiftX = -min.x / zoom, maxShiftX = 1f - max.x / zoom;
+            float minShiftY = -min.y / zoom, maxShiftY = 1f - max.y / zoom;
+            shift.x = minShiftX <= maxShiftX ? Mathf.Clamp(shift.x, minShiftX, maxShiftX) : (minShiftX + maxShiftX) * 0.5f;
+            shift.y = minShiftY <= maxShiftY ? Mathf.Clamp(shift.y, minShiftY, maxShiftY) : (minShiftY + maxShiftY) * 0.5f;
+            return shift;
         }
 
         private static float Smoothstep(float start, float end, float value)
@@ -464,28 +926,6 @@ namespace SplitScreenCoop
             return new[] { Vector2.zero, Vector2.right, Vector2.one, Vector2.up };
         }
 
-        private Vector2[][] PowerCells(Vector2[] sites, float[] weights)
-        {
-            Vector2[][] cells = new Vector2[sites.Length][];
-            for (int i = 0; i < sites.Length; i++)
-                cells[i] = PowerCell(sites, weights, i);
-            return cells;
-        }
-
-        private static Vector2[] PowerCell(Vector2[] sites, float[] weights, int i)
-        {
-            Vector2[] polygon = ScreenPolygon();
-            for (int j = 0; j < sites.Length; j++)
-            {
-                if (i == j) continue;
-                Vector2 normal = 2f * (sites[j] - sites[i]);
-                float cut = sites[j].sqrMagnitude - sites[i].sqrMagnitude + weights[i] - weights[j];
-                polygon = Clip(polygon, normal, cut);
-                if (polygon.Length == 0) break;
-            }
-            return polygon;
-        }
-
         private static Vector2[] Clip(Vector2[] polygon, Vector2 normal, float cut)
         {
             if (polygon.Length == 0) return polygon;
@@ -498,13 +938,20 @@ namespace SplitScreenCoop
                 float side = Vector2.Dot(current, normal) - cut;
                 if ((side < -Epsilon && previousSide > Epsilon) || (side > Epsilon && previousSide < -Epsilon))
                     result.Add(Vector2.Lerp(previous, current, previousSide / (previousSide - side)));
-                else if (Mathf.Abs(previousSide) <= Epsilon && Mathf.Abs(side) > Epsilon && side > 0f)
-                    result.Add(previous);
                 if (side <= Epsilon) result.Add(current);
                 previous = current;
                 previousSide = side;
             }
             return result.ToArray();
+        }
+
+        private static void Bounds(Vector2[] polygon, ref Vector2 min, ref Vector2 max)
+        {
+            for (int i = 0; i < polygon.Length; i++)
+            {
+                min.x = Mathf.Min(min.x, polygon[i].x); min.y = Mathf.Min(min.y, polygon[i].y);
+                max.x = Mathf.Max(max.x, polygon[i].x); max.y = Mathf.Max(max.y, polygon[i].y);
+            }
         }
 
         private static float Area(Vector2[] polygon)

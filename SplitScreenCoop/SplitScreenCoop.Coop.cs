@@ -61,9 +61,27 @@ namespace SplitScreenCoop
 
         void CoopGameOver(RainWorldGame game)
         {
+            Logger.LogInfo($"[Coop] frame={Time.frameCount} game over: every player is dead or held; players=[{string.Join(",", game.session.Players.Select(p => $"{PlayerNumber(p)}:{(IsCreatureDead(p) ? "dead" : "held")}"))}]");
             coopActualGameover = true;
             game.GameOver(null);
             coopActualGameover = false;
+        }
+
+        private void RainWorldGame_GoToDeathScreen(On.RainWorldGame.orig_GoToDeathScreen orig, RainWorldGame self)
+        {
+            Logger.LogInfo($"[Coop] frame={Time.frameCount} GoToDeathScreen; gameOverModeActive={self.GameOverModeActive}");
+            orig(self);
+        }
+
+        private void TextPrompt_EnterGameOverMode(On.HUD.TextPrompt.orig_EnterGameOverMode orig, TextPrompt self,
+            Creature.Grasp dependentOnGrasp, int foodInStomach, int deathRoom, Vector2 deathPos)
+        {
+            orig(self, dependentOnGrasp, foodInStomach, deathRoom, deathPos);
+            int camera = -1;
+            if (self.hud?.rainWorld?.processManager?.currentMainLoop is RainWorldGame game && game.cameras != null)
+                for (int i = 0; i < game.cameras.Length; i++)
+                    if (game.cameras[i]?.hud == self.hud) camera = i;
+            Logger.LogInfo($"[Coop] frame={Time.frameCount} game over prompt entered on cam={camera}; promptSource={globalPromptSource}; meterSource={globalMeterSource}");
         }
 
         /// <summary>

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace SplitScreenCoop
@@ -16,6 +17,112 @@ namespace SplitScreenCoop
         private readonly string[] lastCameraStateKeys = new string[4];
         private int lastCameraHealthScanFrame = -CameraHealthScanInterval;
         private int lastCameraHeartbeatFrame = -600;
+
+        // Frame-hitch diagnostics. Playtests reported stutter, but the log had no
+        // timing at all; now any frame over the threshold is logged together with
+        // the expensive things that happened in it.
+        private const float HitchThresholdSeconds = 0.05f;
+        private const int HitchLogCooldownFrames = 30;
+        private static readonly System.Text.StringBuilder frameEvents = new System.Text.StringBuilder(256);
+        private static int frameEventCount;
+        private static int frameEventFrame = -1;
+        private int lastHitchLogFrame = -10000;
+        private int suppressedHitches;
+        private int lastGcCollectionCount;
+
+        internal static void NoteFrameEvent(string text)
+        {
+            if (frameEventFrame != Time.frameCount)
+            {
+                frameEvents.Length = 0;
+                frameEventCount = 0;
+                frameEventFrame = Time.frameCount;
+            }
+            if (frameEventCount++ >= 8) return;
+            if (frameEvents.Length > 0) frameEvents.Append("; ");
+            frameEvents.Append(text);
+        }
+
+        private void NoteFrameTime()
+        {
+            float seconds = Time.unscaledDeltaTime;
+            int collections = GC.CollectionCount(0);
+            int collectionDelta = collections - lastGcCollectionCount;
+            lastGcCollectionCount = collections;
+            if (seconds < HitchThresholdSeconds) return;
+            if (Time.frameCount - lastHitchLogFrame < HitchLogCooldownFrames)
+            {
+                suppressedHitches++;
+                return;
+            }
+            string events = frameEventFrame >= Time.frameCount - 1 ? frameEvents.ToString() : "";
+            Logger.LogInfo($"[FrameHitch] frame={Time.frameCount} ms={seconds * 1000f:0} gcCollections={collectionDelta} suppressedSinceLast={suppressedHitches} sharedLevelTextures={sharedLevelTextureCopies} events=[{events}]");
+            suppressedHitches = 0;
+            lastHitchLogFrame = Time.frameCount;
+        }
+
+        // ---- Menu camera watchdog ---------------------------------------------
+        // Two playtests ended on a black screen after Exit and after the death
+        // screen. Outside a game session exactly one camera may draw: Futile's own
+        // camera, into Futile's screen texture, with the root stage in its mask.
+        // Enforce that every frame while no game runs, and log what had to be
+        // corrected plus a snapshot after every process switch so the log names the
+        // culprit if it ever recurs.
+        private MainLoopProcess lastObservedProcess;
+        private int lastMenuCorrectionLogFrame = -10000;
+
+        internal void EnforceMenuCameraState()
+        {
+            ProcessManager manager = rainworldGameObject?.processManager;
+            MainLoopProcess process = manager?.currentMainLoop;
+            if (process == null || process is RainWorldGame || fcameras[0] == null || Futile.screen?.renderTexture == null) return;
+            var corrections = new List<string>(4);
+            if (!fcameras[0].enabled) { fcameras[0].enabled = true; corrections.Add("camera 0 was disabled"); }
+            if (fcameras[0].targetTexture != Futile.screen.renderTexture)
+            {
+                corrections.Add($"camera 0 target was {fcameras[0].targetTexture?.name ?? "null"}");
+                fcameras[0].targetTexture = Futile.screen.renderTexture;
+            }
+            int stageBit = Futile.stage != null ? 1 << Futile.stage.layer : 0;
+            if ((fcameras[0].cullingMask & stageBit) == 0 || fcameras[0].cullingMask == 0)
+            {
+                corrections.Add($"camera 0 mask was {fcameras[0].cullingMask}");
+                fcameras[0].cullingMask = initialWorldCullingMasks[0] | stageBit;
+                if (fcameras[0].cullingMask == 0) fcameras[0].cullingMask = -1;
+            }
+            for (int i = 1; i < fcameras.Length; i++)
+                if (fcameras[i] != null && fcameras[i].enabled) { fcameras[i].enabled = false; corrections.Add($"camera {i} was enabled"); }
+            for (int i = 0; i < hudCameras.Length; i++)
+                if (hudCameras[i] != null && hudCameras[i].enabled) { hudCameras[i].enabled = false; corrections.Add($"HUD camera {i} was enabled"); }
+            if (globalHudCamera != null && globalHudCamera.enabled) { globalHudCamera.enabled = false; corrections.Add("global HUD camera was enabled"); }
+            if (dynamicCompositorCamera != null && dynamicCompositorCamera.enabled) { dynamicCompositorCamera.enabled = false; corrections.Add("compositor camera was enabled"); }
+            bool switched = process != lastObservedProcess;
+            lastObservedProcess = process;
+            if (switched || (corrections.Count > 0 && Time.frameCount - lastMenuCorrectionLogFrame > 120))
+            {
+                lastMenuCorrectionLogFrame = Time.frameCount;
+                Logger.LogInfo($"[MenuCamera] frame={Time.frameCount} process={process.ID} corrections=[{string.Join("; ", corrections)}] cam0=(enabled={fcameras[0].enabled} mask={fcameras[0].cullingMask} target={fcameras[0].targetTexture?.name ?? "null"} isFutileCamera={Futile.instance?.camera == fcameras[0]}) stageLayer={Futile.stage?.layer} stageChildren={Futile.stage?.GetChildCount()} screenImage={(Futile.instance?._cameraImage?.texture == Futile.screen.renderTexture)} fadeToBlack={manager.fadeToBlack:0.00} blackDelay={manager.blackDelay:0.00}");
+            }
+        }
+
+        private void ProcessManager_PostSwitchMainProcess(On.ProcessManager.orig_PostSwitchMainProcess orig, ProcessManager self, ProcessManager.ProcessID ID)
+        {
+            orig(self, ID);
+            EnforceMenuCameraState();
+        }
+
+        private void AbstractRoom_RealizeRoom(On.AbstractRoom.orig_RealizeRoom orig, AbstractRoom self, World world, RainWorldGame game)
+        {
+            bool fresh = self.realizedRoom == null;
+            orig(self, world, game);
+            if (fresh && self.realizedRoom != null) NoteFrameEvent("realize " + self.name);
+        }
+
+        private void AbstractRoom_Abstractize(On.AbstractRoom.orig_Abstractize orig, AbstractRoom self)
+        {
+            if (self.realizedRoom != null) NoteFrameEvent("abstractize " + self.name);
+            orig(self);
+        }
 
         private void ResetCameraDiagnostics()
         {
@@ -47,6 +154,7 @@ namespace SplitScreenCoop
         {
             if (!ValidCameraNumber(camera)) return;
             Logger.LogInfo($"[CameraMove] frame={Time.frameCount} source={source} cam={camera.cameraNumber} room={RoomName(camera.room)} loading={RoomName(camera.loadingRoom)} position={camera.currentCameraPosition} follow={PlayerNumber(camera.followAbstractCreature)}");
+            NoteFrameEvent(source + " cam=" + camera.cameraNumber);
             lastCameraStateKeys[camera.cameraNumber] = null;
         }
 
@@ -176,7 +284,16 @@ namespace SplitScreenCoop
                 string key = $"mode={CurrentSplitMode}|world={game.world?.name}|room={RoomName(roomCamera?.room)}|loading={RoomName(roomCamera?.loadingRoom)}|position={roomCamera?.currentCameraPosition}|follow={PlayerNumber(roomCamera?.followAbstractCreature)}|realizedRoom={realizedRoom}|enabled={unityCamera?.enabled}|direct={listener?.direct}|target={RenderTargetState(listener)}|zoom={cameraZoomed[i]}";
                 if (!force && lastCameraStateKeys[i] == key) continue;
                 lastCameraStateKeys[i] = key;
-                Logger.LogInfo($"[CameraState] frame={Time.frameCount} reason={reason} cam={i} {key}; cameraPos={roomCamera?.pos}; playerPos={followedCreature?.mainBodyChunk?.pos}; inShortcut={followedCreature?.inShortcut}; mapVisible={roomCamera?.hud?.map?.visible}; roomUpdateAge={FrameAge(lastRoomCameraUpdateFrames[i])}; roomDrawAge={FrameAge(lastRoomCameraDrawFrames[i])}; preRenderAge={FrameAge(listener?.lastPreRenderFrame ?? -1)}; postRenderAge={FrameAge(listener?.lastPostRenderFrame ?? -1)}; compositeAge={FrameAge(listener?.lastCompositeFrame ?? -1)}");
+                // Palette state rides along on the heartbeat so two views that render
+                // the same room with different colours can be compared in the log.
+                string palette = "";
+                if (force && roomCamera != null)
+                {
+                    float fog = -1f;
+                    if (listener != null && !listener.ShaderFloats.TryGetValue(RainWorld.ShadPropFogAmount, out fog)) fog = -1f;
+                    palette = $"; palA={roomCamera.paletteA} palB={roomCamera.paletteB} blend={roomCamera.paletteBlend:0.00} ghost={roomCamera.ghostMode:0.00} dark={roomCamera.currentPalette.darkness:0.00} fog={fog:0.00} dayNight={roomCamera.effect_dayNight:0.00} darkEff={roomCamera.effect_darkness:0.00} palTexOwn={(roomCamera.paletteTexture != null && listener != null && listener.ShaderTextures.TryGetValue(RainWorld.ShadPropPalTex, out Texture bound) && bound == roomCamera.paletteTexture)}";
+                }
+                Logger.LogInfo($"[CameraState] frame={Time.frameCount} reason={reason} cam={i} {key}; cameraPos={roomCamera?.pos}; playerPos={followedCreature?.mainBodyChunk?.pos}; inShortcut={followedCreature?.inShortcut}; mapVisible={roomCamera?.hud?.map?.visible}; roomUpdateAge={FrameAge(lastRoomCameraUpdateFrames[i])}; roomDrawAge={FrameAge(lastRoomCameraDrawFrames[i])}; preRenderAge={FrameAge(listener?.lastPreRenderFrame ?? -1)}; postRenderAge={FrameAge(listener?.lastPostRenderFrame ?? -1)}; compositeAge={FrameAge(listener?.lastCompositeFrame ?? -1)}{palette}");
             }
         }
 

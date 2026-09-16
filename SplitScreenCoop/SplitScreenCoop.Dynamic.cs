@@ -13,10 +13,16 @@ namespace SplitScreenCoop
         private SplitLayoutSolver.PlayerInput[] dynamicInputs = new SplitLayoutSolver.PlayerInput[0];
         private Vector2[] ownScreenPositions = new Vector2[0];
         private int[] baseCameraNumbers = new int[0];
-        private readonly Vector2[] dynamicCameraTargets = new Vector2[4];
-        private readonly bool[] hasDynamicCameraTarget = new bool[4];
-        private readonly Vector2[] dynamicFollowVelocities = new Vector2[4];
-        private readonly int[] lastPlayerSafetyLogFrames = { -10000, -10000, -10000, -10000 };
+        // Per camera: the uv translation its own image is drawn with. Refreshed every
+        // rendered frame from interpolated positions and damped, so following is as
+        // smooth as the sprites themselves instead of stepping at the 40 Hz tick.
+        private readonly Vector2[] ownViewShifts = new Vector2[4];
+        private readonly Vector2[] ownViewShiftVelocities = new Vector2[4];
+        private readonly bool[] ownViewShiftValid = new bool[4];
+        private readonly long[] ownViewSourceKeys = new long[4];
+        private readonly Vector2[] ownViewCellCenters = new Vector2[4];
+        private long lastLayoutSignature = long.MinValue;
+        private const float ViewPanSmoothing = 0.12f;
         private Camera dynamicCompositorCamera;
         private DynamicCompositor dynamicCompositor;
         private readonly FStage[] hudStages = new FStage[4];
@@ -61,6 +67,11 @@ namespace SplitScreenCoop
             public void OnPostRender()
             {
                 owner?.CompositeDynamicLayout(this);
+            }
+
+            public void LateUpdate()
+            {
+                owner?.EnforceMenuCameraState();
             }
 
             public void OnGUI()
@@ -302,6 +313,27 @@ namespace SplitScreenCoop
             if (!dynamicStyle || dualDisplays || camera?.hud == null ||
                 camera.game?.cameras?.Length <= 1 || globalHudStage == null) return;
             FContainer destination = camera.cameraNumber == globalMeterSource ? globalHudStage : null;
+            // Order matters: AddChild appends, so the routing order is the draw
+            // order. Vanilla builds the TextPrompt before every meter, which keeps
+            // its semi-transparent letterbox bars *behind* the meters. Routing the
+            // bars last put them over the food pips and greyed them out.
+            HUD.TextPrompt prompt = camera.hud.textPrompt;
+            if (prompt != null)
+            {
+                FContainer promptDestination = camera.cameraNumber == globalPromptSource ? globalHudStage : null;
+                RouteNode(prompt.fullscreenFade, promptDestination);
+                if (prompt.sprites != null)
+                    foreach (FSprite sprite in prompt.sprites) RouteNode(sprite, promptDestination);
+                RouteNode(prompt.label, promptDestination);
+                RouteNode(prompt.musicSprite, promptDestination);
+                if (prompt.symbols != null)
+                    foreach (IconSymbol symbol in prompt.symbols)
+                    {
+                        RouteNode(symbol.shadowSprite1, promptDestination);
+                        RouteNode(symbol.shadowSprite2, promptDestination);
+                        RouteNode(symbol.symbolSprite, promptDestination);
+                    }
+            }
             RouteFoodMeter(camera.hud.foodMeter, destination);
             // Food plops and karma changes create short-lived FadeCircles after
             // the permanent meter nodes have been routed. Keep those circles with
@@ -323,23 +355,6 @@ namespace SplitScreenCoop
             HUD.RainMeter rain = camera.hud.rainMeter;
             if (rain?.circles != null)
                 foreach (HUD.HUDCircle circle in rain.circles) RouteNode(circle?.sprite, destination);
-            HUD.TextPrompt prompt = camera.hud.textPrompt;
-            if (prompt != null)
-            {
-                FContainer promptDestination = camera.cameraNumber == globalPromptSource ? globalHudStage : null;
-                RouteNode(prompt.label, promptDestination);
-                RouteNode(prompt.musicSprite, promptDestination);
-                RouteNode(prompt.fullscreenFade, promptDestination);
-                if (prompt.sprites != null)
-                    foreach (FSprite sprite in prompt.sprites) RouteNode(sprite, promptDestination);
-                if (prompt.symbols != null)
-                    foreach (IconSymbol symbol in prompt.symbols)
-                    {
-                        RouteNode(symbol.symbolSprite, promptDestination);
-                        RouteNode(symbol.shadowSprite1, promptDestination);
-                        RouteNode(symbol.shadowSprite2, promptDestination);
-                    }
-            }
             // Gourmand's collection tracker belongs with the shared food meter.
             if (camera.hud.gourmandmeter != null)
                 foreach (var symbol in camera.hud.gourmandmeter.CollectedSymbols)
@@ -417,6 +432,7 @@ namespace SplitScreenCoop
             ownScreenPositions = new Vector2[0];
             baseCameraNumbers = new int[0];
             lastDynamicLayoutKey = null;
+            lastLayoutSignature = long.MinValue;
             dynamicActive = false;
             globalMeterSource = -1;
             globalPromptSource = -1;
@@ -440,8 +456,8 @@ namespace SplitScreenCoop
                 cameraListeners[i].dynamicCompositing = false;
                 cameraListeners[i].Retarget();
                 lastWorldFallbackReasons[i] = null;
-                hasDynamicCameraTarget[i] = false;
-                dynamicFollowVelocities[i] = Vector2.zero;
+                ownViewShiftValid[i] = false;
+                ownViewShiftVelocities[i] = Vector2.zero;
             }
         }
 
@@ -525,6 +541,14 @@ namespace SplitScreenCoop
             if (count == 0 && game.cameras.Length > 0) aliveCameras.Add(game.cameras[0].cameraNumber);
             count = aliveCameras.Count;
             if (count == 0) return;
+            // Everyone is in the same shelter: there is one thing to look at and the
+            // sleep sequence draws its own full-screen UI. Collapse to a single view
+            // so only one HUD is composited instead of one per region.
+            if (count > 1 && AllPlayersInOneShelter(game, aliveCameras))
+            {
+                aliveCameras = aliveCameras.GetRange(0, 1);
+                count = 1;
+            }
             var inputs = new SplitLayoutSolver.PlayerInput[count];
             var positions = new Vector2[count];
             var roomCameras = new RoomCamera[count];
@@ -547,8 +571,13 @@ namespace SplitScreenCoop
                 playerRooms[i] = room;
                 bool cameraRoomReady = room != null && camera?.room == room;
                 validRoomPositions[i] = hasPlayerPos && cameraRoomReady;
+                // A camera with no usable room has no image of its own to show. Key it
+                // on the room it is loading so cameras heading to the same place stay
+                // merged; giving each one a unique key forces a hard split, which is
+                // what made spawn-in open on a split screen for a couple of frames.
+                AbstractRoom pending = camera?.loadingRoom?.abstractRoom ?? camera?.room?.abstractRoom;
                 long screenKey = !cameraRoomReady
-                    ? long.MinValue + cameraNumber
+                    ? pending != null ? long.MinValue + 1L + pending.index : long.MinValue
                     : ScreenKey(room, camera.currentCameraPosition);
                 keys[i] = screenKey;
                 Vector2 worldPos = playerPos;
@@ -701,47 +730,174 @@ namespace SplitScreenCoop
                 if (CameraByNumber(game, aliveCameras[i])?.hud != null)
                 { globalMeterSource = aliveCameras[i]; break; }
             globalPromptSource = globalMeterSource;
+            // Game over and pause are raised on camera 0's prompt by the game, no
+            // matter which camera currently supplies the shared meters. Those modes
+            // win outright; otherwise the first prompt with something to show does.
+            bool promptLocked = false;
             foreach (RoomCamera camera in game.cameras)
-                if (camera?.hud?.textPrompt is HUD.TextPrompt active &&
-                    (active.show > 0f || (active.messages != null && active.messages.Count > 0)))
-                { globalPromptSource = camera.cameraNumber; break; }
+            {
+                if (!(camera?.hud?.textPrompt is HUD.TextPrompt active)) continue;
+                if (active.gameOverMode || active.pausedMode)
+                {
+                    globalPromptSource = camera.cameraNumber;
+                    promptLocked = true;
+                    break;
+                }
+            }
+            if (!promptLocked)
+                foreach (RoomCamera camera in game.cameras)
+                    if (camera?.hud?.textPrompt is HUD.TextPrompt active &&
+                        (active.show > 0f || (active.messages != null && active.messages.Count > 0)))
+                    { globalPromptSource = camera.cameraNumber; break; }
             RouteGlobalMeters(game);
-            ComputeDynamicCameraTargets(allRoomCameras, allRoomPositions, allValid);
             ApplyDynamicCameraRendering(game);
         }
 
-        private void ComputeDynamicCameraTargets(RoomCamera[] cameras, Vector2[] positions, bool[] valid)
+        private readonly Vector2[] liveSourceScratch = new Vector2[4];
+
+        /// <summary>
+        /// Runs every rendered frame. Every cell draws the image of its base camera
+        /// (the camera whose prebaked screen the players in that cell share), panned
+        /// so the followed slugcat sits at the cell centre. The pan target lerps
+        /// from "identity" at split 0 to "centred" at split 1, so two cells that show
+        /// one screen line up exactly when their players are close and part again as
+        /// they separate, with no blending anywhere. Members of one image group get
+        /// one common pan. Positions are interpolated with the sprites' timeStacker,
+        /// the result is damped, and it snaps only when the image underneath changed:
+        /// a new room or camera position on the base camera, or a cell that moved
+        /// elsewhere on screen.
+        /// </summary>
+        private void RefreshDynamicViewShifts(RainWorldGame game, float timeStacker)
         {
-            for (int i = 0; i < hasDynamicCameraTarget.Length; i++) hasDynamicCameraTarget[i] = false;
-            if (dynamicLayout == null) return;
-            for (int i = 0; i < dynamicLayout.viewports.Length; i++)
+            if (!dynamicActive || dynamicLayout == null || game?.cameras == null) return;
+            float dt = Mathf.Clamp(Time.deltaTime, 0.001f, 0.1f);
+            var viewports = dynamicLayout.viewports;
+            int count = Mathf.Min(viewports.Length, liveSourceScratch.Length);
+            for (int i = 0; i < count; i++)
             {
-                var viewport = dynamicLayout.viewports[i];
+                var viewport = viewports[i];
+                RoomCamera baseCamera = i < baseCameraNumbers.Length ? CameraByNumber(game, baseCameraNumbers[i]) : null;
+                Vector2 source;
+                if (viewport.ghost || baseCamera?.room == null ||
+                    !TryGetInterpolatedScreenPosition(baseCamera, GetPlayerForCamera(game, viewport.cameraNumber), timeStacker, out source))
+                    source = i < dynamicInputs.Length && FiniteVector(dynamicInputs[i].mergedScreenPos)
+                        ? dynamicInputs[i].mergedScreenPos : new Vector2(0.5f, 0.5f);
+                liveSourceScratch[i] = source;
+            }
+            for (int i = 0; i < count; i++)
+            {
+                var viewport = viewports[i];
                 int number = viewport.cameraNumber;
-                RoomCamera camera = cameras[i];
-                if (viewport.ghost || camera == null || !valid[i]) continue;
-                SetDynamicCameraTarget(camera, positions[i], viewport);
+                if (viewport.ghost || number < 0 || number >= ownViewShifts.Length) continue;
+                RoomCamera baseCamera = i < baseCameraNumbers.Length ? CameraByNumber(game, baseCameraNumbers[i]) : null;
+                if (baseCamera?.room == null) { ownViewShiftValid[number] = false; continue; }
+                int leader = viewport.sharesImageWith >= 0 ? viewport.sharesImageWith : number;
+                Vector2 groupSource = Vector2.zero;
+                int members = 0;
+                for (int j = 0; j < count; j++)
+                {
+                    var other = viewports[j];
+                    int otherLeader = other.sharesImageWith >= 0 ? other.sharesImageWith : other.cameraNumber;
+                    if (other.ghost || otherLeader != leader) continue;
+                    groupSource += liveSourceScratch[j];
+                    members++;
+                }
+                groupSource = members > 0 ? groupSource / members : liveSourceScratch[i];
+                Vector2 source = liveSourceScratch[i];
+                Vector2 groupCenter = (viewport.groupMin + viewport.groupMax) * 0.5f;
+                Vector2 transformAnchor = Vector2.Lerp(groupSource, groupCenter, viewport.splitAmount);
+                Vector2 anchor = transformAnchor + (source - groupSource) * viewport.zoom;
+                Vector2 target = SplitLayoutSolver.ClampedUvShift(source, anchor, viewport.groupMin, viewport.groupMax, viewport.zoom);
+                long sourceKey = ((long)baseCamera.room.abstractRoom.index << 8) | (uint)(baseCamera.currentCameraPosition & 0xFF);
+                bool snap = !ownViewShiftValid[number] || ownViewSourceKeys[number] != sourceKey ||
+                    (ownViewCellCenters[number] - viewport.centroid).sqrMagnitude > 0.08f * 0.08f;
+                if (snap)
+                {
+                    ownViewShifts[number] = target;
+                    ownViewShiftVelocities[number] = Vector2.zero;
+                }
+                else
+                {
+                    Vector2 velocity = ownViewShiftVelocities[number];
+                    Vector2 current = ownViewShifts[number];
+                    current.x = Mathf.SmoothDamp(current.x, target.x, ref velocity.x, ViewPanSmoothing, Mathf.Infinity, dt);
+                    current.y = Mathf.SmoothDamp(current.y, target.y, ref velocity.y, ViewPanSmoothing, Mathf.Infinity, dt);
+                    ownViewShifts[number] = current;
+                    ownViewShiftVelocities[number] = velocity;
+                }
+                ownViewShiftValid[number] = true;
+                ownViewSourceKeys[number] = sourceKey;
+                ownViewCellCenters[number] = viewport.centroid;
             }
         }
 
-        private void SetDynamicCameraTarget(RoomCamera camera, Vector2 playerPosition,
-            SplitLayoutSolver.ViewportState viewport)
+        public void RainWorldGame_GrafUpdate(On.RainWorldGame.orig_GrafUpdate orig, RainWorldGame self, float timeStacker)
         {
-            int number = camera.cameraNumber;
-            Vector2 min = new Vector2(1f, 1f), max = Vector2.zero;
-            for (int j = 0; j < dynamicLayout.viewports.Length; j++)
-                if (dynamicLayout.viewports[j].cameraNumber == number ||
-                    dynamicLayout.viewports[j].sharesImageWith == number ||
-                    (viewport.sharesImageWith >= 0 &&
-                     dynamicLayout.viewports[j].sharesImageWith == viewport.sharesImageWith))
-                    ExpandBounds(dynamicLayout.viewports[j].polygon, ref min, ref max);
-            Vector2 boundsCenter = (min + max) * 0.5f;
-            Vector2 nativeSource = CameraScreenPosition(camera, playerPosition);
-            Vector2 wantedSource = SplitLayoutSolver.FollowSourcePosition(nativeSource,
-                viewport.groupTargetAnchor, boundsCenter, viewport.zoom, viewport.splitAmount);
-            dynamicCameraTargets[number] = playerPosition - new Vector2(wantedSource.x * camera.sSize.x,
-                wantedSource.y * camera.sSize.y);
-            hasDynamicCameraTarget[number] = true;
+            orig(self, timeStacker);
+            if (dynamicStyle && !dualDisplays) RefreshDynamicViewShifts(self, self.pauseUpdate ? 1f : timeStacker);
+            NoteFrameTime();
+        }
+
+        /// <summary>
+        /// Where the followed creature sits in the camera's render texture for this
+        /// rendered frame, in normalized coordinates. Mirrors RoomCamera.DrawUpdate:
+        /// the camera position is interpolated, clamped to its prebaked screen and
+        /// floored before sprites are placed against it.
+        /// </summary>
+        private static bool TryGetInterpolatedScreenPosition(RoomCamera camera, AbstractCreature player,
+            float timeStacker, out Vector2 source)
+        {
+            source = new Vector2(0.5f, 0.5f);
+            Creature creature = player?.realizedCreature;
+            if (creature == null || camera?.room == null || camera.sSize.x <= 0f || camera.sSize.y <= 0f) return false;
+            Vector2 world;
+            if (creature.inShortcut)
+            {
+                Vector2? shortcut = camera.game?.shortcuts?.OnScreenPositionOfInShortCutCreature(camera.room, creature);
+                if (shortcut == null) return false;
+                world = shortcut.Value;
+            }
+            else
+            {
+                if (creature.room != camera.room || creature.mainBodyChunk == null) return false;
+                world = Vector2.Lerp(creature.mainBodyChunk.lastPos, creature.mainBodyChunk.pos, timeStacker);
+            }
+            Vector2 cameraPos = Vector2.Lerp(camera.lastPos, camera.pos, timeStacker);
+            if (!camera.voidSeaMode && camera.freeMoveRect == null && camera.room.cameraPositions != null &&
+                camera.currentCameraPosition >= 0 && camera.currentCameraPosition < camera.room.cameraPositions.Length)
+            {
+                Vector2 screen = camera.room.cameraPositions[camera.currentCameraPosition];
+                cameraPos.x = Mathf.Clamp(cameraPos.x, screen.x + camera.hDisplace + 8f - 20f, screen.x + camera.hDisplace + 8f + 20f);
+                cameraPos.y = Mathf.Clamp(cameraPos.y, screen.y + 8f - 7f, screen.y + 33f);
+            }
+            cameraPos = new Vector2(Mathf.Floor(cameraPos.x), Mathf.Floor(cameraPos.y));
+            source = new Vector2((world.x - cameraPos.x) / camera.sSize.x, (world.y - cameraPos.y) / camera.sSize.y);
+            return FiniteVector(source);
+        }
+
+        private static void PolygonBounds(Vector2[] polygon, out Vector2 min, out Vector2 max)
+        {
+            min = new Vector2(1f, 1f); max = Vector2.zero;
+            ExpandBounds(polygon, ref min, ref max);
+        }
+
+        /// <summary>
+        /// True when every camera in the layout follows a player who is inside the
+        /// same shelter. The first camera must actually be showing it, so the
+        /// collapsed view is never a camera that is still loading somewhere else.
+        /// </summary>
+        private bool AllPlayersInOneShelter(RainWorldGame game, List<int> aliveCameras)
+        {
+            AbstractRoom shelter = null;
+            for (int i = 0; i < aliveCameras.Count; i++)
+            {
+                AbstractCreature player = GetPlayerForCamera(game, aliveCameras[i]);
+                AbstractRoom room = player?.realizedCreature?.room?.abstractRoom ?? player?.Room;
+                if (room == null || !room.shelter) return false;
+                if (shelter == null) shelter = room;
+                else if (shelter != room) return false;
+            }
+            return shelter != null && CameraByNumber(game, aliveCameras[0])?.room?.abstractRoom == shelter;
         }
 
         private static void ExpandBounds(Vector2[] polygon, ref Vector2 min, ref Vector2 max)
@@ -753,67 +909,6 @@ namespace SplitScreenCoop
                 min.x = Mathf.Min(min.x, point.x); min.y = Mathf.Min(min.y, point.y);
                 max.x = Mathf.Max(max.x, point.x); max.y = Mathf.Max(max.y, point.y);
             }
-        }
-
-        private bool ApplyDynamicCameraFollow(RoomCamera camera)
-        {
-            if (!dynamicStyle || dualDisplays || dynamicLayout == null || camera == null) return false;
-            int number = camera.cameraNumber;
-            if (number < 0 || number >= hasDynamicCameraTarget.Length || !hasDynamicCameraTarget[number]) return true;
-            SplitLayoutSolver.ViewportState viewport = null;
-            for (int i = 0; i < dynamicLayout.viewports.Length; i++)
-                if (dynamicLayout.viewports[i].cameraNumber == number) { viewport = dynamicLayout.viewports[i]; break; }
-            if (viewport == null) return true;
-            RoomCamera shared = viewport.sharesImageWith >= 0 ? CameraByNumber(camera.game, viewport.sharesImageWith) : null;
-            if (viewport.splitAmount <= 0f && viewport.imageBlend <= 0f)
-            {
-                if (shared != null && shared.room == camera.room &&
-                    shared.currentCameraPosition == camera.currentCameraPosition)
-                    camera.pos = shared.pos;
-                return true; // Keep native follow for a full-screen merged image.
-            }
-            AbstractCreature player = GetPlayerForCamera(camera.game, number);
-            Creature realized = player?.realizedCreature;
-            if (realized == null || (!realized.inShortcut && realized.room != camera.room) ||
-                !TryGetPlayerRoomPosition(camera, player, out Vector2 livePosition))
-                return true; // The old room must not steer a transitioning camera.
-            SetDynamicCameraTarget(camera, livePosition, viewport);
-            if (shared != null && viewport.imageBlend <= 0f && shared.room == camera.room &&
-                shared.currentCameraPosition == camera.currentCameraPosition)
-            {
-                camera.pos = shared.pos;
-                return true;
-            }
-            Vector2 target = dynamicCameraTargets[number] + camera.followCreatureInputForward * 2f;
-            if (shared != null && shared.room == camera.room && viewport.imageBlend < 1f)
-                target = Vector2.Lerp(shared.pos, target, viewport.imageBlend);
-            Vector2 velocity = dynamicFollowVelocities[number];
-            camera.pos.x = SmoothDynamicCameraAxis(camera.pos.x, target.x, camera.sSize.x, ref velocity.x);
-            camera.pos.y = SmoothDynamicCameraAxis(camera.pos.y, target.y, camera.sSize.y, ref velocity.y);
-            dynamicFollowVelocities[number] = velocity;
-            return true;
-        }
-
-        private static float SmoothDynamicCameraAxis(float current, float target, float screenSize, ref float velocity)
-        {
-            float distance = Mathf.Abs(target - current);
-            if (distance > screenSize * 0.35f)
-            {
-                velocity = 0f; // Discrete screen/warp change, not ordinary follow.
-                return target;
-            }
-            if (distance < 4f && Mathf.Abs(velocity) < 8f) return current;
-            return Mathf.SmoothDamp(current, target, ref velocity, 0.14f,
-                screenSize * 2f, Mathf.Max(0.001f, Time.deltaTime));
-        }
-
-        private float DynamicClampWiden(RoomCamera camera, bool horizontal, bool lower)
-        {
-            // The level art only covers one prebaked camera screen. Widening
-            // Rain World's native displace clamps exposed unrendered black space
-            // when a creature was pulled by a vulture or a shortcut. The
-            // compositor can pan within that rendered screen, not beyond it.
-            return 0f;
         }
 
         private static RoomCamera CameraByNumber(RainWorldGame game, int number)
@@ -830,22 +925,6 @@ namespace SplitScreenCoop
             for (int i = 0; i < dynamicLayout.viewports.Length; i++)
                 if (dynamicLayout.viewports[i].cameraNumber == cameraNumber) return dynamicLayout.viewports[i];
             return null;
-        }
-
-        private Vector2 DynamicGroupCentroid(int cameraNumber)
-        {
-            var view = DynamicViewportForCamera(cameraNumber);
-            if (view == null) return new Vector2(0.5f, 0.5f);
-            int leader = view.sharesImageWith >= 0 ? view.sharesImageWith : cameraNumber;
-            Vector2 sum = Vector2.zero;
-            float area = 0f;
-            foreach (var member in dynamicLayout.viewports)
-                if (member.cameraNumber == leader || member.sharesImageWith == leader)
-                {
-                    sum += member.centroid * member.areaFraction;
-                    area += member.areaFraction;
-                }
-            return area > 0f ? sum / area : view.centroid;
         }
 
         private void JollyOffRoom_Update(
@@ -953,59 +1032,38 @@ namespace SplitScreenCoop
             return first.x * second.y - first.y * second.x;
         }
 
-        private void MovePauseMenuIntoRegion(Menu.PauseMenu menu, int cameraNumber, Vector2 screenSize)
+        /// <summary>
+        /// The pause menu is shared by every player, so it is drawn once on the global
+        /// stage. That stage is composited last, at native screen coordinates and
+        /// without polygon clipping, so the menu looks exactly like the single-player
+        /// one and Futile's pointer hit-testing matches what is on screen.
+        /// </summary>
+        /// <summary>
+        /// The shared meters belong to one camera's HUD, and vanilla only reveals a
+        /// HUD for its own owner's map button. Any player holding the map should see
+        /// the shared food, karma and rain meters come up.
+        /// </summary>
+        private void HUD_Update(On.HUD.HUD.orig_Update orig, HUD.HUD self)
         {
-            if (menu?.container == null || dynamicLayout == null || cameraNumber < 0 ||
-                cameraNumber >= hudStages.Length || hudStages[cameraNumber] == null) return;
-            bool fullyMerged = !alwaysSplit;
-            foreach (var view in dynamicLayout.viewports)
-                if (!view.ghost && view.splitAmount > 0.05f) { fullyMerged = false; break; }
-            if (fullyMerged && globalHudStage != null)
-            {
-                // Native full-screen pause UI must not be polygon-clipped.
-                globalHudStage.AddChild(menu.container);
-                menu.container.SetPosition(Vector2.zero);
-                return;
-            }
-            hudStages[cameraNumber].AddChild(menu.container);
-            menu.container.SetPosition(camOffsets[cameraNumber]);
-            PlacePauseButtonsInRegion(menu, cameraNumber, screenSize);
+            orig(self);
+            if (!dynamicStyle || dualDisplays || !dynamicActive || self.showKarmaFoodRain) return;
+            if (!(self.rainWorld?.processManager?.currentMainLoop is RainWorldGame game) || game.cameras == null) return;
+            RoomCamera source = CameraByNumber(game, globalMeterSource);
+            if (source?.hud != self || game.session?.Players == null) return;
+            foreach (AbstractCreature player in game.session.Players)
+                if (player?.realizedCreature is Player realized && !realized.dead &&
+                    (realized.RevealMap || realized.showKarmaFoodRainTime > 0))
+                {
+                    self.showKarmaFoodRain = true;
+                    return;
+                }
         }
 
-        private void PlacePauseButtonsInRegion(Menu.PauseMenu menu, int cameraNumber, Vector2 screenSize)
+        private void MovePauseMenuGlobal(Menu.PauseMenu menu)
         {
-            var view = DynamicViewportForCamera(cameraNumber);
-            if (view?.polygon == null || screenSize.x <= 0f || screenSize.y <= 0f) return;
-            Vector2 buttonCenter = view.centroid;
-            if (RayToPolygonEdge(view.centroid, Vector2.down, view.polygon, out Vector2 bottom))
-                buttonCenter = Vector2.Lerp(view.centroid, bottom, 0.3f);
-            // The compositor draws this view's HUD texture translated by its own
-            // shift, so a native screen position p appears at p/screenSize - shift.
-            // Invert that to land the buttons on buttonCenter.
-            Vector2 shift = DynamicHudShift(view, true);
-            Vector2 native = new Vector2(screenSize.x * (buttonCenter.x + shift.x),
-                screenSize.y * (buttonCenter.y + shift.y));
-            bool narrow = view.areaFraction < 0.32f;
-            PlacePauseButton(menu.continueButton ?? menu.confirmYesButton,
-                native + (narrow ? new Vector2(0f, 24f) : new Vector2(80f, 0f)));
-            PlacePauseButton(menu.exitButton ?? menu.confirmNoButton,
-                native + (narrow ? new Vector2(0f, -24f) : new Vector2(-80f, 0f)));
-            // The confirm text is laid out to the left of the exit button, so the
-            // native position leaves it outside the region the buttons moved into.
-            if (menu.confirmMessage != null)
-                PlacePauseObject(menu.confirmMessage, native + new Vector2(0f, narrow ? -60f : 40f));
-        }
-
-        private static void PlacePauseButton(Menu.SimpleButton button, Vector2 position)
-        {
-            PlacePauseObject(button, position);
-        }
-
-        private static void PlacePauseObject(Menu.PositionedMenuObject menuObject, Vector2 position)
-        {
-            if (menuObject == null) return;
-            menuObject.pos = position;
-            menuObject.lastPos = position;
+            if (menu?.container == null || globalHudStage == null) return;
+            globalHudStage.AddChild(menu.container);
+            menu.container.SetPosition(Vector2.zero);
         }
 
         private static bool TryGetPlayerRoomPosition(RoomCamera camera, AbstractCreature player, out Vector2 position)
@@ -1059,14 +1117,13 @@ namespace SplitScreenCoop
             if (mergedFullScreen) renderedCameraNumbers.Add(directCamera);
             else
             {
+                // Only base cameras render: a cell always draws the image of the
+                // camera whose prebaked screen its players share.
                 for (int i = 0; i < dynamicLayout.viewports.Length; i++)
                 {
-                    var viewport = dynamicLayout.viewports[i];
-                    if (viewport.rendering && !renderedCameraNumbers.Contains(viewport.cameraNumber))
-                        renderedCameraNumbers.Add(viewport.cameraNumber);
+                    if (dynamicLayout.viewports[i].ghost) continue;
                     int baseCamera = baseCameraNumbers[i];
-                    if (viewport.imageBlend < 1f && !renderedCameraNumbers.Contains(baseCamera))
-                        renderedCameraNumbers.Add(baseCamera);
+                    if (!renderedCameraNumbers.Contains(baseCamera)) renderedCameraNumbers.Add(baseCamera);
                 }
                 renderedCameraNumbers.Sort();
             }
@@ -1081,9 +1138,12 @@ namespace SplitScreenCoop
                 if (listener == null || fcameras[i] == null) continue;
                 if (listener.renderTexture != null)
                 {
-                    bool zoomed = Array.Exists(dynamicLayout.viewports,
-                        view => !view.ghost && view.zoom < 0.999f &&
-                            (view.cameraNumber == i || baseCameraNumbers[Array.IndexOf(dynamicLayout.viewports, view)] == i));
+                    bool zoomed = false;
+                    for (int v = 0; v < dynamicLayout.viewports.Length && !zoomed; v++)
+                    {
+                        var view = dynamicLayout.viewports[v];
+                        zoomed = !view.ghost && view.zoom < 0.999f && (view.cameraNumber == i || baseCameraNumbers[v] == i);
+                    }
                     listener.renderTexture.filterMode = zoomed ? zoomFilter : FilterMode.Point;
                 }
                 fcameras[i].cullingMask = 1 << worldLayers[i];
@@ -1104,8 +1164,9 @@ namespace SplitScreenCoop
             for (int i = 0; i < hudCameras.Length; i++)
                 if (hudCameras[i] != null)
                 {
-                    bool expected = Array.Exists(dynamicLayout.viewports,
-                        v => v.cameraNumber == i && !v.ghost);
+                    bool expected = false;
+                    for (int v = 0; v < dynamicLayout.viewports.Length && !expected; v++)
+                        expected = dynamicLayout.viewports[v].cameraNumber == i && !dynamicLayout.viewports[v].ghost;
                     if (expected && hudExpectedSinceFrames[i] < 0)
                         hudExpectedSinceFrames[i] = Time.frameCount;
                     else if (!expected) hudExpectedSinceFrames[i] = -1;
@@ -1113,12 +1174,30 @@ namespace SplitScreenCoop
                 }
             if (globalHudCamera != null)
             {
+                // Isolating each view's world onto its own layer left Futile's root
+                // stage rendered by nobody. Menu.MouseCursor.BumToFront parents the
+                // cursor there, so the pause menu had no visible pointer; the same is
+                // true of anything else the game or another mod leaves on the root
+                // stage. Draw it over the finished composite at native coordinates.
+                globalHudCamera.cullingMask = (1 << globalHudLayer) |
+                    (1 << (Futile.stage != null ? Futile.stage.layer : 0));
                 if (globalHudExpectedSinceFrame < 0) globalHudExpectedSinceFrame = Time.frameCount;
                 globalHudCamera.enabled = true;
             }
-            string key = $"groups=[{string.Join(",", Array.ConvertAll(dynamicLayout.viewports, v => $"{v.cameraNumber}:{v.sharesImageWith}"))}]|sources=[{string.Join(",", baseCameraNumbers)}]|rendering=[{string.Join(",", renderedCameraNumbers)}]|direct={mergedFullScreen}";
-            if (key != lastDynamicLayoutKey)
+            // Build the human-readable layout line only when the structure changed;
+            // this runs every tick and string work here was pure garbage otherwise.
+            long signature = mergedFullScreen ? 1L : 0L;
+            for (int i = 0; i < dynamicLayout.viewports.Length; i++)
             {
+                var v = dynamicLayout.viewports[i];
+                signature = signature * 131 + v.cameraNumber * 7 + v.sharesImageWith + 2;
+                signature = signature * 131 + baseCameraNumbers[i] + (v.rendering ? 64 : 0) + (v.ghost ? 128 : 0);
+            }
+            for (int i = 0; i < renderedCameraNumbers.Count; i++) signature = signature * 131 + renderedCameraNumbers[i];
+            if (signature != lastLayoutSignature)
+            {
+                lastLayoutSignature = signature;
+                string key = $"groups=[{string.Join(",", Array.ConvertAll(dynamicLayout.viewports, v => $"{v.cameraNumber}:{v.sharesImageWith}"))}]|sources=[{string.Join(",", baseCameraNumbers)}]|rendering=[{string.Join(",", renderedCameraNumbers)}]|direct={mergedFullScreen}";
                 Logger.LogInfo($"[CameraLayout] frame={Time.frameCount} {key}");
                 lastDynamicLayoutKey = key;
             }
@@ -1150,34 +1229,20 @@ namespace SplitScreenCoop
                     DrawDynamicPolygon(compositor.texturedMaterial,
                         cameraListeners[liveSource]?.renderTexture, FullScreenPolygon,
                         Vector2.zero, 1f);
-                // At a complete merge, render one native image. Re-drawing
-                // adjacent cells with a blended material can expose shader seams
-                // even though their pairwise split alpha is zero.
+                // At a complete merge, render one native image. Otherwise every cell
+                // draws its base camera's image, opaque, with its own pan. Nothing is
+                // ever alpha-blended between two images: when two cells share a screen
+                // and their split amount is 0 their pans are identical, so the seam
+                // simply is not there.
                 if (!fullyMerged)
-                for (int i = 0; i < dynamicLayout.viewports.Length; i++)
                 {
-                    var viewport = dynamicLayout.viewports[i];
-                    if (viewport.ghost) continue;
-                    int own = viewport.cameraNumber;
-                    int shared = baseCameraNumbers[i];
-                    float ownAlpha = viewport.imageBlend;
-                    CameraListener ownListener = cameraListeners[own];
-                    if (ownListener == null || ownListener.lastPostRenderFrame < Time.frameCount - 2 ||
-                        fcameras[own] == null || !fcameras[own].enabled) ownAlpha = 0f;
-                    if (rainworldGameObject?.processManager?.currentMainLoop is RainWorldGame activeGame &&
-                        CameraByNumber(activeGame, own)?.room == null) ownAlpha = 0f;
-                    if (shared == own || ownAlpha >= 1f)
-                        DrawDynamicPolygon(compositor.texturedMaterial, ownListener?.renderTexture,
-                            viewport.polygon, WorldUvShift(ownScreenPositions[i], viewport, i,
-                                shared == own && ownAlpha < 1f), 1f, viewport.zoom);
-                    else
-                    {
-                        DrawDynamicPolygon(compositor.texturedMaterial, cameraListeners[shared]?.renderTexture,
-                            viewport.polygon, WorldUvShift(dynamicInputs[i].mergedScreenPos, viewport, i, true), 1f, viewport.zoom);
-                        if (ownAlpha > 0f)
-                            DrawDynamicPolygon(compositor.texturedMaterial, ownListener?.renderTexture,
-                                viewport.polygon, WorldUvShift(ownScreenPositions[i], viewport, i, false), ownAlpha, viewport.zoom);
-                    }
+                    // While cells slide to new rectangles they may overlap or leave
+                    // gaps, so the resting layout is drawn underneath first.
+                    if (dynamicLayout.sliding)
+                        for (int i = 0; i < dynamicLayout.viewports.Length; i++)
+                            DrawWorldCell(compositor.texturedMaterial, i, dynamicLayout.viewports[i].targetPolygon);
+                    for (int i = 0; i < dynamicLayout.viewports.Length; i++)
+                        DrawWorldCell(compositor.texturedMaterial, i, dynamicLayout.viewports[i].polygon);
                 }
                 // Dividers separate world images, so they belong above the world
                 // and below every overlay. Drawing them last painted opaque black
@@ -1200,6 +1265,28 @@ namespace SplitScreenCoop
                 GL.PopMatrix();
                 RenderTexture.active = previous;
             }
+        }
+
+        private void DrawWorldCell(Material material, int index, Vector2[] polygon)
+        {
+            var viewport = dynamicLayout.viewports[index];
+            if (viewport.ghost || polygon == null) return;
+            int own = viewport.cameraNumber;
+            int source = index < baseCameraNumbers.Length ? baseCameraNumbers[index] : own;
+            CameraListener listener = FreshListener(source) ?? FreshListener(own);
+            if (listener == null) return;
+            Vector2 shift = own >= 0 && own < ownViewShifts.Length && ownViewShiftValid[own] ? ownViewShifts[own] : Vector2.zero;
+            DrawDynamicPolygon(material, listener.renderTexture, polygon, shift, 1f, viewport.zoom);
+        }
+
+        /// <summary>A camera's listener if that camera rendered within the last two frames.</summary>
+        private static CameraListener FreshListener(int number)
+        {
+            if (number < 0 || number >= cameraListeners.Length) return null;
+            CameraListener listener = cameraListeners[number];
+            if (listener?.renderTexture == null || fcameras[number] == null || !fcameras[number].enabled ||
+                listener.lastPostRenderFrame < Time.frameCount - 2) return null;
+            return listener;
         }
 
         private static void DrawDynamicPolygon(Material material, RenderTexture source,
@@ -1233,65 +1320,6 @@ namespace SplitScreenCoop
             new Vector2(1f, 1f), new Vector2(0f, 1f)
         };
 
-        /// <summary>
-        /// How far outside its own render texture a view may sample in order to keep
-        /// the followed slugcat on the correct side of a divider.
-        /// </summary>
-        private const float PlayerVisibilitySlack = 0.35f;
-
-        private Vector2 WorldUvShift(Vector2 playerSourcePos, SplitLayoutSolver.ViewportState viewport,
-            int index, bool sharedSource)
-        {
-            float zoom = Mathf.Max(0.1f, viewport.zoom);
-            Vector2 shift = playerSourcePos - viewport.regionAnchor / zoom;
-            Vector2 min = new Vector2(1f, 1f), max = Vector2.zero;
-            if (sharedSource)
-                for (int j = 0; j < dynamicLayout.viewports.Length; j++)
-                    if (baseCameraNumbers[j] == baseCameraNumbers[index])
-                        ExpandBounds(dynamicLayout.viewports[j].polygon, ref min, ref max);
-            if (!sharedSource) ExpandBounds(viewport.polygon, ref min, ref max);
-            float minShiftX = -min.x / zoom, maxShiftX = 1f - max.x / zoom;
-            float minShiftY = -min.y / zoom, maxShiftY = 1f - max.y / zoom;
-            if (minShiftX <= maxShiftX) shift.x = Mathf.Clamp(shift.x, minShiftX, maxShiftX);
-            if (minShiftY <= maxShiftY) shift.y = Mathf.Clamp(shift.y, minShiftY, maxShiftY);
-            if (!sharedSource && viewport.splitAmount > 0.05f && viewport.imageBlend > 0.5f &&
-                playerSourcePos.x >= 0f && playerSourcePos.x <= 1f &&
-                playerSourcePos.y >= 0f && playerSourcePos.y <= 1f)
-            {
-                Vector2 displayedPlayer = (playerSourcePos - shift) * zoom;
-                Vector2 direction = displayedPlayer - viewport.centroid;
-                if (RayToPolygonEdge(viewport.centroid, direction, viewport.polygon, out Vector2 edge))
-                {
-                    bool outside = !PointInsidePolygon(viewport.polygon, displayedPlayer);
-                    if (outside || (edge - displayedPlayer).magnitude < 0.045f)
-                    {
-                        Vector2 inward = viewport.centroid - edge;
-                        Vector2 safePoint = edge + inward.normalized * 0.05f;
-                        Vector2 safeShift = playerSourcePos - safePoint / zoom;
-                        // Allow a clamped-edge strip rather than hide the character.
-                        // A cell whose bounding box nearly fills the screen - every
-                        // diagonal Voronoi split produces one - is zoomed to exactly
-                        // that box, so the in-bounds shift range collapses to a point
-                        // and no legal pan can move the player off the far side of the
-                        // divider. Only a player who is genuinely outside their own
-                        // cell gets the wide budget; a player merely close to an edge
-                        // keeps the small nudge, which costs no source coverage.
-                        float slack = outside ? PlayerVisibilitySlack : 0.08f;
-                        shift.x = Mathf.Clamp(safeShift.x, minShiftX - slack, maxShiftX + slack);
-                        shift.y = Mathf.Clamp(safeShift.y, minShiftY - slack, maxShiftY + slack);
-                        int number = viewport.cameraNumber;
-                        if (outside && number >= 0 && number < lastPlayerSafetyLogFrames.Length &&
-                            Time.frameCount - lastPlayerSafetyLogFrames[number] > 120)
-                        {
-                            Logger.LogWarning($"[CameraLayout] frame={Time.frameCount} player visibility correction cam={number} source={playerSourcePos} display={displayedPlayer} cell={viewport.centroid} zoom={zoom:0.00}");
-                            lastPlayerSafetyLogFrames[number] = Time.frameCount;
-                        }
-                    }
-                }
-            }
-            return shift;
-        }
-
         private static void DrawVertex(Vector2 position, Vector2 uvShift, float zoom)
         {
             GL.TexCoord2(position.x / zoom + uvShift.x, position.y / zoom + uvShift.y);
@@ -1300,29 +1328,27 @@ namespace SplitScreenCoop
 
         private void DrawDynamicHud(Material material)
         {
-            bool paused = rainworldGameObject?.processManager?.currentMainLoop is RainWorldGame game && game.GamePaused;
             for (int i = 0; i < dynamicLayout.viewports.Length; i++)
             {
                 var view = dynamicLayout.viewports[i];
                 if (view.ghost) continue;
                 // The HUD is sampled at its native scale, translated so the map's
-                // conventional screen center lands at the owned cell centroid.
-                int sourceCamera = paused && view.sharesImageWith >= 0 ? view.sharesImageWith : view.cameraNumber;
-                DrawDynamicPolygon(material, hudTextures[sourceCamera], view.polygon,
-                    DynamicHudShift(view, paused), 1f);
+                // conventional screen center lands at the owned cell centroid. Each
+                // view keeps its own HUD even while paused; the pause menu itself is
+                // a single shared one drawn later on the global stage.
+                DrawDynamicPolygon(material, hudTextures[view.cameraNumber], view.polygon,
+                    DynamicHudShift(view), 1f);
             }
         }
 
         /// <summary>
         /// The uv translation the compositor draws a view's HUD texture with.
-        /// Anything that has to be positioned against the composited result -
-        /// the pause menu's buttons, for instance - has to use this same value,
-        /// or it lands somewhere other than where the HUD is drawn.
+        /// Anything positioned against the composited result has to use this same
+        /// value, or it lands somewhere other than where the HUD is drawn.
         /// </summary>
-        private Vector2 DynamicHudShift(SplitLayoutSolver.ViewportState view, bool paused)
+        private Vector2 DynamicHudShift(SplitLayoutSolver.ViewportState view)
         {
-            Vector2 anchor = paused ? DynamicGroupCentroid(view.cameraNumber) : view.centroid;
-            return HudUvShift(view.polygon, new Vector2(0.5f, 0.5f) - anchor);
+            return HudUvShift(view.polygon, new Vector2(0.5f, 0.5f) - view.centroid);
         }
 
         /// <summary>

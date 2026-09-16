@@ -37,8 +37,11 @@ namespace SplitScreenCoop
             MinZoom = config.Bind("MinZoom", 0.5f, new ConfigurableInfo(
                 "Smallest view zoom, still limited by the one-screen source image.",
                 new ConfigAcceptableRange<float>(0.3f, 1f)));
-            ZoomExponent = config.Bind("ZoomExponent", 0.5f, new ConfigurableInfo(
-                "How strongly shrinking view area reduces zoom.",
+            // New key: the old "ZoomExponent" default of 0.5 zoomed three- and
+            // four-player cells out to half scale, which made following pointless.
+            // Native scale with panning is the baseline; raise this for a wider view.
+            ZoomExponent = config.Bind("ViewZoomExponent", 0f, new ConfigurableInfo(
+                "How strongly smaller cells zoom out. 0 keeps every view at native scale and pans to follow.",
                 new ConfigAcceptableRange<float>(0f, 1.5f)));
             DividerWidth = config.Bind("DividerWidth", 2f, new ConfigurableInfo(
                 "Divider width in display pixels.", new ConfigAcceptableRange<float>(0.5f, 8f)));
