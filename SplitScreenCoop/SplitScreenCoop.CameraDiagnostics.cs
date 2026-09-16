@@ -118,7 +118,9 @@ namespace SplitScreenCoop
             }
 
             if (dynamicActive && dynamicCompositorCamera != null && dynamicCompositorCamera.enabled &&
-                dynamicCompositor != null && Time.frameCount - Math.Max(0, dynamicCompositor.lastCompositeFrame) > RenderStallFrames)
+                dynamicCompositor != null && compositorExpectedSinceFrame >= 0 &&
+                Time.frameCount - Math.Max(compositorExpectedSinceFrame,
+                    dynamicCompositor.lastCompositeFrame) > RenderStallFrames)
             {
                 Logger.LogWarning($"[CameraHealth] frame={Time.frameCount} final polygon compositor has not completed for {Time.frameCount - dynamicCompositor.lastCompositeFrame} frames; enabled={dynamicCompositorCamera.enabled}; target={dynamicCompositorCamera.targetTexture?.name ?? "null"}; resetting compositor camera");
                 dynamicCompositorCamera.enabled = false;

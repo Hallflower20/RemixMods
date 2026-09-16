@@ -135,6 +135,7 @@ namespace SplitScreenCoop
                 // fixes in fixes file
                 On.RoomCamera.FireUpSinglePlayerHUD += RoomCamera_FireUpSinglePlayerHUD;// displace cam2 map
                 On.Menu.PauseMenu.ctor += PauseMenu_ctor;// displace pause menu
+                On.Menu.PauseMenu.GrafUpdate += PauseMenu_GrafUpdate;
                 On.Menu.PauseMenu.ShutDownProcess += PauseMenu_ShutDownProcess;// kill dupe pause menu
                 On.Water.InitiateSprites += Water_InitiateSprites; // move water somewhere near final position
                 On.VirtualMicrophone.DrawUpdate += VirtualMicrophone_DrawUpdate; // mic from 2nd cam should not pic up while on same cam
@@ -324,8 +325,12 @@ namespace SplitScreenCoop
             alwaysSplit = Options.AlwaysSplit.Value;
             dynamicStyle = Options.SplitStyle.Value != "Classic" && dynamicPipelineAvailable &&
                 !dynamicPipelineFailed;
-            dynamicSettings.mergeDistance = Options.MergeDistance.Value;
-            dynamicSettings.blendWidth = Options.BlendWidth.Value;
+            // Existing installs may still hold the old eager default in their
+            // Remix config. Treat only that exact default as the new baseline.
+            dynamicSettings.mergeDistance = Mathf.Approximately(Options.MergeDistance.Value, 280f)
+                ? 850f : Options.MergeDistance.Value;
+            dynamicSettings.blendWidth = Mathf.Approximately(Options.BlendWidth.Value, 200f)
+                ? 300f : Options.BlendWidth.Value;
             dynamicSettings.minZoom = Options.MinZoom.Value;
             dynamicSettings.zoomExponent = Options.ZoomExponent.Value;
             dynamicSettings.dividerWidth = Options.DividerWidth.Value;
@@ -563,7 +568,9 @@ namespace SplitScreenCoop
                         self.cameras[i].followAbstractCreature = player;
                     else
                         self.cameras[i].followAbstractCreature = self.session.Players[0];
+                    MoveCameraWorldToStage(self.cameras[i]);
                     MoveCameraHudToOverlay(self.cameras[i]);
+                    MovePlayerNamesToWorld(self.cameras[i]);
                 }
                 SetSplitMode(dynamicStyle && !dualDisplays ? SplitMode.NoSplit :
                     alwaysSplit ? ResolveSplitMode(self.session.Players.Count) : SplitMode.NoSplit, self, "game start");
@@ -596,7 +603,9 @@ namespace SplitScreenCoop
             self.splitScreenMode = false; // don't, mine is better
             self.offset = Vector2.zero;
             foreach (var c in self.SpriteLayers) c.SetPosition(camOffsets[self.cameraNumber]);
+            MoveCameraWorldToStage(self);
             MoveCameraHudToOverlay(self);
+            MovePlayerNamesToWorld(self);
         }
 
         /// <summary>
@@ -605,6 +614,11 @@ namespace SplitScreenCoop
         public void RainWorldGame_ShutDownProcess(On.RainWorldGame.orig_ShutDownProcess orig, RainWorldGame self)
         {
             Logger.LogInfo("RainWorldGame_ShutDownProcess cleanups");
+            if ((dynamicActive || dynamicStyle) && !dualDisplays && self.cameras?.Length > 1)
+            {
+                RestoreClassicWorld(self);
+                RestoreClassicHud(self);
+            }
             ResetDynamicLayout();
             SetSplitMode(SplitMode.NoSplit, self, "game shutdown");
             if (dualDisplays && DualDisplaySupported())
@@ -653,17 +667,21 @@ namespace SplitScreenCoop
             orig(self);
 
             if (!self.IsStorySession) return;
+            if (self.cameras.Length > 1 && dynamicStyle && dynamicPipelineFailed)
+            {
+                Logger.LogWarning($"[CameraLayout] frame={Time.frameCount} restoring Classic after compositor failure");
+                RestoreClassicWorld(self);
+                RestoreClassicHud(self);
+                RestoreClassicPauseMenus(self);
+                dynamicStyle = false;
+                ResetDynamicLayout();
+                SetSplitMode(ResolveSplitMode(GetAliveCameraNumbers(self).Count), self,
+                    "compositor failure fallback");
+            }
             if (self.GamePaused) return;
 
             if (self.cameras.Length > 1)
             {
-                if (dynamicStyle && dynamicPipelineFailed)
-                {
-                    Logger.LogWarning($"[CameraLayout] frame={Time.frameCount} restoring Classic after compositor failure");
-                    RestoreClassicHud(self);
-                    dynamicStyle = false;
-                    ResetDynamicLayout();
-                }
                 EnsureStableCameraAssignments(self);
                 List<int> aliveCameras = GetAliveCameraNumbers(self);
                 if (dynamicStyle && !dualDisplays)
@@ -837,6 +855,10 @@ namespace SplitScreenCoop
                 }
                 cameraListeners[0].direct = true;
             }
+            if (dynamicStyle && !dualDisplays && game.cameras.Length > 1)
+                for (int i = 0; i < fcameras.Length; i++)
+                    if (fcameras[i] != null && worldLayers[i] > 0)
+                        fcameras[i].cullingMask = 1 << worldLayers[i];
             RefreshActiveCameraRendering(game, reason ?? "split mode update");
         }
 

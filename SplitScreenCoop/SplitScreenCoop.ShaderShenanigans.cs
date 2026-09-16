@@ -252,6 +252,16 @@ namespace SplitScreenCoop
             listener.ShaderKeywords["GAMEPLAYRIPPLETEXTURE"] = camera.rippleData != null &&
                 camera.rippleData.hasGameplayScreen;
 
+            // These textures are authoritative per RoomCamera. A different
+            // camera's DrawUpdate can overwrite Unity's global bindings before
+            // this camera renders, especially during camera-position fades.
+            if (camera.currentPalette.texture != null)
+                listener.ShaderTextures[RainWorld.ShadPropPalTex] = camera.currentPalette.texture;
+            if (camera.levelTexture != null)
+                listener.ShaderTextures[RainWorld.ShadPropLevelTex] = camera.levelTexture;
+            listener.ShaderTextures[Shader.PropertyToID("_terrainPalette")] =
+                camera.terrainPalette?.texture;
+
             if (room == null) return;
             listener.ShaderKeywords["RoomHasWater"] = !room.abstractRoom.gate && !room.abstractRoom.shelter && room.waterObject != null;
             listener.ShaderKeywords["RoomHasBrainMold"] = room.brainMold != null;

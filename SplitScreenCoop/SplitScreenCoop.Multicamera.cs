@@ -77,6 +77,7 @@ namespace SplitScreenCoop
                         var leaders = new System.Collections.Generic.List<int>();
                         foreach (var view in dynamicLayout.viewports)
                         {
+                            if (view.ghost) continue;
                             int leader = view.sharesImageWith >= 0 ? view.sharesImageWith : view.cameraNumber;
                             if (!leaders.Contains(leader)) leaders.Add(leader);
                         }
@@ -127,6 +128,22 @@ namespace SplitScreenCoop
             }
         }
 
+        public void PauseMenu_GrafUpdate(On.Menu.PauseMenu.orig_GrafUpdate orig,
+            Menu.PauseMenu self, float timeStacker)
+        {
+            if (dynamicStyle && !dualDisplays && dynamicLayout != null &&
+                self?.container?.container is FStage stage)
+            {
+                for (int i = 0; i < hudStages.Length; i++)
+                    if (stage == hudStages[i])
+                    {
+                        PlacePauseButtonsInRegion(self, i, self.manager.rainWorld.screenSize);
+                        break;
+                    }
+            }
+            orig(self, timeStacker);
+        }
+
         private static Vector2 PauseOffsetForSlot(SplitMode mode, int slot, Vector2 screenSize)
         {
             float x = screenSize.x / 4f;
@@ -174,6 +191,7 @@ namespace SplitScreenCoop
             orig(self, player);
             AssignCameraToPlayer(self, player);
             MoveCameraHudToOverlay(self);
+            MovePlayerNamesToWorld(self);
         }
 
         public delegate bool delget_ShouldBeCulled(GraphicsModule gm);
@@ -204,7 +222,8 @@ namespace SplitScreenCoop
         public void Water_InitiateSprites(On.Water.orig_InitiateSprites orig, Water self, RoomCamera.SpriteLeaser sLeaser, RoomCamera rCam)
         {
             orig(self, sLeaser, rCam);
-            if (dynamicActive || CurrentSplitMode != SplitMode.NoSplit)
+            if ((dynamicStyle && !dualDisplays && rCam.game?.cameras?.Length > 1) ||
+                CurrentSplitMode != SplitMode.NoSplit)
             {
                 var camPos = rCam.pos + rCam.offset;
                 float y = -10f;
@@ -265,8 +284,7 @@ namespace SplitScreenCoop
                 c.Remove();
                 c.EmitDelegate<Action<World, AbstractRoom>>((w, r) =>
                 {
-                    w.ActivateRoom(r);
-                    if (w?.game?.roomRealizer is RoomRealizer rr) rr.AddNewTrackedRoom(r, true);
+                    TrackShortcutDestination(w, r);
                 });
             }
             else Logger.LogError(new Exception("Couldn't IL-hook ShortcutHandler_Update part 2 AddNewTrackedRoom from SplitScreenMod")); // deffendisve progrmanig
@@ -313,8 +331,7 @@ namespace SplitScreenCoop
                 c.Remove();
                 c.EmitDelegate<Action<World, AbstractRoom>>((w, r) =>
                 {
-                    w.ActivateRoom(r);
-                    if (w?.game?.roomRealizer is RoomRealizer rr) rr.AddNewTrackedRoom(r, true);
+                    TrackShortcutDestination(w, r);
                 });
             }
             else Logger.LogError(new Exception("Couldn't IL-hook ShortcutHandler_SuckInCreature AddNewTrackedRoom from SplitScreenMod")); // deffendisve progrmanig

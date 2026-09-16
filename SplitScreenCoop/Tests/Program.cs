@@ -64,9 +64,12 @@ internal static class Program
         var merged = Settle(solver, P(0, -50f, 0f), P(1, 50f, 0f));
         Check(merged.viewports[0].zoom == 1f && merged.viewports[1].zoom == 1f, "Merged zoom not native");
         Check(merged.dividers.Length == 0, "Merged divider visible");
-        var next = solver.Solve(new[] { P(0, -141f, 0f), P(1, 141f, 0f) }, 1f / 60f, Settings);
+        float threshold = Settings.mergeDistance;
+        var next = solver.Solve(new[] { P(0, -(threshold + 2f) / 2f, 0f),
+            P(1, (threshold + 2f) / 2f, 0f) }, 1f / 60f, Settings);
         Check(next.viewports[0].splitAmount < 0.001f, "Split jumped at merge threshold");
-        var blending = solver.Solve(new[] { P(0, -160f, 0f), P(1, 160f, 0f) }, 1f / 60f, Settings);
+        var blending = solver.Solve(new[] { P(0, -(threshold + 45f) / 2f, 0f),
+            P(1, (threshold + 45f) / 2f, 0f) }, 1f / 60f, Settings);
         Check(blending.viewports[0].splitAmount > 0f && blending.viewports[0].splitAmount < 0.2f,
             "Blend is not gradual");
         Check(Math.Abs(blending.viewports[0].zoom - next.viewports[0].zoom) < 0.1f, "Zoom popped during split");
@@ -93,6 +96,95 @@ internal static class Program
             "Dead region did not start shrinking");
     }
 
+    private static void DeathCurve()
+    {
+        var solver = new SplitLayoutSolver();
+        var input = new[] { P(0, -900f, 0f, 1), P(1, -100f, 0f, 2),
+            P(2, 100f, 0f, 3), P(3, 900f, 0f, 4) };
+        var previous = Settle(solver, input);
+        float startingArea = previous.viewports[3].areaFraction;
+        float largestChange = 0f;
+        float quarterTimeArea = 0f, halfTimeArea = 0f;
+        for (int frame = 0; frame < 41; frame++)
+        {
+            var next = solver.Solve(new[] { input[0], input[1], input[2] }, 1f / 60f, Settings);
+            Check(next.viewports.Length == 4 && next.viewports[3].ghost,
+                "Dead view disappeared before its smooth transition finished");
+            largestChange = Math.Max(largestChange,
+                Math.Abs(next.viewports[3].areaFraction - previous.viewports[3].areaFraction));
+            if (frame == 10) quarterTimeArea = next.viewports[3].areaFraction;
+            if (frame == 20) halfTimeArea = next.viewports[3].areaFraction;
+            previous = next;
+        }
+        Check(largestChange < 0.06f, "Dead view area popped during reflow: " + largestChange);
+        Check(quarterTimeArea > startingArea * 0.35f,
+            "Dead view collapsed too early in its transition: " + quarterTimeArea);
+        Check(halfTimeArea < quarterTimeArea && halfTimeArea > 0.005f,
+            "Dead view did not steadily shrink through the transition");
+        Check(solver.Solve(new[] { input[0], input[1], input[2] }, 1f / 60f, Settings)
+            .viewports.Length == 3, "Dead view remained after its transition");
+    }
+
+    private static void SharedSourceUv()
+    {
+        var solver = new SplitLayoutSolver();
+        var left = P(0, -145f, 0f);
+        var right = P(1, 145f, 0f);
+        left.mergedScreenPos = new Vector2(0.35f, 0.52f);
+        right.mergedScreenPos = new Vector2(0.65f, 0.49f);
+        var layout = Settle(solver, left, right);
+        var a = layout.viewports[0];
+        var b = layout.viewports[1];
+        Check(b.sharesImageWith == 0 && a.zoom == b.zoom,
+            "Nearby players do not share one source image and zoom");
+        Vector2 shiftA = left.mergedScreenPos - a.regionAnchor / a.zoom;
+        Vector2 shiftB = right.mergedScreenPos - b.regionAnchor / b.zoom;
+        Check((shiftA - shiftB).magnitude < 0.0001f,
+            "Merged camera cells sample different UV transforms");
+    }
+
+    private static void FollowAnchor()
+    {
+        Vector2 target = new Vector2(0.5f, 0.5f);
+        Vector2 first = SplitLayoutSolver.FollowSourcePosition(new Vector2(0.25f, 0.8f),
+            target, target, 0.6f, 0f);
+        Vector2 second = SplitLayoutSolver.FollowSourcePosition(new Vector2(0.25f, 0.8f),
+            target, target, 0.6f, 1f);
+        Vector2 third = SplitLayoutSolver.FollowSourcePosition(new Vector2(0.75f, 0.2f),
+            target, target, 0.6f, 1f);
+        Vector2 middle = SplitLayoutSolver.FollowSourcePosition(new Vector2(0.25f, 0.8f),
+            target, target, 0.6f, 0.5f);
+        Check((first - new Vector2(0.25f, 0.8f)).magnitude < 0.0001f,
+            "Merged follow no longer uses the native player position");
+        Check((second - target).magnitude < 0.0001f && (third - target).magnitude < 0.0001f,
+            "Fully split follow depends on the previous camera position");
+        Check(middle.x > first.x && middle.x < second.x &&
+            middle.y < first.y && middle.y > second.y,
+            "Follow anchor jumped during a partial split");
+    }
+
+    private static void ConservativeSameScreenSplit()
+    {
+        var near = Settle(new SplitLayoutSolver(), P(0, -300f, 0f), P(1, 300f, 0f));
+        var far = Settle(new SplitLayoutSolver(), P(0, -650f, 0f), P(1, 650f, 0f));
+        var separateScreens = Settle(new SplitLayoutSolver(), P(0, -20f, 0f, 1), P(1, 20f, 0f, 2));
+        Check(near.viewports[0].splitAmount == 0f && near.dividers.Length == 0,
+            "Players still split too early on one camera screen");
+        Check(far.viewports[0].splitAmount == 1f,
+            "Very distant players no longer receive independent views");
+        Check(separateScreens.viewports[0].splitAmount == 1f,
+            "Players on different camera screens must split immediately");
+    }
+
+    private static void SharedCameraWindow()
+    {
+        Check(SplitLayoutSolver.SharedCameraCanShow(new Vector2(0.05f, 0.95f)),
+            "The safe edge of a shared camera view was rejected");
+        Check(!SplitLayoutSolver.SharedCameraCanShow(new Vector2(0.02f, 0.5f)) &&
+            !SplitLayoutSolver.SharedCameraCanShow(new Vector2(0.5f, 1.02f)),
+            "A player outside the shared camera view was merged");
+    }
+
     private static void MergeSplitSweep()
     {
         var solver = new SplitLayoutSolver();
@@ -100,7 +192,8 @@ internal static class Program
         float largestAnchorChange = 0f, largestZoomChange = 0f;
         for (int frame = 0; frame < 240; frame++)
         {
-            float distance = frame < 120 ? 200f + frame * 2.5f : 500f - (frame - 120) * 2.5f;
+            float distance = frame < 120 ? Settings.mergeDistance - 80f + frame * 4.5f :
+                Settings.mergeDistance + 460f - (frame - 120) * 4.5f;
             var next = solver.Solve(new[] { P(0, -distance / 2f, 0f), P(1, distance / 2f, 0f) },
                 1f / 60f, Settings);
             largestAnchorChange = Math.Max(largestAnchorChange,
@@ -131,6 +224,11 @@ internal static class Program
             Continuity();
             MergeSplitSweep();
             DeathReflow();
+            DeathCurve();
+            SharedSourceUv();
+            FollowAnchor();
+            ConservativeSameScreenSplit();
+            SharedCameraWindow();
             Console.WriteLine("PASS: " + checks + " layout checks");
             return 0;
         }

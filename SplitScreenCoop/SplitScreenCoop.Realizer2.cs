@@ -1,4 +1,5 @@
 using System.Linq;
+using UnityEngine;
 
 namespace SplitScreenCoop
 {
@@ -21,6 +22,19 @@ namespace SplitScreenCoop
             }
             realizer2 = additionalRealizers.FirstOrDefault();
             Logger.LogInfo($"Created {additionalRealizers.Count} additional room realizer(s)");
+        }
+
+        private void TrackShortcutDestination(World world, AbstractRoom room)
+        {
+            if (world == null || room == null) return;
+            world.ActivateRoom(room);
+            RainWorldGame game = world.game;
+            if (game?.roomRealizer?.world == world)
+                game.roomRealizer.AddNewTrackedRoom(room, true);
+            foreach (RoomRealizer realizer in additionalRealizers)
+                if (realizer?.world == world)
+                    realizer.AddNewTrackedRoom(room, false);
+            Logger.LogInfo($"[CameraPreload] frame={Time.frameCount} destination={room.name}; realized={room.realizedRoom != null}; trackedRealizers={additionalRealizers.Count + (game?.roomRealizer == null ? 0 : 1)}");
         }
 
         public void OverWorld_WorldLoaded(On.OverWorld.orig_WorldLoaded orig, OverWorld self, bool warpUsed)

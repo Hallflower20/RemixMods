@@ -9,8 +9,8 @@ namespace SplitScreenCoop
     {
         public sealed class Settings
         {
-            public float mergeDistance = 280f;
-            public float blendWidth = 200f;
+            public float mergeDistance = 850f;
+            public float blendWidth = 300f;
             public float minZoom = 0.5f;
             public float zoomExponent = 0.5f;
             public float smoothingTime = 0.18f;
@@ -76,6 +76,7 @@ namespace SplitScreenCoop
             public float visibleFor;
             public PlayerInput lastInput;
             public float lastArea;
+            public float deathStartArea;
             public float missingFor;
             public bool wasPresent;
         }
@@ -127,6 +128,8 @@ namespace SplitScreenCoop
             {
                 if (aliveNumbers[entry.Key] || !entry.Value.wasPresent ||
                     entry.Value.missingFor >= DeathTransitionSeconds || effective.Count >= 4) continue;
+                if (entry.Value.missingFor <= 0f)
+                    entry.Value.deathStartArea = entry.Value.lastArea;
                 entry.Value.missingFor += dt;
                 if (entry.Value.missingFor < DeathTransitionSeconds)
                     effective.Add(entry.Value.lastInput);
@@ -198,7 +201,10 @@ namespace SplitScreenCoop
                 {
                     Memory state = memory[players[i].playerIndex];
                     float fade = Mathf.Clamp01(1f - state.missingFor / DeathTransitionSeconds);
-                    targetAreas[i] = state.lastArea * fade * fade;
+                    // Keep the area at the moment of death as the fade's origin.
+                    // Reusing the shrinking current area compounds the fade every
+                    // frame and makes the cell collapse almost immediately.
+                    targetAreas[i] = state.deathStartArea * fade * fade;
                     ghostTotal += targetAreas[i];
                 }
             for (int i = 0; i < count; i++)
@@ -360,7 +366,9 @@ namespace SplitScreenCoop
                 {
                     cameraNumber = players[i].playerIndex,
                     ghost = ghosts[i],
-                    rendering = ghosts[i] || !mergedSource || imageBlend > 0.01f || state.visibleFor < 0.25f,
+                    // A dead player's camera no longer has a reliable live image.
+                    // Retain its cell briefly for area reflow, never its stale RT.
+                    rendering = !ghosts[i] && (!mergedSource || imageBlend > 0.01f || state.visibleFor < 0.25f),
                     sharesImageWith = ghosts[i] ? -1 : mergedSource ? players[leaderIndex].playerIndex : -1,
                     polygon = cells[i],
                     areaFraction = area,
@@ -369,7 +377,7 @@ namespace SplitScreenCoop
                     site = sites[i],
                     regionAnchor = anchor,
                     groupSourceAnchor = sourceAnchor,
-                    groupTargetAnchor = transformAnchor,
+                    groupTargetAnchor = targetAnchor,
                     zoom = zoom,
                     splitAmount = split,
                     imageBlend = ghosts[i] ? 1f : imageBlend
@@ -396,6 +404,25 @@ namespace SplitScreenCoop
                 Mathf.SmoothDamp(from.y, to.y, ref vy, Mathf.Max(0.01f, time), Mathf.Infinity, dt));
             velocity = new Vector2(vx, vy);
             return result;
+        }
+
+        // Native follow is the t=0 endpoint. Once fully split, the player's
+        // source-screen anchor is geometry-only, so a stale camera position
+        // cannot become the next frame's follow target.
+        public static Vector2 FollowSourcePosition(Vector2 nativeSource, Vector2 targetAnchor,
+            Vector2 boundsCenter, float zoom, float splitAmount)
+        {
+            zoom = Mathf.Max(0.1f, zoom);
+            Vector2 centered = new Vector2(0.5f + (targetAnchor.x - boundsCenter.x) / zoom,
+                0.5f + (targetAnchor.y - boundsCenter.y) / zoom);
+            Vector2 result = Vector2.Lerp(nativeSource, centered, Mathf.Clamp01(splitAmount));
+            return new Vector2(Mathf.Clamp01(result.x), Mathf.Clamp01(result.y));
+        }
+
+        public static bool SharedCameraCanShow(Vector2 screenPosition)
+        {
+            return Finite(screenPosition) && screenPosition.x >= 0.05f && screenPosition.x <= 0.95f &&
+                screenPosition.y >= 0.05f && screenPosition.y <= 0.95f;
         }
 
         private static float Damp(float from, float to, ref float velocity, float time, float dt)
