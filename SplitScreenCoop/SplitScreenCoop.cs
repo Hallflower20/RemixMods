@@ -218,6 +218,15 @@ namespace SplitScreenCoop
                 On.RoomCamera.MoveCamera_int += RoomCamera_MoveCamera_int;
                 On.RoomCamera.MoveCamera_Room_int += RoomCamera_MoveCamera_Room_int; // can also colapse to single cam if one of the cams is dead
                 On.RoomCamera.UpdateSnowLight += RoomCamera_UpdateSnowLight;
+                // Palette changes reach ApplyPalette from room effects, the day/night
+                // cycle and palette-changing rooms, none of which run inside a scoped
+                // RoomCamera call. Its fog-amount global would then be recorded against
+                // no camera at all, so the views keep whichever value was written last
+                // and lose their own palette during fades and merges.
+                On.RoomCamera.ApplyPalette += RoomCamera_ApplyPalette;
+                On.RoomCamera.ApproximateLightmap += RoomCamera_ApproximateLightmap;
+                On.RoomCamera.WarpMoveCameraActual += RoomCamera_WarpMoveCameraActual;
+                On.RoomCamera.BlankWarpPointHoldFrame += RoomCamera_BlankWarpPointHoldFrame;
 
                 // Watcher rendering assumes a single Unity camera. Route its command
                 // buffers, textures, masks and ripple state to the owning split camera.
@@ -574,6 +583,12 @@ namespace SplitScreenCoop
                 }
                 SetSplitMode(dynamicStyle && !dualDisplays ? SplitMode.NoSplit :
                     alwaysSplit ? ResolveSplitMode(self.session.Players.Count) : SplitMode.NoSplit, self, "game start");
+                // SetSplitMode leaves camera 0 rendering straight to the display with
+                // the HUD cameras still off. Without a layout solved here the first
+                // frames after spawn-in show one un-composited world and no HUD,
+                // which reads as a flash before the real layout appears.
+                if (dynamicStyle && !dualDisplays)
+                    UpdateDynamicLayout(self, GetAliveCameraNumbers(self));
             }
             else
             {
@@ -942,9 +957,20 @@ namespace SplitScreenCoop
             foreach (RoomCamera camera in game.cameras)
             {
                 AbstractCreature player = GetPlayerForCamera(game, camera.cameraNumber);
-                if (player?.realizedCreature is Player realized && camera.followAbstractCreature != player)
+                if (player == null) continue;
+                // A dead player's view fades out of the layout within a second, but
+                // their corpse keeps travelling as it is dragged or carried through
+                // shortcuts. Chasing it re-enters RoomCamera.MoveCamera, which loads
+                // the next room image synchronously and stalls every other view.
+                if (IsCreatureDead(player))
+                {
+                    if (camera.cameraNumber >= 0 && camera.cameraNumber < roomMismatchSinceFrames.Length)
+                        roomMismatchSinceFrames[camera.cameraNumber] = -1;
+                    continue;
+                }
+                if (player.realizedCreature is Player realized && camera.followAbstractCreature != player)
                     AssignCameraToPlayer(camera, realized);
-                else if (player != null)
+                else
                 {
                     camera.followAbstractCreature = player;
                     ReconcileCameraRoom(camera, player, false, "stable assignment check");

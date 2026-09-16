@@ -303,13 +303,13 @@ namespace SplitScreenCoop
                 camera.game?.cameras?.Length <= 1 || globalHudStage == null) return;
             FContainer destination = camera.cameraNumber == globalMeterSource ? globalHudStage : null;
             RouteFoodMeter(camera.hud.foodMeter, destination);
-            // Food plops create short-lived FadeCircles after the permanent
-            // meter nodes have been routed. Keep those circles with the pips
-            // and backing fade instead of leaving them in the per-view HUD2.
-            if (camera.hud.foodMeter != null && camera.hud.fadeCircles != null)
+            // Food plops and karma changes create short-lived FadeCircles after
+            // the permanent meter nodes have been routed. Keep those circles with
+            // the meter they belong to instead of leaving them in the per-view HUD2.
+            if (camera.hud.fadeCircles != null)
                 foreach (HUD.FadeCircle effect in camera.hud.fadeCircles)
                     if (effect?.circle?.sprite != null &&
-                        IsFoodMeterEffect(camera.hud.foodMeter, effect.circle.pos))
+                        IsGlobalMeterEffect(camera.hud, effect.circle.pos))
                         RouteNode(effect.circle.sprite, destination);
             HUD.KarmaMeter karma = camera.hud.karmaMeter;
             if (karma != null)
@@ -369,6 +369,22 @@ namespace SplitScreenCoop
             RouteNode(food.quarterPipShower?.quarterPips, destination);
             if (food.pupBars != null)
                 foreach (HUD.FoodMeter pup in food.pupBars) RouteFoodMeter(pup, destination);
+        }
+
+        /// <summary>
+        /// A fade circle spawned by a globally routed meter has to travel with that
+        /// meter. Left in the per-view HUD it is drawn shifted into the owning cell
+        /// while the meter itself is drawn unshifted, so the flash ends up detached
+        /// from the pips or karma symbol it came from. Jolly's circles spawn at a
+        /// player's on-screen position and must stay with their own view.
+        /// </summary>
+        private static bool IsGlobalMeterEffect(HUD.HUD hud, Vector2 position)
+        {
+            if (IsFoodMeterEffect(hud.foodMeter, position)) return true;
+            HUD.KarmaMeter karma = hud.karmaMeter;
+            if (karma == null) return false;
+            float reach = Mathf.Max(45f, karma.rad + 20f);
+            return (karma.pos - position).sqrMagnitude < reach * reach;
         }
 
         private static bool IsFoodMeterEffect(HUD.FoodMeter food, Vector2 position)
@@ -939,8 +955,8 @@ namespace SplitScreenCoop
 
         private void MovePauseMenuIntoRegion(Menu.PauseMenu menu, int cameraNumber, Vector2 screenSize)
         {
-            if (menu?.container == null || cameraNumber < 0 || cameraNumber >= hudStages.Length ||
-                hudStages[cameraNumber] == null) return;
+            if (menu?.container == null || dynamicLayout == null || cameraNumber < 0 ||
+                cameraNumber >= hudStages.Length || hudStages[cameraNumber] == null) return;
             bool fullyMerged = !alwaysSplit;
             foreach (var view in dynamicLayout.viewports)
                 if (!view.ghost && view.splitAmount > 0.05f) { fullyMerged = false; break; }
@@ -963,20 +979,33 @@ namespace SplitScreenCoop
             Vector2 buttonCenter = view.centroid;
             if (RayToPolygonEdge(view.centroid, Vector2.down, view.polygon, out Vector2 bottom))
                 buttonCenter = Vector2.Lerp(view.centroid, bottom, 0.3f);
-            Vector2 native = new Vector2(screenSize.x * (0.5f + buttonCenter.x - view.centroid.x),
-                screenSize.y * (0.5f + buttonCenter.y - view.centroid.y));
+            // The compositor draws this view's HUD texture translated by its own
+            // shift, so a native screen position p appears at p/screenSize - shift.
+            // Invert that to land the buttons on buttonCenter.
+            Vector2 shift = DynamicHudShift(view, true);
+            Vector2 native = new Vector2(screenSize.x * (buttonCenter.x + shift.x),
+                screenSize.y * (buttonCenter.y + shift.y));
             bool narrow = view.areaFraction < 0.32f;
             PlacePauseButton(menu.continueButton ?? menu.confirmYesButton,
                 native + (narrow ? new Vector2(0f, 24f) : new Vector2(80f, 0f)));
             PlacePauseButton(menu.exitButton ?? menu.confirmNoButton,
                 native + (narrow ? new Vector2(0f, -24f) : new Vector2(-80f, 0f)));
+            // The confirm text is laid out to the left of the exit button, so the
+            // native position leaves it outside the region the buttons moved into.
+            if (menu.confirmMessage != null)
+                PlacePauseObject(menu.confirmMessage, native + new Vector2(0f, narrow ? -60f : 40f));
         }
 
         private static void PlacePauseButton(Menu.SimpleButton button, Vector2 position)
         {
-            if (button == null) return;
-            button.pos = position;
-            button.lastPos = position;
+            PlacePauseObject(button, position);
+        }
+
+        private static void PlacePauseObject(Menu.PositionedMenuObject menuObject, Vector2 position)
+        {
+            if (menuObject == null) return;
+            menuObject.pos = position;
+            menuObject.lastPos = position;
         }
 
         private static bool TryGetPlayerRoomPosition(RoomCamera camera, AbstractCreature player, out Vector2 position)
@@ -1150,8 +1179,11 @@ namespace SplitScreenCoop
                                 viewport.polygon, WorldUvShift(ownScreenPositions[i], viewport, i, false), ownAlpha, viewport.zoom);
                     }
                 }
-                DrawDynamicHud(compositor.texturedMaterial);
+                // Dividers separate world images, so they belong above the world
+                // and below every overlay. Drawing them last painted opaque black
+                // over whatever HUD or pause-menu pixels happened to sit under a bar.
                 DrawDynamicDividers(compositor.solidMaterial);
+                DrawDynamicHud(compositor.texturedMaterial);
                 if (dynamicDebugOverlay) DrawDynamicOutlines(compositor.solidMaterial);
                 compositor.lastCompositeFrame = Time.frameCount;
                 compositorRecoveries = 0;
@@ -1174,6 +1206,14 @@ namespace SplitScreenCoop
             Vector2[] polygon, Vector2 uvShift, float alpha, float zoom = 1f)
         {
             if (source == null || polygon == null || polygon.Length < 3) return;
+            // At native scale the source and the display texture share one pixel
+            // grid, so snapping the pan to whole texels keeps the image exact.
+            // A fractional shift makes every displayed pixel a blend of two
+            // neighbours, which reads as the view softening and shimmering as the
+            // followed slugcat's body chunk jitters.
+            if (zoom > 0.999f && source.width > 0 && source.height > 0)
+                uvShift = new Vector2(Mathf.Round(uvShift.x * source.width) / source.width,
+                    Mathf.Round(uvShift.y * source.height) / source.height);
             material.mainTexture = source;
             if (!material.SetPass(0)) return;
             GL.Begin(GL.TRIANGLES);
@@ -1192,6 +1232,12 @@ namespace SplitScreenCoop
             new Vector2(0f, 0f), new Vector2(1f, 0f),
             new Vector2(1f, 1f), new Vector2(0f, 1f)
         };
+
+        /// <summary>
+        /// How far outside its own render texture a view may sample in order to keep
+        /// the followed slugcat on the correct side of a divider.
+        /// </summary>
+        private const float PlayerVisibilitySlack = 0.35f;
 
         private Vector2 WorldUvShift(Vector2 playerSourcePos, SplitLayoutSolver.ViewportState viewport,
             int index, bool sharedSource)
@@ -1222,12 +1268,17 @@ namespace SplitScreenCoop
                         Vector2 inward = viewport.centroid - edge;
                         Vector2 safePoint = edge + inward.normalized * 0.05f;
                         Vector2 safeShift = playerSourcePos - safePoint / zoom;
-                        // Allow a narrow clamped-edge strip during discrete
-                        // camera-screen entry. It is preferable to hiding the
-                        // character under the divider while the native camera
-                        // still draws the player near the RT edge.
-                        shift.x = Mathf.Clamp(safeShift.x, minShiftX - 0.08f, maxShiftX + 0.08f);
-                        shift.y = Mathf.Clamp(safeShift.y, minShiftY - 0.08f, maxShiftY + 0.08f);
+                        // Allow a clamped-edge strip rather than hide the character.
+                        // A cell whose bounding box nearly fills the screen - every
+                        // diagonal Voronoi split produces one - is zoomed to exactly
+                        // that box, so the in-bounds shift range collapses to a point
+                        // and no legal pan can move the player off the far side of the
+                        // divider. Only a player who is genuinely outside their own
+                        // cell gets the wide budget; a player merely close to an edge
+                        // keeps the small nudge, which costs no source coverage.
+                        float slack = outside ? PlayerVisibilitySlack : 0.08f;
+                        shift.x = Mathf.Clamp(safeShift.x, minShiftX - slack, maxShiftX + slack);
+                        shift.y = Mathf.Clamp(safeShift.y, minShiftY - slack, maxShiftY + slack);
                         int number = viewport.cameraNumber;
                         if (outside && number >= 0 && number < lastPlayerSafetyLogFrames.Length &&
                             Time.frameCount - lastPlayerSafetyLogFrames[number] > 120)
@@ -1257,10 +1308,36 @@ namespace SplitScreenCoop
                 // The HUD is sampled at its native scale, translated so the map's
                 // conventional screen center lands at the owned cell centroid.
                 int sourceCamera = paused && view.sharesImageWith >= 0 ? view.sharesImageWith : view.cameraNumber;
-                Vector2 anchor = paused ? DynamicGroupCentroid(view.cameraNumber) : view.centroid;
                 DrawDynamicPolygon(material, hudTextures[sourceCamera], view.polygon,
-                    new Vector2(0.5f, 0.5f) - anchor, 1f);
+                    DynamicHudShift(view, paused), 1f);
             }
+        }
+
+        /// <summary>
+        /// The uv translation the compositor draws a view's HUD texture with.
+        /// Anything that has to be positioned against the composited result -
+        /// the pause menu's buttons, for instance - has to use this same value,
+        /// or it lands somewhere other than where the HUD is drawn.
+        /// </summary>
+        private Vector2 DynamicHudShift(SplitLayoutSolver.ViewportState view, bool paused)
+        {
+            Vector2 anchor = paused ? DynamicGroupCentroid(view.cameraNumber) : view.centroid;
+            return HudUvShift(view.polygon, new Vector2(0.5f, 0.5f) - anchor);
+        }
+
+        /// <summary>
+        /// The HUD textures clamp at their edges, so a cell that samples outside
+        /// [0,1] smears the border row or column of another view's HUD across
+        /// itself. Keep the sampled window inside the texture whenever the cell
+        /// is small enough to fit; that is every cell up to a full-screen one.
+        /// </summary>
+        private static Vector2 HudUvShift(Vector2[] polygon, Vector2 shift)
+        {
+            Vector2 min = new Vector2(1f, 1f), max = Vector2.zero;
+            ExpandBounds(polygon, ref min, ref max);
+            if (min.x <= max.x && max.x - min.x <= 1f) shift.x = Mathf.Clamp(shift.x, -min.x, 1f - max.x);
+            if (min.y <= max.y && max.y - min.y <= 1f) shift.y = Mathf.Clamp(shift.y, -min.y, 1f - max.y);
+            return shift;
         }
 
         private void DrawDynamicDividers(Material material)

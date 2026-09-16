@@ -23,6 +23,35 @@ Implemented
 [x] Delayed room-camera resync after missed transitions.
 [x] Split-camera map input no longer enters vanilla camera cycling.
 [x] Adaptive layouts use only living players and reflow after deaths.
+[x] Dividers composite under the HUD and pause menu instead of over them.
+[x] Pause buttons and confirm text follow the view's actual HUD translation.
+[x] HUD textures no longer smear their border into neighbouring cells.
+[x] Native-scale views sample on whole texels, so following does not soften the image.
+[x] A view that cannot legally pan far enough still keeps its slugcat on its own
+    side of a divider, at the cost of a clamped edge strip.
+[x] A dead player's camera no longer forces synchronous room resyncs while the
+    corpse is carried.
+[x] Dynamic layout is solved before the first frame after spawn-in.
+[x] Palette changes from room effects, day/night and palette rooms are attributed
+    to the camera that made them.
+[x] Karma fade circles travel with the globally routed karma meter.
+
+Needs in-game confirmation
+--------------------------
+[ ] Death no longer stalls the other views (the forced room resync was the one
+    mechanism found in code; confirm against a fresh log).
+[ ] Spawn-in flash is gone with the layout primed in RainWorldGame_ctor.
+[ ] Pause buttons land inside every region shape, including 3- and 4-player.
+[ ] Secondary-view palettes stay correct through a full day/night cycle and a
+    shelter fade.
+
+Build notes
+-----------
+This machine has no .NET Framework 4.8 targeting pack, so MSBuild/Visual Studio
+fails the csproj with MSB3644. Install the .NET Framework 4.8 Developer Pack to
+build normally. Mod/plugins/SplitScreen Co-op.dll was produced with Roslyn csc
+against the same reference set the csproj declares (publicized Assembly-CSharp
+from BepInEx\utils, not the private one in Managed).
 
 Release validation
 ------------------

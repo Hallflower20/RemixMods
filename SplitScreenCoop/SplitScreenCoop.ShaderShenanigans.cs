@@ -78,6 +78,67 @@ namespace SplitScreenCoop
             }
         }
 
+        public void RoomCamera_ApplyPalette(On.RoomCamera.orig_ApplyPalette orig, RoomCamera self)
+        {
+            var prev = curCamera;
+            try
+            {
+                curCamera = self.cameraNumber;
+                orig(self);
+                CaptureRoomCameraShaderKeywords(self);
+            }
+            finally
+            {
+                curCamera = prev;
+            }
+        }
+
+        public void RoomCamera_ApproximateLightmap(On.RoomCamera.orig_ApproximateLightmap orig, RoomCamera self)
+        {
+            var prev = curCamera;
+            try
+            {
+                curCamera = self.cameraNumber;
+                orig(self);
+            }
+            finally
+            {
+                curCamera = prev;
+            }
+        }
+
+        public void RoomCamera_WarpMoveCameraActual(On.RoomCamera.orig_WarpMoveCameraActual orig,
+            RoomCamera self, Room newRoom, int camPos)
+        {
+            var prev = curCamera;
+            try
+            {
+                curCamera = self.cameraNumber;
+                orig(self, newRoom, camPos);
+                NoteRoomCameraMoved(self, "WarpMoveCameraActual");
+                CaptureRoomCameraShaderKeywords(self);
+            }
+            finally
+            {
+                curCamera = prev;
+            }
+        }
+
+        public void RoomCamera_BlankWarpPointHoldFrame(On.RoomCamera.orig_BlankWarpPointHoldFrame orig,
+            RoomCamera self)
+        {
+            var prev = curCamera;
+            try
+            {
+                curCamera = self.cameraNumber;
+                orig(self);
+            }
+            finally
+            {
+                curCamera = prev;
+            }
+        }
+
         public void RoomCamera_UpdateSnowLight(On.RoomCamera.orig_UpdateSnowLight orig, RoomCamera self)
         {
             if (cameraListeners[self.cameraNumber] is CameraListener l)
@@ -255,8 +316,11 @@ namespace SplitScreenCoop
             // These textures are authoritative per RoomCamera. A different
             // camera's DrawUpdate can overwrite Unity's global bindings before
             // this camera renders, especially during camera-position fades.
-            if (camera.currentPalette.texture != null)
-                listener.ShaderTextures[RainWorld.ShadPropPalTex] = camera.currentPalette.texture;
+            // currentPalette.texture is the same object the game binds, but it is
+            // only rebuilt when a fade is applied, so read the field the game
+            // itself binds rather than the snapshot taken alongside it.
+            if (camera.paletteTexture != null)
+                listener.ShaderTextures[RainWorld.ShadPropPalTex] = camera.paletteTexture;
             if (camera.levelTexture != null)
                 listener.ShaderTextures[RainWorld.ShadPropLevelTex] = camera.levelTexture;
             listener.ShaderTextures[Shader.PropertyToID("_terrainPalette")] =
