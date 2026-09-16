@@ -13,6 +13,8 @@ namespace SplitScreenCoop
         private SplitLayoutSolver.PlayerInput[] dynamicInputs = new SplitLayoutSolver.PlayerInput[0];
         private Vector2[] ownScreenPositions = new Vector2[0];
         private int[] baseCameraNumbers = new int[0];
+        // Which camera's image each camera's cell drew last tick, by camera number.
+        private readonly int[] lastBaseByCamera = { -1, -1, -1, -1 };
         // Per camera: the uv translation its own image is drawn with. Refreshed every
         // rendered frame from interpolated positions and damped, so following is as
         // smooth as the sprites themselves instead of stepping at the 40 Hz tick.
@@ -431,6 +433,7 @@ namespace SplitScreenCoop
             dynamicInputs = new SplitLayoutSolver.PlayerInput[0];
             ownScreenPositions = new Vector2[0];
             baseCameraNumbers = new int[0];
+            for (int i = 0; i < lastBaseByCamera.Length; i++) lastBaseByCamera[i] = -1;
             lastDynamicLayoutKey = null;
             lastLayoutSignature = long.MinValue;
             dynamicActive = false;
@@ -633,6 +636,25 @@ namespace SplitScreenCoop
                         continue;
                     Vector2 screen = CameraScreenPosition(source, roomPositions[playerIndex]);
                     visible[playerIndex] = SplitLayoutSolver.SharedCameraCanShow(screen);
+                    // One-way hysteresis. A cell may only *start* drawing another
+                    // camera's image once its own camera sits on that same screen,
+                    // which is the moment vanilla cuts and the two images are the
+                    // same picture. Adopting it earlier, while the player is merely
+                    // visible near the edge of the other screen, replaced the cell's
+                    // content with a different screen and then panned it into place,
+                    // which read as a swap followed by a swipe. Once sharing, keep
+                    // sharing while the player stays visible, so a camera switching
+                    // screens at the edge does not break a merged view apart.
+                    if (visible[playerIndex] && playerIndex != candidate)
+                    {
+                        RoomCamera own = roomCameras[playerIndex];
+                        int ownNumber = aliveCameras[playerIndex];
+                        bool ownOnSameScreen = own != null && own.room == source.room &&
+                            own.currentCameraPosition == source.currentCameraPosition;
+                        bool alreadySharing = ownNumber >= 0 && ownNumber < lastBaseByCamera.Length &&
+                            lastBaseByCamera[ownNumber] == aliveCameras[candidate];
+                        visible[playerIndex] = ownOnSameScreen || alreadySharing;
+                    }
                     if (visible[playerIndex]) visibleCount++;
                 }
                 if (visibleCount > sharedCount)
@@ -725,6 +747,12 @@ namespace SplitScreenCoop
             dynamicInputs = allInputs;
             ownScreenPositions = allPositions;
             baseCameraNumbers = allBases;
+            for (int i = 0; i < lastBaseByCamera.Length; i++) lastBaseByCamera[i] = -1;
+            for (int i = 0; i < effectiveCount; i++)
+            {
+                int number = dynamicLayout.viewports[i].cameraNumber;
+                if (number >= 0 && number < lastBaseByCamera.Length) lastBaseByCamera[number] = allBases[i];
+            }
             globalMeterSource = aliveCameras[0];
             for (int i = 0; i < aliveCameras.Count; i++)
                 if (CameraByNumber(game, aliveCameras[i])?.hud != null)

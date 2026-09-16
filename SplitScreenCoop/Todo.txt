@@ -86,6 +86,10 @@ Implemented
     rectangles to their new ones over the resting layout. Cut positions slide.
 [x] Only base cameras render; a cell always draws the camera whose prebaked
     screen its players share, so merged views are one image, not a blend.
+[x] A cell only starts drawing the other camera's image once its own camera is
+    on that screen (the vanilla cut moment), and keeps sharing while its player
+    stays visible there. Merging no longer swaps a cell to a different screen
+    and swipes it into place; the line just fades as the pans converge.
 [x] Cameras that are not in the layout (dead players, fading ghosts) are muted;
     their point of view no longer plays in the mix.
 [x] Rot (Watcher "red goop") renders on every camera: vanilla UpdateRotMode

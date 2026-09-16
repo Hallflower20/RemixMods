@@ -171,6 +171,17 @@ on the other's screen through a pipe changes the pair's screen key in one tick. 
 reintroduce an alpha blend between two camera images; that was the "fading" the users
 rejected.
 
+**When a cell may adopt another camera's image** is a one-way hysteresis in the
+`sharedCandidate` loop of `UpdateDynamicLayout`. Starting to share requires the player's
+*own* camera to sit on the base camera's screen (same room and camera position): that is
+the instant vanilla cuts, and the two images are the same picture, so nothing visible
+changes except the line beginning to fade. Adopting earlier, as soon as the player was
+merely visible near the edge of the other screen, replaced the cell's content with a
+different screen and then panned it into place, which the playtest described as "swaps
+to the other camera, then swipes". Once sharing (`lastBaseByCamera`), a cell keeps
+sharing while its player stays visible on the base screen, so a camera switching screens
+at the edge does not break a merged view apart prematurely.
+
 Structural changes (axis flips, side swaps, a different player peeled off) are animated,
 never cut. The solver compares each live cell's target rectangle with the previous
 tick's; a jump over `SnapThreshold` starts a transition of `transitionSeconds` (0.45 s):
