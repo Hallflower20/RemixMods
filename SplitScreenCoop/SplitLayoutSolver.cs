@@ -15,12 +15,13 @@ namespace SplitScreenCoop
     /// own player. A diagonal cell touching two opposite screen edges has no pan at
     /// all, and the followed slugcat can end up on the far side of its own divider.
     ///
-    /// Nothing ever fades. Two players on one prebaked screen merge the way a split
-    /// screen in a LEGO game does: their cells keep drawing the same image, and the
-    /// pan of each cell moves from "centre my player" to "identity" as the split
-    /// amount falls, so the two halves line up and the divider disappears. Layout
-    /// changes animate geometrically: two cells rotate their divider, more cells
-    /// slide from their old rectangle to their new one.
+    /// Nothing ever fades between images. Two players on one prebaked screen merge
+    /// the way a split screen in a LEGO game does: their cells keep drawing the same
+    /// image, and the pan of each cell moves from "centre my player" to "identity"
+    /// as the split amount falls, so the two halves line up and the divider
+    /// disappears. Two cells are separated by one straight line through the screen
+    /// centre whose angle follows the players continuously (damped); three or more
+    /// cells are rectangles that slide when the layout tree restructures.
     /// </summary>
     public sealed class SplitLayoutSolver
     {
@@ -38,14 +39,20 @@ namespace SplitScreenCoop
             public float directionDeadZone = 160f;
             /// <summary>Minimum seconds between structural changes of one layout node.</summary>
             public float layoutHoldSeconds = 0.75f;
-            /// <summary>Seconds a rotate or slide transition takes.</summary>
+            /// <summary>Seconds a slide transition takes.</summary>
             public float transitionSeconds = 0.45f;
+            /// <summary>Response time of a two-cell divider's angle. A side swap is a half turn.</summary>
+            public float dividerTurnSeconds = 0.3f;
             /// <summary>
-            /// Response time of the per-pair split amount. A player arriving on the
-            /// other's screen through a pipe changes the pair's screen key in one tick;
-            /// damping the amount lets the two views glide together instead of popping.
+            /// Response time of the per-pair split amount. When a player's camera cuts
+            /// onto the other's screen the pair is often already inside the merge
+            /// band, so the target drops to merged in one tick; this is how long the
+            /// two views take to glide together. Half a second reads as a camera move
+            /// rather than a snap.
             /// </summary>
-            public float splitSmoothingTime = 0.25f;
+            public float splitSmoothingTime = 0.5f;
+            /// <summary>Response time of the divider's distance-based opacity.</summary>
+            public float lineSmoothingTime = 0.25f;
         }
 
         public struct PlayerInput
@@ -53,6 +60,8 @@ namespace SplitScreenCoop
             public int playerIndex;
             public Vector2 worldPos;
             public long sameScreenKey;
+            /// <summary>Identifies the room the player is in; the divider fades with distance only inside one room.</summary>
+            public long roomKey;
             public Vector2 mergedScreenPos;
             public bool validWorldPos;
         }
@@ -125,6 +134,10 @@ namespace SplitScreenCoop
             public float changedAt = -1000f;
             public float fraction = -1f;
             public float fractionVelocity;
+            /// <summary>Damped angle of a two-cell divider's normal, radians.</summary>
+            public float angle;
+            public float angleVelocity;
+            public bool hasAngle;
         }
 
         private sealed class PairMemory
@@ -132,6 +145,9 @@ namespace SplitScreenCoop
             public bool joined;
             public float split = -1f;
             public float splitVelocity;
+            /// <summary>Damped divider opacity: distance-based inside one room, 1 across rooms.</summary>
+            public float line = -1f;
+            public float lineVelocity;
         }
 
         private struct Box
@@ -164,9 +180,13 @@ namespace SplitScreenCoop
             public float structuralWeight;
             public Vector2 center;
             public Box box;
+            /// <summary>Set when the cell is not a rectangle (a rotating two-cell divider).</summary>
+            public Vector2[] shape;
+            public long screenKey;
+            public Vector2[] Polygon() { return shape ?? box.Polygon(); }
         }
 
-        private enum TransitionMode { None, Rotate, Slide }
+        private enum TransitionMode { None, Slide }
 
         private readonly Dictionary<int, Memory> memory = new Dictionary<int, Memory>();
         private readonly Dictionary<long, PairMemory> pairs = new Dictionary<long, PairMemory>();
@@ -176,9 +196,6 @@ namespace SplitScreenCoop
         private readonly Dictionary<int, Box> slideFrom = new Dictionary<int, Box>();
         private TransitionMode transition = TransitionMode.None;
         private float transitionT = 1f;
-        private int rotateLow = -1, rotateHigh = -1;
-        private Vector2 rotateFromNormal, rotateToNormal;
-        private float rotateFromArea;
         private float clock;
         private const float Epsilon = 0.00001f;
         private const float DeathTransitionSeconds = 0.7f;
@@ -291,15 +308,23 @@ namespace SplitScreenCoop
                 if (!ghosts[i]) targetAreas[i] = (1f - ghostTotal) / Mathf.Max(1, aliveCount);
 
             float[,] amounts = new float[count, count];
+            float[,] lineAmounts = new float[count, count];
             bool[,] joined = new bool[count, count];
             for (int i = 0; i < count; i++)
             for (int j = i + 1; j < count; j++)
             {
                 bool sameScreen = players[i].sameScreenKey == players[j].sameScreenKey;
+                bool sameRoom = players[i].roomKey == players[j].roomKey;
                 Vector2 delta = world[j] - world[i];
                 float distance = new Vector2(delta.x, delta.y * aspect).magnitude;
-                float target = ghosts[i] || ghosts[j] || settings.permanentSplit || !sameScreen ? 1f :
-                    Smoothstep(settings.mergeDistance, settings.mergeDistance + Mathf.Max(1f, settings.blendWidth), distance);
+                float byDistance = Smoothstep(settings.mergeDistance, settings.mergeDistance + Mathf.Max(1f, settings.blendWidth), distance);
+                float target = ghosts[i] || ghosts[j] || settings.permanentSplit || !sameScreen ? 1f : byDistance;
+                // The divider's own opacity follows distance whenever the players are
+                // in one room, even while their cameras still sit on different
+                // screens: that is the cue that the views are about to merge or have
+                // just parted. The split amount above cannot do that job because it
+                // also decides when two cells may share one image.
+                float lineTarget = ghosts[i] || ghosts[j] || settings.permanentSplit || !sameRoom ? 1f : byDistance;
                 long key = PairKey(players[i].playerIndex, players[j].playerIndex);
                 PairMemory pair;
                 if (!pairs.TryGetValue(key, out pair))
@@ -317,6 +342,16 @@ namespace SplitScreenCoop
                 }
                 pair.split = split;
                 amounts[i, j] = amounts[j, i] = split;
+                float line;
+                if (pair.line < 0f || ghosts[i] || ghosts[j]) line = lineTarget;
+                else
+                {
+                    line = Mathf.SmoothDamp(pair.line, lineTarget, ref pair.lineVelocity,
+                        Mathf.Max(0.01f, settings.lineSmoothingTime), Mathf.Infinity, dt);
+                    if (Mathf.Abs(line - lineTarget) < 0.002f) { line = lineTarget; pair.lineVelocity = 0f; }
+                }
+                pair.line = line;
+                lineAmounts[i, j] = lineAmounts[j, i] = line;
                 bool nowJoined = !ghosts[i] && !ghosts[j] && !settings.permanentSplit && sameScreen &&
                     (pair.joined ? split < 0.06f : split < 0.02f);
                 pair.joined = nowJoined;
@@ -349,6 +384,7 @@ namespace SplitScreenCoop
                 item.weight += targetAreas[i] * Mathf.Max(1, aliveCount);
                 item.structuralWeight += 1f;
                 item.center += Corrected(world[i], aspect);
+                item.screenKey = players[i].sameScreenKey;
                 itemOfPlayer[i] = item;
             }
             foreach (Item item in items) item.center /= item.members.Count;
@@ -357,12 +393,12 @@ namespace SplitScreenCoop
 
             // Members of one group tile the group's rectangle. They all draw the same
             // image, so only the HUD and the divider bookkeeping care about the slices.
-            Box[] cells = new Box[count];
+            Vector2[][] cells = new Vector2[count][];
             foreach (Item item in items)
             {
                 if (item.members.Count == 1)
                 {
-                    cells[item.members[0]] = item.box;
+                    cells[item.members[0]] = item.Polygon();
                     continue;
                 }
                 List<Item> slices = new List<Item>(item.members.Count);
@@ -375,59 +411,45 @@ namespace SplitScreenCoop
                     slice.weight = targetAreas[p] * Mathf.Max(1, aliveCount);
                     slice.structuralWeight = 1f;
                     slice.center = Corrected(world[p], aspect);
+                    slice.screenKey = players[p].sameScreenKey;
                     slices.Add(slice);
                 }
                 Partition(item.box, slices, 1, aspect, settings, dt);
-                for (int m = 0; m < slices.Count; m++) cells[slices[m].members[0]] = slices[m].box;
+                for (int m = 0; m < slices.Count; m++) cells[slices[m].members[0]] = slices[m].Polygon();
             }
 
             // ---- Transitions ---------------------------------------------------
+            // Two cells never need one: their divider is a single line whose angle
+            // and position are damped continuously. Three or more cells slide from
+            // their previous rectangles to their new ones when the tree restructures.
             Vector2[][] shown = new Vector2[count][];
-            for (int i = 0; i < count; i++) shown[i] = cells[i].Polygon();
+            for (int i = 0; i < count; i++) shown[i] = cells[i];
             bool snapped = false;
-            for (int i = 0; i < count; i++)
-            {
-                Box previous;
-                if (ghosts[i] || !lastTargets.TryGetValue(players[i].playerIndex, out previous)) continue;
-                if (Mathf.Abs(previous.x - cells[i].x) > SnapThreshold || Mathf.Abs(previous.y - cells[i].y) > SnapThreshold ||
-                    Mathf.Abs(previous.w - cells[i].w) > SnapThreshold || Mathf.Abs(previous.h - cells[i].h) > SnapThreshold)
-                    snapped = true;
-            }
-            if (snapped) BeginTransition(players, ghosts, cells, count);
+            if (count >= 3)
+                for (int i = 0; i < count; i++)
+                {
+                    Box previous;
+                    if (ghosts[i] || !lastTargets.TryGetValue(players[i].playerIndex, out previous)) continue;
+                    Box target = Box.Of(cells[i]);
+                    if (Mathf.Abs(previous.x - target.x) > SnapThreshold || Mathf.Abs(previous.y - target.y) > SnapThreshold ||
+                        Mathf.Abs(previous.w - target.w) > SnapThreshold || Mathf.Abs(previous.h - target.h) > SnapThreshold)
+                        snapped = true;
+                }
+            if (snapped) BeginSlide();
             bool sliding = false;
-            if (transition != TransitionMode.None)
+            if (transition == TransitionMode.Slide)
             {
                 transitionT = Mathf.Min(1f, transitionT + dt / Mathf.Max(0.05f, settings.transitionSeconds));
                 float eased = Smoothstep(0f, 1f, transitionT);
-                if (transition == TransitionMode.Rotate)
-                {
-                    int low = -1, high = -1;
-                    for (int i = 0; i < count; i++)
-                    {
-                        if (players[i].playerIndex == rotateLow) low = i;
-                        if (players[i].playerIndex == rotateHigh) high = i;
-                    }
-                    if (low < 0 || high < 0 || count != 2) transition = TransitionMode.None;
-                    else if (transitionT < 1f)
-                    {
-                        Vector2 normal = RotateTowards(rotateFromNormal, rotateToNormal, eased);
-                        float area = Mathf.Lerp(rotateFromArea, cells[low].Area, eased);
-                        float cut = CutForArea(normal, area);
-                        shown[low] = Clip(ScreenPolygon(), normal, cut);
-                        shown[high] = Clip(ScreenPolygon(), -normal, -cut);
-                    }
-                }
-                else if (transition == TransitionMode.Slide && transitionT < 1f)
-                {
+                if (transitionT < 1f && count >= 3)
                     for (int i = 0; i < count; i++)
                     {
                         Box from;
                         if (ghosts[i] || !slideFrom.TryGetValue(players[i].playerIndex, out from)) continue;
-                        shown[i] = Box.Lerp(from, cells[i], eased).Polygon();
+                        shown[i] = Box.Lerp(from, Box.Of(cells[i]), eased).Polygon();
                         sliding = true;
                     }
-                }
-                if (transitionT >= 1f)
+                if (transitionT >= 1f || count < 3)
                 {
                     transition = TransitionMode.None;
                     slideFrom.Clear();
@@ -436,7 +458,7 @@ namespace SplitScreenCoop
             for (int i = 0; i < count; i++)
             {
                 if (ghosts[i]) { lastTargets.Remove(players[i].playerIndex); lastShown.Remove(players[i].playerIndex); continue; }
-                lastTargets[players[i].playerIndex] = cells[i];
+                lastTargets[players[i].playerIndex] = Box.Of(cells[i]);
                 lastShown[players[i].playerIndex] = shown[i];
             }
             List<int> stale = null;
@@ -473,19 +495,21 @@ namespace SplitScreenCoop
                     }
                 if (!hasSameScreenPeer && count > 1) imageBlend = 1f;
                 float area = Area(shown[i]);
-                memory[players[i].playerIndex].lastArea = cells[i].Area;
+                memory[players[i].playerIndex].lastArea = Area(cells[i]);
                 Vector2 sourceSum = Vector2.zero;
                 Vector2 groupMin = new Vector2(1f, 1f), groupMax = Vector2.zero;
+                float itemArea = 0f;
                 for (int m = 0; m < item.members.Count; m++)
                 {
                     Vector2 merged = players[item.members[m]].mergedScreenPos;
                     sourceSum += Finite(merged) ? merged : new Vector2(0.5f, 0.5f);
                     Bounds(shown[item.members[m]], ref groupMin, ref groupMax);
+                    itemArea += Area(cells[item.members[m]]);
                 }
                 Vector2 sourceAnchor = sourceSum / Mathf.Max(1, item.members.Count);
                 Vector2 targetAnchor = (groupMin + groupMax) * 0.5f;
                 Vector2 transformAnchor = Vector2.Lerp(sourceAnchor, targetAnchor, groupSplit);
-                float zoomTarget = Mathf.Clamp(Mathf.Pow(Mathf.Max(Epsilon, item.box.Area), Mathf.Max(0f, settings.zoomExponent)),
+                float zoomTarget = Mathf.Clamp(Mathf.Pow(Mathf.Max(Epsilon, itemArea), Mathf.Max(0f, settings.zoomExponent)),
                     Mathf.Clamp(settings.minZoom, 0.1f, 1f), 1f);
                 // The sampled window is the group's bounding box divided by zoom, and
                 // it has to fit inside the one prebaked screen the camera rendered.
@@ -504,9 +528,9 @@ namespace SplitScreenCoop
                     rendering = !ghosts[i] && !mergedSource,
                     sharesImageWith = ghosts[i] ? -1 : mergedSource ? players[leaderIndex].playerIndex : -1,
                     polygon = shown[i],
-                    targetPolygon = cells[i].Polygon(),
+                    targetPolygon = cells[i],
                     areaFraction = area,
-                    groupAreaFraction = item.box.Area,
+                    groupAreaFraction = itemArea,
                     centroid = centroid,
                     site = centroid,
                     regionAnchor = anchor,
@@ -526,71 +550,120 @@ namespace SplitScreenCoop
             {
                 if (amounts[i, j] <= 0f) continue;
                 AddSharedEdges(viewports[i].polygon, viewports[j].polygon, players[i].playerIndex, players[j].playerIndex,
-                    amounts[i, j], settings.dividerWidth, dividers);
+                    lineAmounts[i, j], settings.dividerWidth, dividers);
             }
             return new Layout { viewports = viewports, dividers = dividers.ToArray(),
                 pairSplitAmounts = amounts, effectiveInputs = effective.ToArray(), sliding = sliding };
         }
 
         /// <summary>
-        /// A target cell moved discontinuously. Two live cells that both existed a
-        /// frame ago rotate their divider from where it was to where it must be; any
-        /// other change slides every cell from its previous rectangle to its new one.
+        /// A target rectangle moved discontinuously in a three- or four-cell layout:
+        /// slide every cell from its previous rectangle to its new one.
         /// </summary>
-        private void BeginTransition(IList<PlayerInput> players, bool[] ghosts, Box[] cells, int count)
+        private void BeginSlide()
         {
-            int liveCount = 0;
-            for (int i = 0; i < count; i++) if (!ghosts[i]) liveCount++;
-            if (liveCount == 2 && count == 2 &&
-                lastShown.ContainsKey(players[0].playerIndex) && lastShown.ContainsKey(players[1].playerIndex))
-            {
-                Vector2[] a = lastShown[players[0].playerIndex], b = lastShown[players[1].playerIndex];
-                Vector2 fromNormal;
-                if (SharedEdgeNormal(a, b, out fromNormal))
-                {
-                    Vector2 toNormal = (cells[1].Center - cells[0].Center).normalized;
-                    if (toNormal.sqrMagnitude > Epsilon)
-                    {
-                        transition = TransitionMode.Rotate;
-                        transitionT = 0f;
-                        rotateLow = players[0].playerIndex;
-                        rotateHigh = players[1].playerIndex;
-                        rotateFromNormal = fromNormal;
-                        rotateToNormal = toNormal;
-                        rotateFromArea = Area(a);
-                        slideFrom.Clear();
-                        return;
-                    }
-                }
-            }
             transition = TransitionMode.Slide;
             transitionT = 0f;
             slideFrom.Clear();
             foreach (var entry in lastShown) slideFrom[entry.Key] = Box.Of(entry.Value);
         }
 
-        /// <summary>The unit normal of the edge two cells share, pointing from a into b.</summary>
-        private static bool SharedEdgeNormal(Vector2[] a, Vector2[] b, out Vector2 normal)
+        private static float WrapAngle(float angle)
         {
-            normal = Vector2.zero;
-            List<DividerSegment> edges = new List<DividerSegment>(2);
-            AddSharedEdges(a, b, 0, 1, 1f, 1f, edges);
-            if (edges.Count == 0) return false;
-            Vector2 along = edges[0].end - edges[0].start;
-            if (along.sqrMagnitude < Epsilon) return false;
-            normal = new Vector2(-along.y, along.x).normalized;
-            if (Vector2.Dot(normal, Centroid(b) - Centroid(a)) < 0f) normal = -normal;
-            return true;
+            while (angle > Math.PI) angle -= 2f * (float)Math.PI;
+            while (angle < -Math.PI) angle += 2f * (float)Math.PI;
+            return angle;
         }
 
-        private static Vector2 RotateTowards(Vector2 from, Vector2 to, float t)
+        private static bool IsFullScreen(Box box)
         {
-            float a0 = (float)Math.Atan2(from.y, from.x), a1 = (float)Math.Atan2(to.y, to.x);
-            float delta = a1 - a0;
-            while (delta > Math.PI) delta -= 2f * (float)Math.PI;
-            while (delta < -Math.PI) delta += 2f * (float)Math.PI;
-            float angle = a0 + delta * t;
-            return new Vector2((float)Math.Cos(angle), (float)Math.Sin(angle));
+            return Mathf.Abs(box.x) < 0.0001f && Mathf.Abs(box.y) < 0.0001f &&
+                Mathf.Abs(box.w - 1f) < 0.0001f && Mathf.Abs(box.h - 1f) < 0.0001f;
+        }
+
+        /// <summary>
+        /// Two cells filling the whole screen: one straight divider through the screen
+        /// centre. Its normal turns continuously (damped) towards the players'
+        /// on-screen direction while they share a prebaked screen, so the line follows
+        /// them the way a LEGO split screen does and never jumps. On different screens
+        /// the target is the nearest axis, with the usual dead zone and hold time, so
+        /// axis flips and side swaps are rotations as well. The cut through the centre
+        /// halves the screen exactly; a dying player's weight slides it off-centre.
+        /// </summary>
+        private void SplitTwoRotating(Box box, Item a, Item b, NodeMemory node, float aspect,
+            Settings settings, float dt, bool restructured)
+        {
+            List<Item> pair = new List<Item> { a, b };
+            int axis = ChooseAxis(box, pair, node, 0, aspect, settings, restructured, false);
+            DecideSide(a, b, axis, node, settings, restructured);
+            node.axis = axis;
+            // Item centres are aspect-corrected (y scaled by aspect); undo that to get
+            // the pixel-space direction, then express the perpendicular line's normal
+            // in normalized screen coordinates.
+            Vector2 pixelDelta = new Vector2(b.center.x - a.center.x, (b.center.y - a.center.y) / aspect);
+            Vector2 target;
+            if (a.screenKey == b.screenKey && pixelDelta.sqrMagnitude > 1f)
+            {
+                Vector2 m = pixelDelta.normalized;
+                target = new Vector2(m.x * aspect, m.y).normalized;
+            }
+            else
+                target = axis == 0 ? new Vector2(node.reversed ? -1f : 1f, 0f) : new Vector2(0f, node.reversed ? -1f : 1f);
+            float targetAngle = (float)Math.Atan2(target.y, target.x);
+            if (!node.hasAngle || restructured)
+            {
+                node.angle = targetAngle;
+                node.angleVelocity = 0f;
+                node.hasAngle = true;
+            }
+            else
+            {
+                float remaining = WrapAngle(targetAngle - node.angle);
+                float step = Mathf.SmoothDamp(0f, remaining, ref node.angleVelocity,
+                    Mathf.Max(0.01f, settings.dividerTurnSeconds), Mathf.Infinity, dt);
+                node.angle = WrapAngle(node.angle + step);
+                if (Mathf.Abs(WrapAngle(targetAngle - node.angle)) < 0.01f)
+                {
+                    node.angle = targetAngle;
+                    node.angleVelocity = 0f;
+                }
+            }
+            Vector2 normal = new Vector2((float)Math.Cos(node.angle), (float)Math.Sin(node.angle));
+            if (Mathf.Abs(normal.x) < 0.0001f) normal.x = 0f;
+            if (Mathf.Abs(normal.y) < 0.0001f) normal.y = 0f;
+            normal = normal.normalized;
+            float targetFraction = a.weight / Mathf.Max(Epsilon, a.weight + b.weight);
+            if (node.fraction < 0f || restructured && Mathf.Abs(node.fraction - targetFraction) > 0.45f)
+            {
+                node.fraction = targetFraction;
+                node.fractionVelocity = 0f;
+            }
+            else
+                node.fraction = Mathf.SmoothDamp(node.fraction, targetFraction, ref node.fractionVelocity,
+                    Mathf.Max(0.01f, settings.smoothingTime), Mathf.Infinity, dt);
+            float cut = CutForArea(normal, Mathf.Clamp01(node.fraction));
+            a.shape = Clip(ScreenPolygon(), normal, cut);
+            b.shape = Clip(ScreenPolygon(), -normal, -cut);
+            a.box = Box.Of(a.shape);
+            b.box = Box.Of(b.shape);
+        }
+
+        /// <summary>
+        /// Which side each item takes follows the world, with a dead zone and a hold
+        /// time so two players dancing around each other do not swap sides.
+        /// </summary>
+        private void DecideSide(Item a, Item b, int axis, NodeMemory node, Settings settings, bool restructured)
+        {
+            float delta = Axis(b.center, axis) - Axis(a.center, axis);
+            bool wantReversed = delta < 0f;
+            if (restructured || node.axis != axis)
+                node.reversed = wantReversed && Mathf.Abs(delta) > Epsilon;
+            else if (node.reversed != wantReversed && Mathf.Abs(delta) > settings.directionDeadZone &&
+                clock - node.changedAt > settings.layoutHoldSeconds)
+            {
+                node.reversed = wantReversed;
+                node.changedAt = clock;
+            }
         }
 
         /// <summary>The cut c such that {p : n·p ≤ c} clipped to the screen has the given area.</summary>
@@ -644,7 +717,8 @@ namespace SplitScreenCoop
 
             if (items.Count == 2)
             {
-                SplitTwo(box, items[0], items[1], node, depth, aspect, settings, dt, restructured);
+                if (IsFullScreen(box)) SplitTwoRotating(box, items[0], items[1], node, aspect, settings, dt, restructured);
+                else SplitTwo(box, items[0], items[1], node, depth, aspect, settings, dt, restructured);
                 return;
             }
             if (items.Count == 3)
@@ -701,18 +775,7 @@ namespace SplitScreenCoop
         {
             List<Item> pair = new List<Item> { a, b };
             int axis = ChooseAxis(box, pair, node, depth, aspect, settings, restructured, false);
-            // Which side each item takes follows the world, with a dead zone and a
-            // hold time so two players dancing around each other do not swap sides.
-            float delta = Axis(b.center, axis) - Axis(a.center, axis);
-            bool wantReversed = delta < 0f;
-            if (restructured || node.axis != axis)
-                node.reversed = wantReversed && Mathf.Abs(delta) > Epsilon;
-            else if (node.reversed != wantReversed && Mathf.Abs(delta) > settings.directionDeadZone &&
-                clock - node.changedAt > settings.layoutHoldSeconds)
-            {
-                node.reversed = wantReversed;
-                node.changedAt = clock;
-            }
+            DecideSide(a, b, axis, node, settings, restructured);
             node.axis = axis;
             Item low = node.reversed ? b : a;
             Item high = node.reversed ? a : b;

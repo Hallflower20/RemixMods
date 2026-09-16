@@ -90,6 +90,26 @@ Implemented
     on that screen (the vanilla cut moment), and keeps sharing while its player
     stays visible there. Merging no longer swaps a cell to a different screen
     and swipes it into place; the line just fades as the pans converge.
+[x] Two players: one straight divider through the screen centre whose angle
+    follows the players continuously while they share a screen, and turns to
+    the nearest axis when they do not. Side swaps and axis flips are rotations.
+    Three and four players keep the rectangle tree.
+[x] The divider's opacity is how far apart the two views are in world pixels
+    (fading over 4 to 300 px, damped 0.2 s per pair), so it fades across the
+    whole glide as views converge and is hidden when the two halves are already
+    one continuous picture. Solid across rooms.
+[x] Merging across a screen boundary in a wide room cannot be continuous (a half
+    cell is wider than the overlap between adjacent screens), so the pan after
+    the cut glides over 0.5 s instead of 0.25 s, with the line fading alongside.
+[x] A living player being abstracted mid-pipe no longer counts as dead
+    (IsCreatureDead dropped the slated-for-deletion clause). That false death
+    removed their camera and, with the other player held or dead, ended the
+    game with someone alive.
+[x] The game-over prompt itself is gated: TextPrompt.EnterGameOverMode is
+    refused unless every player is dead or held, whichever vanilla path raised
+    it. "[Coop] blocked game-over prompt" logs each refusal with player states.
+[x] A camera whose followed player is dead is muted regardless of layout state,
+    in addition to cameras with no live cell.
 [x] Cameras that are not in the layout (dead players, fading ghosts) are muted;
     their point of view no longer plays in the mix.
 [x] Rot (Watcher "red goop") renders on every camera: vanilla UpdateRotMode

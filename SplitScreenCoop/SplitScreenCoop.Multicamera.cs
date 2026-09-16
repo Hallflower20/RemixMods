@@ -34,11 +34,15 @@ namespace SplitScreenCoop
             if (dynamicStyle && !dualDisplays)
             {
                 var view = DynamicViewportForCamera(self.camera.cameraNumber);
-                // A camera that is not part of the layout (its player is dead, or it
-                // is fading out as a ghost) has no view on screen, so it must not have
-                // a point of view in the mix either. VirtualMicrophone.Update rebuilds
+                // A camera whose player is dead, or which has no live cell on screen,
+                // must not contribute a point of view to the mix. The dead-player
+                // test does not depend on the layout, so it holds during layout
+                // transitions and game over too. VirtualMicrophone.Update rebuilds
                 // volumeGroups every tick, so zeroing them here is per frame only.
-                if (dynamicActive && (view == null || view.ghost))
+                AbstractCreature followed = self.camera.followAbstractCreature;
+                bool followerDead = followed == null || IsCreatureDead(followed);
+                bool noLiveCell = dynamicActive && (view == null || view.ghost);
+                if (followerDead || noLiveCell)
                 {
                     for (int g = 0; g < self.volumeGroups.Length; g++) self.volumeGroups[g] = 0f;
                 }

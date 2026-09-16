@@ -25,6 +25,7 @@ namespace SplitScreenCoop
         private readonly Vector2[] ownViewCellCenters = new Vector2[4];
         private long lastLayoutSignature = long.MinValue;
         private const float ViewPanSmoothing = 0.12f;
+        private float lastTimeStacker = 1f;
         private Camera dynamicCompositorCamera;
         private DynamicCompositor dynamicCompositor;
         private readonly FStage[] hudStages = new FStage[4];
@@ -613,8 +614,10 @@ namespace SplitScreenCoop
                         Logger.LogInfo($"[CameraMode] frame={Time.frameCount} world-direction fallback cam={cameraNumber}; reason={fallback}; holding last valid direction");
                     lastWorldFallbackReasons[cameraNumber] = fallback;
                 }
+                long roomKey = room?.abstractRoom == null ? long.MinValue + cameraNumber :
+                    ((long)(uint)(room.world?.name?.GetHashCode() ?? 0) << 32) | (uint)room.abstractRoom.index;
                 inputs[i] = new SplitLayoutSolver.PlayerInput { playerIndex = cameraNumber, worldPos = worldPos,
-                    sameScreenKey = screenKey, validWorldPos = validWorld, mergedScreenPos = new Vector2(0.5f, 0.5f) };
+                    sameScreenKey = screenKey, roomKey = roomKey, validWorldPos = validWorld, mergedScreenPos = new Vector2(0.5f, 0.5f) };
                 positions[i] = CameraScreenPosition(camera, playerPos);
             }
 
@@ -862,7 +865,8 @@ namespace SplitScreenCoop
         public void RainWorldGame_GrafUpdate(On.RainWorldGame.orig_GrafUpdate orig, RainWorldGame self, float timeStacker)
         {
             orig(self, timeStacker);
-            if (dynamicStyle && !dualDisplays) RefreshDynamicViewShifts(self, self.pauseUpdate ? 1f : timeStacker);
+            lastTimeStacker = self.pauseUpdate ? 1f : timeStacker;
+            if (dynamicStyle && !dualDisplays) RefreshDynamicViewShifts(self, lastTimeStacker);
             NoteFrameTime();
         }
 
@@ -890,18 +894,92 @@ namespace SplitScreenCoop
                 if (creature.room != camera.room || creature.mainBodyChunk == null) return false;
                 world = Vector2.Lerp(creature.mainBodyChunk.lastPos, creature.mainBodyChunk.pos, timeStacker);
             }
+            Vector2 cameraPos = InterpolatedCameraPos(camera, timeStacker);
+            source = new Vector2((world.x - cameraPos.x) / camera.sSize.x, (world.y - cameraPos.y) / camera.sSize.y);
+            return FiniteVector(source);
+        }
+
+        /// <summary>The world position of the render texture's bottom-left corner this frame.</summary>
+        private static Vector2 InterpolatedCameraPos(RoomCamera camera, float timeStacker)
+        {
             Vector2 cameraPos = Vector2.Lerp(camera.lastPos, camera.pos, timeStacker);
-            if (!camera.voidSeaMode && camera.freeMoveRect == null && camera.room.cameraPositions != null &&
+            if (!camera.voidSeaMode && camera.freeMoveRect == null && camera.room?.cameraPositions != null &&
                 camera.currentCameraPosition >= 0 && camera.currentCameraPosition < camera.room.cameraPositions.Length)
             {
                 Vector2 screen = camera.room.cameraPositions[camera.currentCameraPosition];
                 cameraPos.x = Mathf.Clamp(cameraPos.x, screen.x + camera.hDisplace + 8f - 20f, screen.x + camera.hDisplace + 8f + 20f);
                 cameraPos.y = Mathf.Clamp(cameraPos.y, screen.y + 8f - 7f, screen.y + 33f);
             }
-            cameraPos = new Vector2(Mathf.Floor(cameraPos.x), Mathf.Floor(cameraPos.y));
-            source = new Vector2((world.x - cameraPos.x) / camera.sSize.x, (world.y - cameraPos.y) / camera.sSize.y);
-            return FiniteVector(source);
+            return new Vector2(Mathf.Floor(cameraPos.x), Mathf.Floor(cameraPos.y));
         }
+
+        private int ViewportIndex(int cameraNumber)
+        {
+            if (dynamicLayout?.viewports == null) return -1;
+            for (int i = 0; i < dynamicLayout.viewports.Length; i++)
+                if (dynamicLayout.viewports[i].cameraNumber == cameraNumber) return i;
+            return -1;
+        }
+
+        /// <summary>
+        /// How visible a divider is: how far apart, in world pixels, the two views
+        /// meeting at it currently are. Each cell shows its base camera's picture
+        /// offset by its pan, so the views coincide exactly when both cells map display
+        /// space to the same world origin; then one camera frames both players and
+        /// there is nothing to indicate. The ramp is wide (4 to 300 px) so that the
+        /// line fades over the whole glide as two views converge, not just its last
+        /// few pixels, and the result is damped so a camera cut (which moves a view by
+        /// a screen in one frame) fades the line in rather than popping it.
+        /// Player distance on its own was tried as the signal and hid the line while
+        /// the views were still visibly apart.
+        /// </summary>
+        private float DividerAlpha(SplitLayoutSolver.DividerSegment edge)
+        {
+            int a = edge.firstCamera, b = edge.secondCamera;
+            float target = DividerTargetAlpha(edge);
+            if (a < 0 || b < 0 || a >= dividerAlphaState.GetLength(0) || b >= dividerAlphaState.GetLength(1)) return target;
+            float dt = Mathf.Clamp(Time.deltaTime, 0.001f, 0.1f);
+            if (dividerAlphaFrame[a, b] < Time.frameCount - 3)
+            {
+                dividerAlphaState[a, b] = target;
+                dividerAlphaVelocity[a, b] = 0f;
+            }
+            else
+                dividerAlphaState[a, b] = Mathf.SmoothDamp(dividerAlphaState[a, b], target, ref dividerAlphaVelocity[a, b],
+                    DividerFadeSeconds, Mathf.Infinity, dt);
+            dividerAlphaFrame[a, b] = Time.frameCount;
+            return dividerAlphaState[a, b];
+        }
+
+        private float DividerTargetAlpha(SplitLayoutSolver.DividerSegment edge)
+        {
+            if (!(rainworldGameObject?.processManager?.currentMainLoop is RainWorldGame game)) return edge.alpha;
+            int ia = ViewportIndex(edge.firstCamera), ib = ViewportIndex(edge.secondCamera);
+            if (ia < 0 || ib < 0 || ia >= baseCameraNumbers.Length || ib >= baseCameraNumbers.Length) return edge.alpha;
+            var va = dynamicLayout.viewports[ia];
+            var vb = dynamicLayout.viewports[ib];
+            if (va.ghost || vb.ghost) return edge.alpha;
+            RoomCamera ca = CameraByNumber(game, baseCameraNumbers[ia]);
+            RoomCamera cb = CameraByNumber(game, baseCameraNumbers[ib]);
+            if (ca?.room == null || cb?.room == null || ca.room != cb.room) return 1f;
+            if (Mathf.Abs(va.zoom - vb.zoom) > 0.01f) return 1f;
+            int a = edge.firstCamera, b = edge.secondCamera;
+            if (a < 0 || b < 0 || a >= ownViewShifts.Length || b >= ownViewShifts.Length ||
+                !ownViewShiftValid[a] || !ownViewShiftValid[b]) return edge.alpha;
+            Vector2 originA = InterpolatedCameraPos(ca, lastTimeStacker) + Vector2.Scale(ownViewShifts[a], ca.sSize);
+            Vector2 originB = InterpolatedCameraPos(cb, lastTimeStacker) + Vector2.Scale(ownViewShifts[b], cb.sSize);
+            float misalignment = (originA - originB).magnitude;
+            float t = Mathf.Clamp01((misalignment - DividerInvisibleBelowPixels) /
+                (DividerOpaqueAbovePixels - DividerInvisibleBelowPixels));
+            return t * t * (3f - 2f * t);
+        }
+
+        private const float DividerInvisibleBelowPixels = 4f;
+        private const float DividerOpaqueAbovePixels = 300f;
+        private const float DividerFadeSeconds = 0.2f;
+        private readonly float[,] dividerAlphaState = new float[4, 4];
+        private readonly float[,] dividerAlphaVelocity = new float[4, 4];
+        private readonly int[,] dividerAlphaFrame = new int[4, 4];
 
         private static void PolygonBounds(Vector2[] polygon, out Vector2 min, out Vector2 max)
         {
@@ -1402,11 +1480,14 @@ namespace SplitScreenCoop
                 var edge = dynamicLayout.dividers[i];
                 Vector2 along = edge.end - edge.start;
                 if (along.sqrMagnitude < 0.00001f) continue;
+                float alpha = DividerAlpha(edge);
+                if (alpha <= 0.002f) continue;
                 Vector2 normal = new Vector2(-along.y, along.x).normalized;
-                float width = edge.width / Mathf.Max(1f, Futile.screen.pixelWidth);
-                Vector2 pad = normal * width;
+                // Pad in pixels along the normal so a tilted line is as thick as a straight one.
+                float pixelWidth = Mathf.Max(1f, Futile.screen.pixelWidth), pixelHeight = Mathf.Max(1f, Futile.screen.pixelHeight);
+                Vector2 pad = new Vector2(normal.x * edge.width / pixelWidth, normal.y * edge.width / pixelHeight);
                 GL.Begin(GL.QUADS);
-                GL.Color(new Color(0f, 0f, 0f, edge.alpha));
+                GL.Color(new Color(0f, 0f, 0f, alpha));
                 GL.Vertex3(edge.start.x - pad.x, edge.start.y - pad.y, 0f);
                 GL.Vertex3(edge.start.x + pad.x, edge.start.y + pad.y, 0f);
                 GL.Vertex3(edge.end.x + pad.x, edge.end.y + pad.y, 0f);

@@ -36,7 +36,7 @@ Unity math in `Tests/UnityMathStub.cs`.
 & "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\MSBuild\Current\Bin\Roslyn\csc.exe" /target:exe /out:Tests.exe SplitLayoutSolver.cs Tests\UnityMathStub.cs Tests\Program.cs; .\Tests.exe
 ```
 
-Expect `PASS: 9999 layout checks` (the pan-budget test samples an 11x11 grid per cell,
+Expect `PASS: 10328 layout checks` (the pan-budget test samples an 11x11 grid per cell,
 which is where most of that count comes from). `SplitLayoutSolver.cs` is deliberately
 pure and Unity-free so it stays testable — **keep it that way.** Anything needing a
 `RoomCamera`, a `Room` or a `RenderTexture` belongs in `SplitScreenCoop.Dynamic.cs`.
@@ -142,10 +142,19 @@ hint text), and — via the culling mask — Futile's root stage.
 
 `SplitLayoutSolver` builds a guillotine partition of the screen:
 
-- **Two groups**: side by side or stacked. Score = how much of the separation lies along
-  that axis + 0.75 × how square the resulting cells are (in screen-height units, so the
-  16:9 screen strongly prefers columns unless the players are clearly above one another).
-  Cut position = weight fraction (equal areas for living players).
+- **Two groups** (`SplitTwoRotating`): one straight line through the screen centre. Its
+  normal's angle is damped (`dividerTurnSeconds`, 0.3 s) towards a target: while both
+  players share a prebaked screen the target is perpendicular to the players' on-screen
+  direction, so the line turns continuously with them; on different screens it is the
+  nearest axis (side by side or stacked, chosen by the score below with the usual dead
+  zone and hold time). Axis flips and side swaps are therefore rotations, never cuts.
+  A line through the centre halves the screen exactly; a dying player's weight slides
+  the cut off-centre (`CutForArea`). The diagonal cells this produces have little pan,
+  but they only occur while both players are on one screen, where both cells draw the
+  same picture, so a player can never be hidden by the line.
+  Axis score = how much of the separation lies along that axis + 0.75 × how square the
+  resulting cells are (in screen-height units, so the 16:9 screen strongly prefers
+  columns unless the players are clearly above one another).
 - **Three groups**: peel one off (the most isolated, by gap to its neighbour along an
   axis), weighed against the *largest* remaining group, not their sum. Three players give
   one half and two quarters; a pair sharing an image beside a single player gives the
@@ -182,19 +191,40 @@ to the other camera, then swipes". Once sharing (`lastBaseByCamera`), a cell kee
 sharing while its player stays visible on the base screen, so a camera switching screens
 at the edge does not break a merged view apart prematurely.
 
-Structural changes (axis flips, side swaps, a different player peeled off) are animated,
-never cut. The solver compares each live cell's target rectangle with the previous
-tick's; a jump over `SnapThreshold` starts a transition of `transitionSeconds` (0.45 s):
+Structural changes with three or four cells (a different player peeled off, an axis
+flip inside the tree) are animated, never cut. The solver compares each live cell's
+target rectangle with the previous tick's; a jump over `SnapThreshold` starts a
+**slide** of `transitionSeconds` (0.45 s): each cell's `polygon` interpolates from its
+previous rectangle to `targetPolygon`; `Layout.sliding` is true meanwhile. Sliding
+rectangles overlap and leave gaps, so the compositor first draws every `targetPolygon`
+(the resting layout) and then the sliding `polygon`s over it, all opaque. Two-cell
+layouts never slide; their single line is damped continuously (see above).
 
-- **Rotate** — exactly two live cells that both existed last tick. The divider's normal
-  sweeps from its previous direction to the new one (`RotateTowards`) and the cut is
-  re-solved each frame so the areas interpolate (`CutForArea`). The cells are briefly
-  non-rectangular; the zoom guard (`zoomTarget ≥ group bbox extent`) keeps them inside
-  the source, and `ClampedUvShift` just has less pan for those frames.
-- **Slide** — anything else. Each cell's `polygon` interpolates from its previous
-  rectangle to `targetPolygon`; `Layout.sliding` is true meanwhile. Sliding rectangles
-  overlap and leave gaps, so the compositor first draws every `targetPolygon` (the
-  resting layout) and then the sliding `polygon`s over it, all opaque.
+**Divider opacity is how far apart the two views are, damped.** `DividerTargetAlpha` in
+`Dynamic.cs` computes where each cell's image sits in world pixels (base camera position,
+interpolated and clamped like `RoomCamera.DrawUpdate`, plus that cell's pan × screen
+size). When the two origins coincide the picture is continuous across the line, i.e. one
+camera already frames both players and there is nothing to indicate, so the line is 0.
+It ramps to solid over `DividerInvisibleBelowPixels` (4) to `DividerOpaqueAbovePixels`
+(300); the ramp is that wide so the line fades across the *whole* glide as two views
+converge, not only its last few pixels. `DividerAlpha` then damps it per camera pair
+(`DividerFadeSeconds`, 0.2 s), so a camera cut, which moves one view by a screen in one
+frame, fades the line in rather than popping it. Different rooms are solid.
+The solver still computes a distance-based `DividerSegment.alpha` (`PairMemory.line`,
+`lineSmoothingTime`); the compositor only uses it as a fallback when alignment cannot be
+computed. Two rejected variants, so nobody re-tries them: alignment with a narrow 64 px
+ramp never crossed its band (halves on one screen are identical, on two screens a whole
+screen apart); distance alone hid the line while the views were still visibly apart.
+
+**Why a merge across a screen boundary cannot be fully continuous, and what is done
+instead.** A half-width cell is 683 px wide; adjacent prebaked screens in a wide room
+overlap by less than that. A cell keeping its player centred therefore has to change
+which screen it samples somewhere, and at that point its content must jump by (cell
+width − overlap). Vanilla makes that jump too (the whole view cuts); here only one half
+does. The merge pan is then a *glide*: `splitSmoothingTime` is 0.5 s, so when the cut
+puts the pair inside the merge band the view moves to its merged position over half a
+second with the line fading alongside, instead of the 0.25 s move that read as a snap.
+A merge that does not cross a boundary is driven by distance and needs no glide.
 
 Players that are joined (same prebaked screen, within `mergeDistance`) form one group,
 and their individual cells just tile the group rectangle — they draw one image.
@@ -342,8 +372,20 @@ goes into a per-room `RoomShaderState` (a `ConditionalWeakTable`), and
 
 **Dead players' point of view audible.** A camera outside the layout kept its
 `VirtualMicrophone` at full volume. `VirtualMicrophone_DrawUpdate` zeroes every volume
-group for a camera with no viewport (or a ghost one); `VirtualMicrophone.Update`
-rebuilds the groups each tick so this is per frame.
+group for a camera whose followed player is dead (independent of layout state, so it
+holds through transitions and game over) and for a camera with no live cell;
+`VirtualMicrophone.Update` rebuilds the groups each tick so this is per frame.
+
+**Game over with a player still alive.** Two faults. `IsCreatureDead` returned true for
+a living player whose realized body was slated for deletion, which is what happens to
+a player abstracted mid-pipe when the next room is not yet realized; that dropped their
+camera from the layout and satisfied the "everyone dead or held" test when the other
+player was grabbed or died. Death is now the creature state only (`state.dead`,
+`permaDead`). Separately, vanilla raises game over from several `Player` paths and the IL
+guard in `RainWorldGame.GameOver` is the only thing deferring them to the co-op rule;
+`TextPrompt_EnterGameOverMode` now refuses to enter game-over mode unless
+`AllPlayersDown` holds, whichever path called it, and logs `[Coop] blocked game-over
+prompt` with each player's state. `UpdateCoopGameover` uses the same predicate.
 
 **Shared meters only revealed for their owner.** `HUD.Update` computes
 `showKarmaFoodRain` from its own owner's map button. `HUD_Update` sets it on the meter

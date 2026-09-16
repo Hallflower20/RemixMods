@@ -34,16 +34,10 @@ namespace SplitScreenCoop
         {
             var isGameOver = game.GameOverModeActive;
 
-            if (game.session.Players.All(IsCreatureDead))
-            {
-                if(!isGameOver)
-                    CoopGameOver(game); // Death
-                return;
-            }
-            else if (game.session.Players.All(p => IsCreatureDead(p) || (p.realizedCreature is Player pl && pl.dangerGrasp != null)))
+            if (AllPlayersDown(game))
             {
                 if (!isGameOver)
-                    CoopGameOver(game); // Death?
+                    CoopGameOver(game);
                 return;
             }
             else
@@ -73,12 +67,30 @@ namespace SplitScreenCoop
             orig(self);
         }
 
+        /// <summary>Every player is dead or in a predator's grasp: the co-op game-over condition.</summary>
+        private bool AllPlayersDown(RainWorldGame game)
+        {
+            if (game?.session?.Players == null) return false;
+            return game.session.Players.All(p => IsCreatureDead(p) || (p.realizedCreature is Player pl && pl.dangerGrasp != null));
+        }
+
         private void TextPrompt_EnterGameOverMode(On.HUD.TextPrompt.orig_EnterGameOverMode orig, TextPrompt self,
             Creature.Grasp dependentOnGrasp, int foodInStomach, int deathRoom, Vector2 deathPos)
         {
+            RainWorldGame game = self.hud?.rainWorld?.processManager?.currentMainLoop as RainWorldGame;
+            // Vanilla raises game over from several places in Player (death, being
+            // carried for a while, destruction). The IL guard in GameOver is meant to
+            // defer to the co-op rule, but this is the one place every path funnels
+            // through, so the rule is enforced here as well: with a player still
+            // standing there is no game over.
+            if (selfSufficientCoop && game != null && game.IsStorySession && !AllPlayersDown(game))
+            {
+                Logger.LogInfo($"[Coop] frame={Time.frameCount} blocked game-over prompt; players=[{string.Join(",", game.session.Players.Select(p => $"{PlayerNumber(p)}:{(IsCreatureDead(p) ? "dead" : "alive")}"))}]");
+                return;
+            }
             orig(self, dependentOnGrasp, foodInStomach, deathRoom, deathPos);
             int camera = -1;
-            if (self.hud?.rainWorld?.processManager?.currentMainLoop is RainWorldGame game && game.cameras != null)
+            if (game?.cameras != null)
                 for (int i = 0; i < game.cameras.Length; i++)
                     if (game.cameras[i]?.hud == self.hud) camera = i;
             Logger.LogInfo($"[Coop] frame={Time.frameCount} game over prompt entered on cam={camera}; promptSource={globalPromptSource}; meterSource={globalMeterSource}");

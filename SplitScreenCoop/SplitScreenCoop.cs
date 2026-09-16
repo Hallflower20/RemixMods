@@ -912,7 +912,12 @@ namespace SplitScreenCoop
         {
             if (critter?.state == null || critter.state.dead) return true;
             if (critter.state is PlayerState playerState && playerState.permaDead) return true;
-            return critter.realizedCreature?.slatedForDeletetion ?? false;
+            // A living player travelling through a pipe into an unrealized room is
+            // abstracted: its realized body is slated for deletion and rebuilt when
+            // the room loads. Counting that as death dropped the player's camera and,
+            // with the other player held or dead, ended the game with someone alive.
+            // Death is the creature state, nothing else.
+            return false;
         }
 
         /// <summary>

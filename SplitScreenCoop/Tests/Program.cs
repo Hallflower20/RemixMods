@@ -7,10 +7,41 @@ internal static class Program
     private static int checks;
     private static readonly SplitLayoutSolver.Settings Settings = new SplitLayoutSolver.Settings();
 
-    private static SplitLayoutSolver.PlayerInput P(int camera, float x, float y, long screen = 1)
+    private static SplitLayoutSolver.PlayerInput P(int camera, float x, float y, long screen = 1, long room = 1)
     {
         return new SplitLayoutSolver.PlayerInput { playerIndex = camera, worldPos = new Vector2(x, y),
-            sameScreenKey = screen, mergedScreenPos = new Vector2(0.5f, 0.5f), validWorldPos = true };
+            sameScreenKey = screen, roomKey = room, mergedScreenPos = new Vector2(0.5f, 0.5f), validWorldPos = true };
+    }
+
+    private static void DividerFadesWithDistance()
+    {
+        // Same room, different screens: the line fades with distance through the
+        // merge band even though the cells cannot share an image yet. Different
+        // rooms: solid regardless of distance.
+        var far = Settle(new SplitLayoutSolver(), P(0, -1000f, 0f, 1, 7), P(1, 1000f, 0f, 2, 7));
+        Check(far.dividers.Length == 1 && far.dividers[0].alpha == 1f, "Far apart in one room should draw a solid line");
+        var mid = Settle(new SplitLayoutSolver(), P(0, -500f, 0f, 1, 7), P(1, 500f, 0f, 2, 7));
+        Check(mid.dividers.Length == 1 && mid.dividers[0].alpha > 0.05f && mid.dividers[0].alpha < 0.95f,
+            "Inside the merge band the line should be partly faded: " + mid.dividers[0].alpha);
+        var near = Settle(new SplitLayoutSolver(), P(0, -300f, 0f, 1, 7), P(1, 300f, 0f, 2, 7));
+        Check(near.dividers.Length == 1 && near.dividers[0].alpha < 0.01f,
+            "Close together in one room the line should be gone even on different screens: " + near.dividers[0].alpha);
+        Check(near.viewports[0].splitAmount == 1f, "Different screens must still keep separate images");
+        var rooms = Settle(new SplitLayoutSolver(), P(0, -300f, 0f, 1, 7), P(1, 300f, 0f, 2, 8));
+        Check(rooms.dividers.Length == 1 && rooms.dividers[0].alpha == 1f, "Different rooms should draw a solid line");
+
+        // The fade is gradual in time as well as in distance.
+        var solver = new SplitLayoutSolver();
+        var previous = Settle(solver, P(0, -1000f, 0f, 1, 7), P(1, 1000f, 0f, 2, 7));
+        float largestStep = 0f;
+        for (int frame = 0; frame < 60; frame++)
+        {
+            var next = solver.Solve(new[] { P(0, -300f, 0f, 1, 7), P(1, 300f, 0f, 2, 7) }, 1f / 60f, Settings);
+            largestStep = Math.Max(largestStep, Math.Abs(next.dividers[0].alpha - previous.dividers[0].alpha));
+            previous = next;
+        }
+        Check(largestStep < 0.12f, "Divider opacity jumped: " + largestStep);
+        Check(previous.dividers[0].alpha < 0.05f, "Divider did not fade out after approaching");
     }
 
     private static void Check(bool condition, string message)
@@ -353,6 +384,9 @@ internal static class Program
         Check(largestAnchorChange < 0.06f, "Anchor jumped during continuous join/leave: " + largestAnchorChange);
         Check(largestZoomChange < 0.06f, "Zoom jumped during continuous join/leave: " + largestZoomChange);
         Check(largestCellChange < 0.001f, "Cells moved during a same-screen join/leave: " + largestCellChange);
+        // The merge glides over about half a second, so give it that after the sweep.
+        for (int frame = 0; frame < 60; frame++)
+            previous = solver.Solve(new[] { P(0, -385f, 0f), P(1, 385f, 0f) }, 1f / 60f, Settings);
         Check(previous.viewports[0].imageBlend < 0.1f, "Images did not blend back on return");
     }
 
@@ -409,7 +443,46 @@ internal static class Program
         Check(previous.viewports[0].centroid.x > 0.5f && IsRectangle(previous.viewports[0].polygon),
             "Side swap did not finish on the new rectangles");
         Check(largestCentroidStep < 0.08f, "Cell jumped during the rotate transition: " + largestCentroidStep);
-        Check(frames < 60, "Rotate transition took too long: " + frames + " frames");
+        Check(frames < 100, "Rotate transition took too long: " + frames + " frames");
+    }
+
+    private static void SameScreenLineRotates()
+    {
+        // Two players far apart on one prebaked screen: the divider is a single
+        // line through the screen centre, perpendicular to the vector between them.
+        var layout = Settle(new SplitLayoutSolver(), P(0, -600f, -300f, 1), P(1, 600f, 300f, 1));
+        var a = layout.viewports[0];
+        var b = layout.viewports[1];
+        Check(!IsRectangle(a.polygon) && !IsRectangle(b.polygon), "Same-screen diagonal players still got rectangles");
+        Check(Math.Abs(a.areaFraction - 0.5f) < 0.001f && Math.Abs(b.areaFraction - 0.5f) < 0.001f,
+            "Centre line does not halve the screen: " + a.areaFraction);
+        Check(layout.dividers.Length == 1, "Expected one divider segment, got " + layout.dividers.Length);
+        Vector2 mid = (layout.dividers[0].start + layout.dividers[0].end) * 0.5f;
+        Check((mid - new Vector2(0.5f, 0.5f)).magnitude < 0.001f, "Divider does not pass through the centre: " + mid);
+        Vector2 along = (layout.dividers[0].end - layout.dividers[0].start).normalized;
+        // Perpendicular in pixel space to the players' vector (1200, 600).
+        Vector2 alongPixels = new Vector2(along.x * Settings.screenAspect, along.y).normalized;
+        Check(Math.Abs(Vector2.Dot(alongPixels, new Vector2(1200f, 600f).normalized)) < 0.02f,
+            "Divider is not perpendicular to the players' direction");
+        Check(a.centroid.x < b.centroid.x && a.centroid.y < b.centroid.y, "Players are on the wrong sides of the line");
+
+        // The line follows the players continuously: move player 1 around player 0
+        // and the divider angle must never jump.
+        var solver = new SplitLayoutSolver();
+        var previous = Settle(solver, P(0, 0f, 0f, 1), P(1, 1200f, 0f, 1));
+        float largestTurn = 0f;
+        for (int frame = 1; frame <= 180; frame++)
+        {
+            double angle = frame / 180.0 * Math.PI;
+            var next = solver.Solve(new[] { P(0, 0f, 0f, 1), P(1, (float)(1200 * Math.Cos(angle)), (float)(700 * Math.Sin(angle)), 1) },
+                1f / 60f, Settings);
+            Vector2 previousAlong = (previous.dividers[0].end - previous.dividers[0].start).normalized;
+            Vector2 nextAlong = (next.dividers[0].end - next.dividers[0].start).normalized;
+            largestTurn = Math.Max(largestTurn, 1f - Math.Abs(Vector2.Dot(previousAlong, nextAlong)));
+            Check(Math.Abs(next.viewports[0].areaFraction - 0.5f) < 0.01f, "Centre line left the centre while turning");
+            previous = next;
+        }
+        Check(largestTurn < 0.01f, "Divider angle jumped while the players circled: " + largestTurn);
     }
 
     private static void SlideTransition()
@@ -487,6 +560,8 @@ internal static class Program
         try
         {
             RotateTransition();
+            SameScreenLineRotates();
+            DividerFadesWithDistance();
             SlideTransition();
             ScreenArrivalGlides();
             Direction(800f, 0f, true);
