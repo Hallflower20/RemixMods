@@ -1,7 +1,9 @@
 # SplitScreen Co-op — developer handoff
 
-Updated 2026-09-15 (second pass, after the three-player playtest). Covers the
-`dynamic-split-screen` branch at commit `c3de29f` plus the uncommitted tree. Read
+Updated 2026-09-16 (after the sixth three-player playtest: rot-spore crash fixed, layout
+holds across rooms). Covers the `dynamic-split-screen` branch at commit `4b71edc` plus the
+uncommitted tree. `CLAUDE.md` is the short version for a new session; this file is the
+reasoning. Read
 "Build", "How the dynamic pipeline renders" and "Invariants" before touching rendering
 code; nearly every regression so far came from violating one of those, not from geometry.
 
