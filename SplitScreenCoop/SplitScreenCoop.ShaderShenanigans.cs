@@ -1,4 +1,5 @@
 ﻿
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using UnityEngine;
@@ -163,9 +164,18 @@ namespace SplitScreenCoop
                 curCamera = self.cameraNumber;
                 orig(self, timeStacker, timeSpeed);
                 NoteRoomCameraDrawn(self);
-                CaptureRoomCameraShaderKeywords(self);
-                OffsetHud(self);
-                RouteGlobalMeters(self);
+                // This runs inside the game's per-camera draw loop. A throw here
+                // would skip every later camera's draw for the frame, so it is
+                // contained, and it is skipped entirely while a draw stall is being
+                // diagnosed (see DetectDrawStall).
+                if (drawPathSafeMode) return;
+                try
+                {
+                    CaptureRoomCameraShaderKeywords(self);
+                    OffsetHud(self);
+                    RouteGlobalMeters(self);
+                }
+                catch (Exception error) { LogHookError("RoomCamera_DrawUpdate.post", error); }
             }
             finally
             {
@@ -181,7 +191,8 @@ namespace SplitScreenCoop
                 curCamera = self.cameraNumber;
                 orig(self);
                 NoteRoomCameraUpdated(self);
-                CaptureRoomCameraShaderKeywords(self);
+                try { if (!drawPathSafeMode) CaptureRoomCameraShaderKeywords(self); }
+                catch (Exception error) { LogHookError("RoomCamera_Update.post", error); }
             }
             finally
             {

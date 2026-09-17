@@ -410,6 +410,7 @@
     <Compile Include="SplitScreenCoop.Realizer2.cs" />
     <Compile Include="SplitScreenCoop.ShaderShenanigans.cs" />
     <Compile Include="SplitScreenCoop.WatcherCompat.cs" />
+    <Compile Include="SplitScreenCoop.RotSpores.cs" />
     <Compile Include="SplitScreenCoopOptions.cs" />
   </ItemGroup>
   <ItemGroup>

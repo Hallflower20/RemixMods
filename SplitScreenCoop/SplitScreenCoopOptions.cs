@@ -24,16 +24,16 @@ namespace SplitScreenCoop
             SplitStyle = config.Bind("SplitStyle", "Dynamic", new ConfigurableInfo(
                 "Dynamic rotates and weights regions; Classic keeps the original fixed layouts.",
                 new ConfigAcceptableList<string>("Classic", "Dynamic")));
-            MergeDistance = config.Bind("MergeDistance", 850f, new ConfigurableInfo(
+            MergeDistance = config.Bind("MergeDistance", 600f, new ConfigurableInfo(
                 "Players closer than this on the same camera screen share one image.",
                 new ConfigAcceptableRange<float>(100f, 1400f)));
-            BlendWidth = config.Bind("BlendWidth", 300f, new ConfigurableInfo(
+            BlendWidth = config.Bind("BlendWidth", 250f, new ConfigurableInfo(
                 "Distance over which the divider fades and images blend.",
                 new ConfigAcceptableRange<float>(20f, 800f)));
-            // Migrate the two previous defaults so existing installs display
-            // the effective, less eager values in Remix rather than stale 280/200.
-            if (Mathf.Approximately(MergeDistance.Value, 280f)) MergeDistance.Value = 850f;
-            if (Mathf.Approximately(BlendWidth.Value, 200f)) BlendWidth.Value = 300f;
+            // Migrate earlier defaults so existing installs pick up the current ones
+            // rather than a value a previous build wrote into the config file.
+            if (Mathf.Approximately(MergeDistance.Value, 280f) || Mathf.Approximately(MergeDistance.Value, 850f)) MergeDistance.Value = 600f;
+            if (Mathf.Approximately(BlendWidth.Value, 200f) || Mathf.Approximately(BlendWidth.Value, 300f)) BlendWidth.Value = 250f;
             MinZoom = config.Bind("MinZoom", 0.5f, new ConfigurableInfo(
                 "Smallest view zoom, still limited by the one-screen source image.",
                 new ConfigAcceptableRange<float>(0.3f, 1f)));

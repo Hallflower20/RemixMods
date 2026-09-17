@@ -118,6 +118,7 @@ namespace SplitScreenCoop
         public void RoomRealizer_KillRoom(On.RoomRealizer.orig_KillRoom orig,
             RoomRealizer self, AbstractRoom room)
         {
+            HangMarker = "RoomRealizer_KillRoom";
             if (room != null && (RoomIsInUseByAnyPlayer(self?.world?.game, room) || RoomIsHeldByAnotherRealizer(self, room)))
             {
                 if (Time.frameCount - lastKillRoomBlockFrame > 200)

@@ -155,6 +155,31 @@ Needs in-game confirmation
     slide shut.
 [ ] Following: the slugcat sits at its cell centre whenever the room screen
     allows, and the view stays smooth through pipes and screen changes.
+[ ] Three players: the layout settles instead of sliding back and forth. Count
+    "[CameraLayout] ... restructured" lines; players standing still should
+    produce none. Pairs now join at 600 px and part around 840 px.
+[ ] Three players all in one pipe: they stay one group through the transit
+    (shared pending-room key) and no slivers appear on leaving a shelter.
+[ ] Freeze: if it recurs, the log has a "[Hang] ... last marker=" line naming
+    where the main thread was. Send that line. (Menus no longer produce a
+    false one.)
+[ ] Continue after death: the new session's rooms draw normally (level
+    texture keys are reset per session).
+[ ] Every player stays inside their own cell once their image has parted from
+    a neighbour's; at the seamless moment they may span the seam.
+[ ] Black screen with audio: was the rot particle cloud (SentientRotSpores)
+    once two cameras viewed CC_B06; fixed with one renderer per camera. Check
+    a rot room with all three players in it: particles visible on every
+    view, no "[UnityLog]" lines. If any other object throws the same way the
+    log will again carry a "[UnityLog]" line naming it.
+[ ] Layout only rearranges while everyone in that part of the layout is in
+    one room; in separate rooms it holds, and re-decides when they pipe
+    together.
+[ ] Merging: no visible shear at the seam. The line stays solid until the two
+    images are within ~32 px of lining up, then fades over about a quarter
+    second; switching which camera a cell draws no longer jolts the picture.
+[ ] Slides and merges now run at the configured speed at any frame rate
+    (the solver is fed the 40 Hz tick, not the render frame time).
 [ ] Stutter: read the [FrameHitch] lines from the next log. Each one names what
     happened in that frame (realize/abstractize room, MoveCamera, level texture
     decode or copy, GC collections). That decides what to optimize next.

@@ -19,6 +19,17 @@ namespace SplitScreenCoop
         private static int sharedLevelTextureCopies;
 
         /// <summary>
+        /// Every session creates new cameras with blank level textures. A key left
+        /// over from the previous session would let the first camera to load that
+        /// same screen (the shelter you respawn in) copy blank pixels from a sibling
+        /// that has not decoded anything yet.
+        /// </summary>
+        private static void ForgetLevelTextures()
+        {
+            for (int i = 0; i < loadedLevelTextureKeys.Length; i++) loadedLevelTextureKeys[i] = null;
+        }
+
+        /// <summary>
         /// Replaces `this.levelTexture.LoadImage(this.preLoadedTexture, false)` inside
         /// RoomCamera.ApplyPositionChange with a call that may copy from a sibling.
         /// </summary>
@@ -46,12 +57,13 @@ namespace SplitScreenCoop
 
         private static bool LoadLevelTexture(Texture2D texture, byte[] bytes, bool markNonReadable, RoomCamera self)
         {
+            HangMarker = "LoadLevelTexture";
             int number = self?.cameraNumber ?? -1;
             bool tracked = number >= 0 && number < loadedLevelTextureKeys.Length;
             string key = null;
             try { key = LevelTextureKey(self); }
             catch (Exception error) { sLogger?.LogWarning("[LevelTexture] key failed: " + error.Message); }
-            if (tracked && key != null && texture != null && self.game?.cameras != null)
+            if (tracked && key != null && texture != null && self.game?.cameras != null && !drawPathSafeMode)
             {
                 foreach (RoomCamera other in self.game.cameras)
                 {

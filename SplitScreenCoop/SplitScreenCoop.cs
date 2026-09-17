@@ -123,6 +123,7 @@ namespace SplitScreenCoop
                 if (init) return;
                 init = true;
                 Logger.LogInfo("OnModsInit");
+                HookUnityLog(); // mirror Unity exceptions into this log; WriteUnityLog is off in the playtest config
 
                 // splitscreen functionality
                 IL.RainWorldGame.ctor += RainWorldGame_ctor1;
@@ -247,6 +248,9 @@ namespace SplitScreenCoop
 
                 // Watcher rendering assumes a single Unity camera. Route its command
                 // buffers, textures, masks and ripple state to the owning split camera.
+                On.SentientRotSpores.InitiateSprites += SentientRotSpores_InitiateSprites; // one renderer per camera
+                On.SentientRotSpores.DrawSprites += SentientRotSpores_DrawSprites; // never GetChildAt(0) on an emptied container
+                On.SentientRotSpores.Destroy += SentientRotSpores_Destroy;
                 On.Watcher.RippleCameraData.ctor += RippleCameraData_ctor;
                 On.Watcher.RippleCameraData.AddCommandBuffer += RippleCameraData_AddCommandBuffer;
                 On.Watcher.RippleCameraData.RemoveCommandBuffer += RippleCameraData_RemoveCommandBuffer;
@@ -353,10 +357,10 @@ namespace SplitScreenCoop
                 !dynamicPipelineFailed;
             // Existing installs may still hold the old eager default in their
             // Remix config. Treat only that exact default as the new baseline.
-            dynamicSettings.mergeDistance = Mathf.Approximately(Options.MergeDistance.Value, 280f)
-                ? 850f : Options.MergeDistance.Value;
-            dynamicSettings.blendWidth = Mathf.Approximately(Options.BlendWidth.Value, 200f)
-                ? 300f : Options.BlendWidth.Value;
+            dynamicSettings.mergeDistance = Mathf.Approximately(Options.MergeDistance.Value, 280f) ||
+                Mathf.Approximately(Options.MergeDistance.Value, 850f) ? 600f : Options.MergeDistance.Value;
+            dynamicSettings.blendWidth = Mathf.Approximately(Options.BlendWidth.Value, 200f) ||
+                Mathf.Approximately(Options.BlendWidth.Value, 300f) ? 250f : Options.BlendWidth.Value;
             dynamicSettings.minZoom = Options.MinZoom.Value;
             dynamicSettings.zoomExponent = Options.ZoomExponent.Value;
             dynamicSettings.dividerWidth = Options.DividerWidth.Value;
@@ -576,6 +580,8 @@ namespace SplitScreenCoop
 
             realizer2 = null;
             additionalRealizers.Clear();
+            ForgetLevelTextures();
+            drawPathSafeMode = false;
             pendingKarmaFlowerPosition = null;
             CurrentSplitMode = SplitMode.NoSplit;
             ResetCameraDiagnostics();
@@ -659,8 +665,14 @@ namespace SplitScreenCoop
             }
             realizer2 = null;
             additionalRealizers.Clear();
+            ForgetLevelTextures();
             orig(self);
             DisposeWatcherMasks();
+            // Leave the cameras the way a menu needs them instead of relying on the
+            // watchdog to notice one frame later: SetSplitMode above just enabled
+            // whichever camera still had a living player and pointed camera 0 at its
+            // split texture.
+            RestoreMenuCameras("game shutdown");
         }
 
         struct RoomTarget : IEquatable<RoomTarget>
@@ -695,9 +707,21 @@ namespace SplitScreenCoop
         /// </summary>
         public void RainWorldGame_Update(On.RainWorldGame.orig_Update orig, RainWorldGame self)
         {
+            StartHangWatchdog();
+            HangMarker = "EnsureStableCameraAssignments";
             if (self.IsStorySession && self.cameras?.Length > 1) EnsureStableCameraAssignments(self);
+            HangMarker = "RainWorldGame.Update(orig)";
             orig(self);
+            HangMarker = "RainWorldGame_Update.post";
+            // An exception here would leave RawUpdate before GrafUpdate: game logic
+            // and audio would continue while nothing is ever drawn again.
+            try { RainWorldGame_UpdatePost(self); }
+            catch (Exception error) { LogHookError("RainWorldGame_Update.post", error); }
+            HangMarker = "idle";
+        }
 
+        private void RainWorldGame_UpdatePost(RainWorldGame self)
+        {
             if (!self.IsStorySession) return;
             if (self.cameras.Length > 1 && dynamicStyle && dynamicPipelineFailed)
             {
@@ -754,6 +778,7 @@ namespace SplitScreenCoop
             {
                 if (additionalRealizers.Count > 0)
                 {
+                    HangMarker = "additional RoomRealizer.Update";
                     foreach (RoomRealizer realizer in additionalRealizers.ToArray())
                         if (realizer?.world == self.world) realizer.Update();
                 }
@@ -765,9 +790,11 @@ namespace SplitScreenCoop
 
             if (selfSufficientCoop)
             {
+                HangMarker = "CoopUpdate";
                 CoopUpdate(self);
             }
 
+            HangMarker = "MonitorCameraHealth";
             MonitorCameraHealth(self);
         }
 

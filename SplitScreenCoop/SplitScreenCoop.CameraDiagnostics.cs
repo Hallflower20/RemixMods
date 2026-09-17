@@ -61,6 +61,121 @@ namespace SplitScreenCoop
             lastHitchLogFrame = Time.frameCount;
         }
 
+        // ---- Unity log capture and hook error shielding ------------------------
+        // The playtest BepInEx config has WriteUnityLog = false, so an exception
+        // thrown inside a hook or vanilla draw code never reaches LogOutput.log. A
+        // black screen with audio was exactly that: RoomCamera.DrawUpdate threw every
+        // frame from one moment on (roomDrawAge climbed while roomUpdateAge stayed 0)
+        // and nothing said why. Mirror Unity's errors into this log, rate limited per
+        // distinct message, so the next such log names the throw.
+        private static readonly Dictionary<string, int> unityErrorLastLogged = new Dictionary<string, int>();
+        private static readonly Dictionary<string, int> unityErrorCounts = new Dictionary<string, int>();
+        private static string lastUnityError = "none";
+        private static bool unityLogHooked;
+
+        private static void HookUnityLog()
+        {
+            if (unityLogHooked) return;
+            unityLogHooked = true;
+            Application.logMessageReceived += OnUnityLogMessage;
+        }
+
+        private static void OnUnityLogMessage(string condition, string stackTrace, LogType type)
+        {
+            if (type != LogType.Exception && type != LogType.Error && type != LogType.Assert) return;
+            string key = condition ?? "";
+            int count;
+            unityErrorCounts.TryGetValue(key, out count);
+            unityErrorCounts[key] = ++count;
+            lastUnityError = key;
+            int last;
+            bool seen = unityErrorLastLogged.TryGetValue(key, out last);
+            if (seen && Time.frameCount - last < 600) return;
+            unityErrorLastLogged[key] = Time.frameCount;
+            string trace = string.IsNullOrEmpty(stackTrace) ? "" : "\n" + stackTrace.TrimEnd();
+            sLogger?.LogError($"[UnityLog] frame={Time.frameCount} {type} (x{count}): {condition}{trace}");
+        }
+
+        /// <summary>
+        /// The mod's own code that runs after a vanilla call must never take the
+        /// game's frame down with it. Log the error, rate limited per call site.
+        /// </summary>
+        private static readonly Dictionary<string, int> hookErrorLastLogged = new Dictionary<string, int>();
+
+        internal static void LogHookError(string site, Exception error)
+        {
+            int last;
+            if (hookErrorLastLogged.TryGetValue(site, out last) && Time.frameCount - last < 600) return;
+            hookErrorLastLogged[site] = Time.frameCount;
+            sLogger?.LogError($"[HookError] frame={Time.frameCount} in {site}: {error}");
+        }
+
+        /// <summary>
+        /// Set when the game's draw loop stopped completing. The mod's code inside
+        /// that loop (HUD routing, shader capture, level texture sharing) passes
+        /// through while it is set, so if the mod caused the stall the picture comes
+        /// back and the log says so; if it persists, the cause is elsewhere.
+        /// </summary>
+        internal static bool drawPathSafeMode;
+        private int drawStallLoggedFrame = -10000;
+        private int drawStallSince = -1;
+
+        private void DetectDrawStall(RainWorldGame game)
+        {
+            if (game?.cameras == null || game.cameras.Length == 0 || game.GamePaused) { drawStallSince = -1; return; }
+            int number = game.cameras[0].cameraNumber;
+            if (number < 0 || number >= lastRoomCameraDrawFrames.Length) return;
+            int drawAge = FrameAge(lastRoomCameraDrawFrames[number]);
+            int updateAge = FrameAge(lastRoomCameraUpdateFrames[number]);
+            if (drawAge < 30 || updateAge > 2 || lastRoomCameraDrawFrames[number] < 0) { drawStallSince = -1; return; }
+            if (drawStallSince < 0) drawStallSince = Time.frameCount;
+            if (Time.frameCount - drawStallLoggedFrame < 300) return;
+            drawStallLoggedFrame = Time.frameCount;
+            if (!drawPathSafeMode)
+            {
+                drawPathSafeMode = true;
+                Logger.LogError($"[CameraHealth] frame={Time.frameCount} draw loop stalled: camera {number} has not completed DrawUpdate for {drawAge} frames while Update still runs (an exception inside the draw loop every frame). Last Unity error: {lastUnityError}. Switching the mod's draw-path code to pass-through.");
+            }
+            else
+                Logger.LogError($"[CameraHealth] frame={Time.frameCount} draw loop still stalled for {Time.frameCount - drawStallSince} frames with the mod's draw-path code in pass-through; the throw is in vanilla or another mod. Last Unity error: {lastUnityError}");
+        }
+
+        // ---- Hang watchdog ---------------------------------------------------
+        // A playtest ended in a hard freeze with nothing in the log. The main thread
+        // cannot report its own hang, so a background thread watches the frame
+        // counter and, after four seconds without progress, logs the last marker the
+        // main thread set. Markers name the mod code (or the vanilla call) that was
+        // running, so the next freeze says where it happened.
+        internal static volatile string HangMarker = "startup";
+        internal static volatile int WatchdogFrame;
+        private static System.Threading.Thread hangWatchdog;
+
+        internal static void StartHangWatchdog()
+        {
+            if (hangWatchdog != null) return;
+            hangWatchdog = new System.Threading.Thread(() =>
+            {
+                int lastFrame = -1, stalledSeconds = 0;
+                while (true)
+                {
+                    System.Threading.Thread.Sleep(1000);
+                    int frame = WatchdogFrame;
+                    if (frame == lastFrame)
+                    {
+                        stalledSeconds++;
+                        if (stalledSeconds == 4 || stalledSeconds == 30)
+                            sLogger?.LogWarning($"[Hang] main thread has not advanced past frame {frame} for {stalledSeconds} s; last marker={HangMarker}");
+                    }
+                    else
+                    {
+                        stalledSeconds = 0;
+                        lastFrame = frame;
+                    }
+                }
+            }) { IsBackground = true, Name = "SplitScreen hang watchdog" };
+            hangWatchdog.Start();
+        }
+
         // ---- Menu camera watchdog ---------------------------------------------
         // Two playtests ended on a black screen after Exit and after the death
         // screen. Outside a game session exactly one camera may draw: Futile's own
@@ -76,7 +191,52 @@ namespace SplitScreenCoop
             ProcessManager manager = rainworldGameObject?.processManager;
             MainLoopProcess process = manager?.currentMainLoop;
             if (process == null || process is RainWorldGame || fcameras[0] == null || Futile.screen?.renderTexture == null) return;
+            var corrections = RestoreMenuCameras(null);
+            bool switched = process != lastObservedProcess;
+            lastObservedProcess = process;
+            if (switched || (corrections.Count > 0 && Time.frameCount - lastMenuCorrectionLogFrame > 120))
+            {
+                lastMenuCorrectionLogFrame = Time.frameCount;
+                Logger.LogInfo($"[MenuCamera] frame={Time.frameCount} process={process.ID} corrections=[{string.Join("; ", corrections)}] cam0=(enabled={fcameras[0].enabled} mask={fcameras[0].cullingMask} target={fcameras[0].targetTexture?.name ?? "null"} isFutileCamera={Futile.instance?.camera == fcameras[0]}) stageLayer={Futile.stage?.layer} stageChildren={Futile.stage?.GetChildCount()} screenImage={(Futile.instance?._cameraImage?.texture == Futile.screen.renderTexture)} fadeToBlack={manager.fadeToBlack:0.00} blackDelay={manager.blackDelay:0.00}");
+                if (switched) LogStageChildren();
+            }
+        }
+
+        /// <summary>
+        /// The root stage held ~500 children after one session where a menu has 3.
+        /// Whatever is left there is drawn over every menu by camera 0. Name the
+        /// leftovers by type (and sprite element) so the next log says what leaks.
+        /// </summary>
+        private void LogStageChildren()
+        {
+            FStage stage = Futile.stage;
+            if (stage == null || stage.GetChildCount() <= 40) return;
+            var histogram = new Dictionary<string, int>();
+            for (int i = 0; i < stage.GetChildCount(); i++)
+            {
+                FNode child = stage.GetChildAt(i);
+                string name = child == null ? "null" : child.GetType().Name;
+                if (child is FSprite sprite) name += ":" + (sprite.element?.name ?? "?");
+                else if (child is FContainer container) name += "(" + container.GetChildCount() + ")";
+                int seen;
+                histogram.TryGetValue(name, out seen);
+                histogram[name] = seen + 1;
+            }
+            var lines = new List<string>(histogram.Count);
+            foreach (var entry in histogram) lines.Add(entry.Key + "x" + entry.Value);
+            lines.Sort();
+            Logger.LogInfo($"[MenuCamera] frame={Time.frameCount} stage children by type: {string.Join(", ", lines)}");
+        }
+
+        /// <summary>
+        /// Put the Unity cameras into the one configuration a menu can draw with:
+        /// camera 0 enabled, rendering Futile's screen texture with the root stage in
+        /// its mask, everything else off. Returns what had to change.
+        /// </summary>
+        internal List<string> RestoreMenuCameras(string reason)
+        {
             var corrections = new List<string>(4);
+            if (fcameras[0] == null || Futile.screen?.renderTexture == null) return corrections;
             if (!fcameras[0].enabled) { fcameras[0].enabled = true; corrections.Add("camera 0 was disabled"); }
             if (fcameras[0].targetTexture != Futile.screen.renderTexture)
             {
@@ -96,13 +256,9 @@ namespace SplitScreenCoop
                 if (hudCameras[i] != null && hudCameras[i].enabled) { hudCameras[i].enabled = false; corrections.Add($"HUD camera {i} was enabled"); }
             if (globalHudCamera != null && globalHudCamera.enabled) { globalHudCamera.enabled = false; corrections.Add("global HUD camera was enabled"); }
             if (dynamicCompositorCamera != null && dynamicCompositorCamera.enabled) { dynamicCompositorCamera.enabled = false; corrections.Add("compositor camera was enabled"); }
-            bool switched = process != lastObservedProcess;
-            lastObservedProcess = process;
-            if (switched || (corrections.Count > 0 && Time.frameCount - lastMenuCorrectionLogFrame > 120))
-            {
-                lastMenuCorrectionLogFrame = Time.frameCount;
-                Logger.LogInfo($"[MenuCamera] frame={Time.frameCount} process={process.ID} corrections=[{string.Join("; ", corrections)}] cam0=(enabled={fcameras[0].enabled} mask={fcameras[0].cullingMask} target={fcameras[0].targetTexture?.name ?? "null"} isFutileCamera={Futile.instance?.camera == fcameras[0]}) stageLayer={Futile.stage?.layer} stageChildren={Futile.stage?.GetChildCount()} screenImage={(Futile.instance?._cameraImage?.texture == Futile.screen.renderTexture)} fadeToBlack={manager.fadeToBlack:0.00} blackDelay={manager.blackDelay:0.00}");
-            }
+            if (reason != null && corrections.Count > 0)
+                Logger.LogInfo($"[MenuCamera] frame={Time.frameCount} restored for {reason}: [{string.Join("; ", corrections)}]");
+            return corrections;
         }
 
         private void ProcessManager_PostSwitchMainProcess(On.ProcessManager.orig_PostSwitchMainProcess orig, ProcessManager self, ProcessManager.ProcessID ID)
@@ -198,6 +354,7 @@ namespace SplitScreenCoop
         {
             if (game?.cameras == null || Time.frameCount - lastCameraHealthScanFrame < CameraHealthScanInterval) return;
             lastCameraHealthScanFrame = Time.frameCount;
+            DetectDrawStall(game);
             LogCameraSnapshot(game, "state change", false);
             if (Time.frameCount - lastCameraHeartbeatFrame >= 600)
             {

@@ -20,10 +20,11 @@ internal static class Program
         // rooms: solid regardless of distance.
         var far = Settle(new SplitLayoutSolver(), P(0, -1000f, 0f, 1, 7), P(1, 1000f, 0f, 2, 7));
         Check(far.dividers.Length == 1 && far.dividers[0].alpha == 1f, "Far apart in one room should draw a solid line");
-        var mid = Settle(new SplitLayoutSolver(), P(0, -500f, 0f, 1, 7), P(1, 500f, 0f, 2, 7));
+        float half = (Settings.mergeDistance + Settings.blendWidth * 0.4f) / 2f;
+        var mid = Settle(new SplitLayoutSolver(), P(0, -half, 0f, 1, 7), P(1, half, 0f, 2, 7));
         Check(mid.dividers.Length == 1 && mid.dividers[0].alpha > 0.05f && mid.dividers[0].alpha < 0.95f,
             "Inside the merge band the line should be partly faded: " + mid.dividers[0].alpha);
-        var near = Settle(new SplitLayoutSolver(), P(0, -300f, 0f, 1, 7), P(1, 300f, 0f, 2, 7));
+        var near = Settle(new SplitLayoutSolver(), P(0, -250f, 0f, 1, 7), P(1, 250f, 0f, 2, 7));
         Check(near.dividers.Length == 1 && near.dividers[0].alpha < 0.01f,
             "Close together in one room the line should be gone even on different screens: " + near.dividers[0].alpha);
         Check(near.viewports[0].splitAmount == 1f, "Different screens must still keep separate images");
@@ -385,8 +386,9 @@ internal static class Program
         Check(largestZoomChange < 0.06f, "Zoom jumped during continuous join/leave: " + largestZoomChange);
         Check(largestCellChange < 0.001f, "Cells moved during a same-screen join/leave: " + largestCellChange);
         // The merge glides over about half a second, so give it that after the sweep.
+        float rest = (Settings.mergeDistance - 80f) / 2f;
         for (int frame = 0; frame < 60; frame++)
-            previous = solver.Solve(new[] { P(0, -385f, 0f), P(1, 385f, 0f) }, 1f / 60f, Settings);
+            previous = solver.Solve(new[] { P(0, -rest, 0f), P(1, rest, 0f) }, 1f / 60f, Settings);
         Check(previous.viewports[0].imageBlend < 0.1f, "Images did not blend back on return");
     }
 
@@ -520,6 +522,26 @@ internal static class Program
         Check(largestStep < 0.06f, "Cell jumped during the slide: " + largestStep);
     }
 
+    private static void SeparateRoomsHold()
+    {
+        // Three players in three rooms: map positions may swing however they like,
+        // the layout keeps its shape. Once they share a room it re-decides.
+        var solver = new SplitLayoutSolver();
+        var before = Settle(solver, P(0, -1500f, 0f, 1, 1), P(1, 400f, 300f, 2, 2), P(2, 500f, -300f, 3, 3));
+        var afterMove = Settle(solver, P(0, 1500f, 0f, 1, 1), P(1, -400f, -300f, 2, 2), P(2, -500f, 300f, 3, 3));
+        for (int i = 0; i < 3; i++)
+            Check((before.viewports[i].centroid - afterMove.viewports[i].centroid).magnitude < 1e-4f,
+                "Players in separate rooms were rearranged by map position: cam " + before.viewports[i].cameraNumber +
+                " " + before.viewports[i].centroid + " -> " + afterMove.viewports[i].centroid);
+        bool restructured = false;
+        for (int frame = 0; frame < 180; frame++)
+        {
+            var layout = solver.Solve(new[] { P(0, 1500f, 0f, 1, 9), P(1, -400f, -300f, 2, 9), P(2, -500f, 300f, 3, 9) }, 1f / 60f, Settings);
+            if (layout.restructured) restructured = true;
+        }
+        Check(restructured, "Players who pipe into one room were not rearranged");
+    }
+
     private static Vector2 Bounds1(Vector2[] polygon)
     {
         Vector2 min, max;
@@ -563,6 +585,7 @@ internal static class Program
             SameScreenLineRotates();
             DividerFadesWithDistance();
             SlideTransition();
+            SeparateRoomsHold();
             ScreenArrivalGlides();
             Direction(800f, 0f, true);
             Direction(-800f, 0f, true);
