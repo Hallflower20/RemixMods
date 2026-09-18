@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using RWCustom;
 using UnityEngine;
@@ -11,6 +12,66 @@ namespace SplitScreenCoop
         private sealed class WatcherCameraOwner
         {
             public RoomCamera camera;
+        }
+
+        /// <summary>
+        /// Where a mask source's GameObject must sit for each camera. Mask sources
+        /// (Watcher foliage and other dynamic level elements, grass, ripples, warp
+        /// tears, urban shadows) are Unity meshes, not Futile sprites: one GameObject
+        /// per object, however many cameras show it. A camera renders them, a
+        /// full-screen grab quad captures them into _DynamicLevelElements (or the
+        /// ripple/shadow grab), and that camera's level combiner composites the grab
+        /// into its _LevelTex. Vanilla positions the meshes once per frame from
+        /// cameras[0]; with several cameras the last RoomCamera.DrawUpdate won, so at
+        /// most one camera ever had the meshes in view and every other camera's
+        /// combiner worked from a stale or black grab - foliage kept its shape but lost
+        /// its colour on cameras 1-3. Each camera's DrawUpdate now records the
+        /// transform it wants and <see cref="PlaceMaskSourcesFor"/> applies it, with
+        /// that camera's world layer, right before the camera culls.
+        /// </summary>
+        private sealed class MaskPlacement
+        {
+            public readonly Vector3[] position = new Vector3[4];
+            public readonly Quaternion[] rotation = new Quaternion[4];
+            public readonly Vector3[] scale = new Vector3[4];
+            public readonly int[] frame = { -1, -1, -1, -1 };
+            /// <summary>Last frame any camera drew the source; a camera's placement is current while it matches.</summary>
+            public int lastFrame = -1;
+        }
+
+        private static readonly ConditionalWeakTable<Watcher.MaskSource, MaskPlacement> maskPlacements = new();
+        private static readonly List<Watcher.MaskSource> placedMaskSources = new();
+
+        /// <summary>
+        /// Called from <see cref="CameraListener.OnPreCull"/> of camera
+        /// <paramref name="cameraNumber"/>. Meshes this camera drew this frame get its
+        /// transform and its isolated world layer; meshes it did not draw are hidden
+        /// for its pass (they belong to rooms it does not show). Sources nobody has
+        /// placed yet are left alone.
+        /// </summary>
+        internal static void PlaceMaskSourcesFor(int cameraNumber)
+        {
+            if (cameraNumber < 0 || cameraNumber >= 4 || placedMaskSources.Count == 0) return;
+            bool isolate = dynamicActive && worldLayers[cameraNumber] > 0;
+            for (int i = placedMaskSources.Count - 1; i >= 0; i--)
+            {
+                Watcher.MaskSource source = placedMaskSources[i];
+                MaskPlacement placement;
+                if (source == null || source.beingDeleted || source.obj == null ||
+                    !maskPlacements.TryGetValue(source, out placement))
+                {
+                    placedMaskSources.RemoveAt(i);
+                    continue;
+                }
+                bool shown = placement.frame[cameraNumber] == placement.lastFrame;
+                if (source.meshRenderer != null) source.meshRenderer.enabled = shown;
+                if (!shown) continue;
+                Transform transform = source.obj.transform;
+                transform.localPosition = placement.position[cameraNumber];
+                transform.localRotation = placement.rotation[cameraNumber];
+                transform.localScale = placement.scale[cameraNumber];
+                if (isolate) source.obj.layer = worldLayers[cameraNumber];
+            }
         }
 
         private static readonly ConditionalWeakTable<Watcher.LevelTexCombiner, WatcherCameraOwner> levelCombinerOwners = new();
@@ -294,8 +355,24 @@ namespace SplitScreenCoop
             float timeStacker, RoomCamera rCam, Vector2 camPos)
         {
             orig(self, timeStacker, rCam, camPos);
-            if (self.obj != null && rCam != null && rCam.cameraNumber >= 0 && rCam.cameraNumber < camOffsets.Length)
-                self.obj.transform.localPosition += (Vector3)camOffsets[rCam.cameraNumber];
+            if (self.obj == null || rCam == null || rCam.cameraNumber < 0 || rCam.cameraNumber >= camOffsets.Length) return;
+            int number = rCam.cameraNumber;
+            Transform transform = self.obj.transform;
+            transform.localPosition += (Vector3)camOffsets[number];
+            // Remember this camera's transform; PlaceMaskSourcesFor re-applies it when
+            // this camera is about to render, whichever camera drew last.
+            MaskPlacement placement;
+            if (!maskPlacements.TryGetValue(self, out placement))
+            {
+                placement = new MaskPlacement();
+                maskPlacements.Add(self, placement);
+                placedMaskSources.Add(self);
+            }
+            placement.position[number] = transform.localPosition;
+            placement.rotation[number] = transform.localRotation;
+            placement.scale[number] = transform.localScale;
+            placement.frame[number] = Time.frameCount;
+            placement.lastFrame = Time.frameCount;
         }
 
         private void RippleFlow_Update(On.Watcher.FloatingDebris.RippleFlow.orig_Update orig,
@@ -343,6 +420,7 @@ namespace SplitScreenCoop
         private static void DisposeWatcherMasks()
         {
             if (Watcher.MaskMaker.isInstanced) Watcher.MaskMaker.maskMaker.Dispose();
+            placedMaskSources.Clear();
         }
     }
 }

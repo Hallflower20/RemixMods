@@ -45,6 +45,7 @@ namespace SplitScreenCoop
 
 
             public bool _direct = true;
+            public bool dynamicCompositing;
             /// <summary>
             /// bypass intermediate rendertexture and blit
             /// </summary>
@@ -72,7 +73,7 @@ namespace SplitScreenCoop
             public void Retarget()
             {
                 if (fcamera == null || display == null) return;
-                fcamera.targetTexture = _direct ? display.Extras().renderTexture : this.renderTexture;
+                fcamera.targetTexture = _direct && !dynamicCompositing ? display.Extras().renderTexture : this.renderTexture;
             }
 
 
@@ -96,6 +97,10 @@ namespace SplitScreenCoop
                 if (reinitDisplay) display.Extras().ReinitRenderTexture();
                 renderTexture = new RenderTexture(Futile.screen.renderTexture);
                 renderTexture.name = $"SplitScreen camera {Array.IndexOf(cameraListeners, this)}";
+                if (dynamicStyle && Options != null)
+                    renderTexture.filterMode = Options.ZoomedFilter.Value == "Point"
+                        ? FilterMode.Point : FilterMode.Bilinear;
+                renderTexture.wrapMode = TextureWrapMode.Clamp;
                 renderTexture.Create();
                 SetMap(this.sourceRect, this.targetRect);
                 Retarget();
@@ -188,6 +193,15 @@ namespace SplitScreenCoop
                 }
             }
 
+            /// <summary>
+            /// Before this camera culls: Watcher mask meshes are shared between the
+            /// cameras, so put each one where this camera's DrawUpdate asked for it.
+            /// </summary>
+            public void OnPreCull()
+            {
+                PlaceMaskSourcesFor(Array.IndexOf(cameraListeners, this));
+            }
+
             private static void SetKeyword(string keyword, bool enabled)
             {
                 if (enabled) Shader.EnableKeyword(keyword);
@@ -200,6 +214,7 @@ namespace SplitScreenCoop
             public void OnPostRender()
             {
                 lastPostRenderFrame = Time.frameCount;
+                if (dynamicCompositing) return; // The final compositor camera draws all polygons after split cameras render.
                 if (!_direct)
                 {
                     RenderTexture destination = display.Extras().renderTexture;
