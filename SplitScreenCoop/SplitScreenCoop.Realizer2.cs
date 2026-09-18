@@ -72,10 +72,36 @@ namespace SplitScreenCoop
             realizer2 = null;
             orig(self, warpUsed);
             if (rebuild || self.game?.session?.Players?.Count > 1) MakeRealizer2(self.game);
+            ClearStaleWorldCameras(self.game);
             EnsureStableCameraAssignments(self.game);
             RefreshActiveCameraRendering(self.game, "world loaded");
             LogCameraSnapshot(self.game, "world loaded", true);
             ConsiderColapsing(self.game, true);
+        }
+
+        /// <summary>
+        /// One player through a gate unloads the old world for everybody, but the
+        /// cameras of the players left behind keep their room and every sprite
+        /// leaser of it. Nothing draws those leasers usefully again, and the ones
+        /// holding Unity objects (rot spore renderers, mask meshes) turn into
+        /// per-frame exceptions once the objects are destroyed. Clean them the way
+        /// ChangeRoom would; the camera is re-populated when its player is moved.
+        /// </summary>
+        private void ClearStaleWorldCameras(RainWorldGame game)
+        {
+            if (game?.cameras == null || game.world == null) return;
+            foreach (RoomCamera camera in game.cameras)
+            {
+                if (camera?.room == null || camera.room.world == game.world || camera.spriteLeasers == null) continue;
+                int count = camera.spriteLeasers.Count;
+                for (int i = 0; i < count; i++)
+                {
+                    try { camera.spriteLeasers[i].CleanSpritesAndRemove(); }
+                    catch (Exception error) { LogHookError("ClearStaleWorldCameras", error); }
+                }
+                camera.spriteLeasers.Clear();
+                Logger.LogInfo($"[CameraMove] frame={Time.frameCount} cam={camera.cameraNumber} cleared {count} sprite leasers left in unloaded world {camera.room.world.name}/{camera.room.abstractRoom?.name}");
+            }
         }
 
         /// <summary>

@@ -40,7 +40,7 @@ namespace SplitScreenCoop
         private readonly FStage[] hudStages = new FStage[4];
         private readonly FStage[] worldStages = new FStage[4];
         private readonly FContainer[] worldNameContainers = new FContainer[4];
-        private readonly int[] worldLayers = new int[4];
+        private static readonly int[] worldLayers = new int[4];
         private static readonly FieldInfo PlayerNameLabelField =
             typeof(JollyCoop.JollyHUD.JollyPlayerSpecificHud.JollyPlayerArrow)
                 .GetField("label", BindingFlags.Instance | BindingFlags.NonPublic);

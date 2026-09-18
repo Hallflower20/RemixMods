@@ -33,7 +33,7 @@ csc.exe /nologo /target:exe /out:Tests.exe SplitLayoutSolver.cs Tests\UnityMathS
 
 | File | Owns |
 |---|---|
-| `SplitLayoutSolver.cs` | Pure layout maths: rectangle tree, joins, slides, pans. No Unity. |
+| `SplitLayoutSolver.cs` | Pure layout maths: fixed-slot rectangles by camera number, joins, slides, pans. No Unity. Positions never move a cell; only merges/parts/deaths restructure. |
 | `SplitScreenCoop.Dynamic.cs` | Per-tick layout inputs, base camera choice, uv-shift pans, GL compositor, divider alpha, HUD routing |
 | `SplitScreenCoop.cs` | Hook registration, split modes, game Update/GrafUpdate/ShutDown hooks, classic HUD offsets |
 | `SplitScreenCoop.CameraDiagnostics.cs` | All logging tags, hang watchdog, Unity log capture, draw-stall detection, menu camera restore |
@@ -51,8 +51,10 @@ csc.exe /nologo /target:exe /out:Tests.exe SplitLayoutSolver.cs Tests\UnityMathS
 - **Every camera renders one prebaked 1400x800 screen.** All "following" is uv panning of
   that image; a cell cannot show more than its screen. See the uv-shift model in HANDOFF.
 - **No alpha blending between camera images.** The user rejected crossfades. Merges are
-  geometric: same image, pans converge, the divider line fades. Rotation of the two-player
-  divider goes through the screen centre. Nothing may snap.
+  geometric: same image, pans converge, the divider line fades. Nothing may snap.
+- **Cells never move with the players.** Slots are fixed by camera number; only a merge,
+  a part, an arrival or a death restructures (as a slide). The users rejected the earlier
+  position-driven layout (rotating divider, side swaps) as "constantly shifting around".
 - **Vanilla assumes one camera.** Any `IDrawable` that keeps Unity objects per room object
   instead of per sprite leaser breaks when a second camera enters its room (rot spores,
   ripples, level combiner already fixed). A black screen with audio means something threw

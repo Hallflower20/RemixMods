@@ -183,6 +183,26 @@ namespace SplitScreenCoop
             }
         }
 
+        /// <summary>
+        /// Every RoomCamera runs DrawSprites for every drawable in its room each
+        /// rendered frame, whether or not its Unity camera is on. Three players in
+        /// one room were three full passes over every object per frame, two of them
+        /// drawing into textures nobody displays (rot spores even dispatch their
+        /// particle compute per pass). Skip the object draw for cameras that are not
+        /// rendering. The camera's own DrawUpdate, its HUD, shader capture and leaser
+        /// bookkeeping (deleteMeNextFrame is set elsewhere) still run, and a camera
+        /// that starts rendering gets its DrawSprites before the render in the same
+        /// frame: rendered cameras are decided in the tick, before GrafUpdate.
+        /// </summary>
+        public void SpriteLeaser_Update(On.RoomCamera.SpriteLeaser.orig_Update orig, RoomCamera.SpriteLeaser self,
+            float timeStacker, RoomCamera rCam, Vector2 camPos)
+        {
+            if (!drawPathSafeMode && !dualDisplays && rCam != null && rCam.game?.cameras?.Length > 1 &&
+                renderedCameraNumbers.Count > 0 && !renderedCameraNumbers.Contains(rCam.cameraNumber))
+                return;
+            orig(self, timeStacker, rCam, camPos);
+        }
+
         public void RoomCamera_Update(On.RoomCamera.orig_Update orig, RoomCamera self)
         {
             var prev = curCamera;

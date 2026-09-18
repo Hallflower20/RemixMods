@@ -142,34 +142,40 @@ hint text), and — via the culling mask — Futile's root stage.
 
 ### Layout: rectangles, decided by a small tree
 
-`SplitLayoutSolver` builds a guillotine partition of the screen:
+`SplitLayoutSolver` builds a guillotine partition of the screen from **fixed slots**.
+World positions play no part in where a cell sits (they only decide merging, see below,
+and the pan inside a cell). Items — a single player or a merged group — are ordered by
+their lowest camera number:
 
-- **Two groups** (`SplitTwoRotating`): one straight line through the screen centre. Its
-  normal's angle is damped (`dividerTurnSeconds`, 0.3 s) towards a target: while both
-  players share a prebaked screen the target is perpendicular to the players' on-screen
-  direction, so the line turns continuously with them; on different screens it is the
-  nearest axis (side by side or stacked, chosen by the score below with the usual dead
-  zone and hold time). Axis flips and side swaps are therefore rotations, never cuts.
-  A line through the centre halves the screen exactly; a dying player's weight slides
-  the cut off-centre (`CutForArea`). The diagonal cells this produces have little pan,
-  but they only occur while both players are on one screen, where both cells draw the
-  same picture, so a player can never be hidden by the line.
-  Axis score = how much of the separation lies along that axis + 0.75 × how square the
-  resulting cells are (in screen-height units, so the 16:9 screen strongly prefers
-  columns unless the players are clearly above one another).
-- **Three groups**: peel one off (the most isolated, by gap to its neighbour along an
-  axis), weighed against the *largest* remaining group, not their sum. Three players give
-  one half and two quarters; a pair sharing an image beside a single player gives the
-  pair two thirds. The remainder recurses.
-- **Four groups**: always two against two, then each pair splits → a 2×2 grid.
-- Cells narrower or shorter than 0.3 of the screen carry a heavy score penalty.
+- **Two items**: side by side, first item left (stacked, first on top, only inside a
+  box that is taller than wide on screen, i.e. a pair tiling a half-width column).
+  The cut follows the weights: two singles are halves, a pair beside a single owns two
+  thirds.
+- **Three items**: the item with the most members (a merged pair) takes the top half;
+  with three singles camera 0 does. The other two take the bottom, left to right by
+  number. The top item is weighed against the *largest* of the others, so three
+  players give one half and two quarters.
+- **Four items**: a 2×2 grid, cameras 0 1 / 2 3.
 
-Hysteresis lives in `NodeMemory`, keyed by the bitmask of cameras in the node: a node
-keeps its axis, its side order and its split-off choice unless the alternative wins by
-`SwitchMargin` (0.25) *and* `layoutHoldSeconds` (0.75 s) have passed; side swaps also
-need `directionDeadZone` (160 world px). Cut fractions are `SmoothDamp`ed so a dying
-player's cell slides shut and a pair merging beside a third player slides from a half to
-two thirds.
+This replaced (2026-09-16) a position-driven tree: a two-player divider that rotated
+continuously with the players' on-screen direction, side swaps and axis flips with
+dead zones and hold times, and a three-player "peel off the most isolated player"
+choice. The players' verdict was that the screens "constantly shift around depending
+on positions" and that only two things should ever change the screen: a split when
+two players get far enough apart and a merge when they get close. Every dead zone,
+hold time and score is gone with it (`directionDeadZone`, `layoutHoldSeconds`,
+`dividerTurnSeconds`, `SwitchMargin`, `ChooseAxis`, `ChooseSplitOff`,
+`SplitTwoRotating`, `CutForArea`, `Clip`); `Tests/Program.cs` `PositionsNeverRestructure`
+pins the new contract: any motion, including crossing sides, circling and changing
+rooms, leaves every rectangle exactly where it was and never sets `restructured`.
+
+`NodeMemory` (keyed by the bitmask of cameras in the node) now only holds the damped
+cut fraction and the `layoutKey` (the item masks in slot order). While the key is
+unchanged the cut `SmoothDamp`s with the live weights, so a dying player's cell slides
+shut; when the key changes the cut snaps to its target and the slide below is the only
+animation. (Damping across a key change was tried first: the third player's cell then
+passed through a half on its way from a quarter to a third because the old fraction
+belonged to a cut on the other axis.)
 
 **Nothing fades.** Merging is geometric, like a LEGO split screen. Two players on one
 prebaked screen share a base camera (`baseCameraNumbers`), every cell draws that
@@ -193,14 +199,15 @@ to the other camera, then swipes". Once sharing (`lastBaseByCamera`), a cell kee
 sharing while its player stays visible on the base screen, so a camera switching screens
 at the edge does not break a merged view apart prematurely.
 
-Structural changes with three or four cells (a different player peeled off, an axis
-flip inside the tree) are animated, never cut. The solver compares each live cell's
-target rectangle with the previous tick's; a jump over `SnapThreshold` starts a
-**slide** of `transitionSeconds` (0.45 s): each cell's `polygon` interpolates from its
-previous rectangle to `targetPolygon`; `Layout.sliding` is true meanwhile. Sliding
-rectangles overlap and leave gaps, so the compositor first draws every `targetPolygon`
-(the resting layout) and then the sliding `polygon`s over it, all opaque. Two-cell
-layouts never slide; their single line is damped continuously (see above).
+Structural changes with three or four cells (a pair joining or parting, a player
+arriving or a dead player's cell being removed) are animated, never cut: the tick the
+layout key of any node changes starts a **slide** of `transitionSeconds` (0.45 s): each
+cell's `polygon` interpolates from its previous rectangle to `targetPolygon`;
+`Layout.sliding` is true meanwhile and `Layout.restructured` on the first tick (logged
+as `[CameraLayout] … restructured`). Sliding rectangles overlap and leave gaps, so the
+compositor first draws every `targetPolygon` (the resting layout) and then the sliding
+`polygon`s over it, all opaque. Two-cell layouts never slide: two players joining or
+parting keeps both rectangles where they are, only the pans and the line change.
 
 **Divider opacity is how far apart the two views are, damped.** `DividerTargetAlpha` in
 `Dynamic.cs` computes where each cell's image sits in world pixels (base camera position,
@@ -576,6 +583,57 @@ circles with them.
 
 ---
 
+### Fixed slots and mask meshes (2026-09-16)
+
+- Layout: see §3 "fixed slots". Position-driven rotation/side swaps removed at the
+  players' request.
+- **Foliage lost its colour on cameras 1–3.** Watcher `DynamicLevelElement`, `Grass`,
+  ripples, warp tears and urban shadows are `MaskSource` Unity meshes (`MaskMaker`
+  singleton), not Futile sprites. The pipeline per camera is: camera renders the meshes
+  (opaque queue) → a full-screen grab quad (the `MaskLayer` base node) captures them
+  into `_DynamicLevelElements` (or the ripple/shadow grab) → that camera's
+  `LevelTexCombiner` command buffer (`DynamicLevelElementCombiner`, AfterForwardOpaque,
+  attached to `fcameras[owner]` by `LevelTexCombiner_CreateBuffer`) composites the grab
+  into its `_LevelTex`. But there is one GameObject per element, positioned by whichever
+  `RoomCamera.DrawUpdate` ran last (`MaskSource.DrawUpdate` subtracts that camera's
+  `camPos`), so only one camera ever had the meshes in view; the others combined a stale
+  or black grab and the foliage rendered with the wrong data. Fix: `MaskSource_DrawUpdate`
+  records each camera's wanted transform in `maskPlacements`, and
+  `CameraListener.OnPreCull` → `PlaceMaskSourcesFor(n)` applies camera n's transform and
+  `worldLayers[n]` (and disables the renderer for meshes camera n did not draw this
+  frame) right before camera n culls. `OnPreCull`, not `OnPreRender`: Unity culls
+  between the two, so transforms changed in `OnPreRender` are not honoured.
+  Unverified in game: whether Unity's named `GrabPass` grabs once per *camera* (needed)
+  or once per *frame*; ripple masks already relied on the former.
+- **Sleep lockout / "went to an old camera" (seventh playtest log).** Chain: player 1
+  took GATE_LF_SU alone; the SU world unloaded (`SentientRotSpores.RoomUnloaded → Destroy`
+  destroyed the per-camera renderer GameObjects) while cameras 1 and 2 still pointed at
+  SU rooms with all their sprite leasers. Their `FGameObjectNode`s now wrapped destroyed
+  objects: `Futile.LateUpdate` threw NRE twice per frame for 10k frames (`[UnityLog]
+  GetComponent[T]`). At the shelter, `RainWorldGame_ShutDownProcess` → `RestoreClassicWorld`
+  re-parented those layers → `FGameObjectNode.HandleRemovedFromStage` touched the dead
+  object → NRE out of the hook → `ProcessManager.PreSwitchMainProcess` aborted *before*
+  `currentMainLoop = null`. Next frame it retried: the pre-orig part passed, vanilla
+  `ClearAllSprites` hit the same node → NRE out of `orig`. From then on the half-shut-down
+  game stayed current and `RoomCamera.Update → HUD.Update → JollyMeter.Update` threw every
+  frame (`currentMainLoop as RainWorldGame` was fine; the HUD was cleared), so
+  `ProcessManager.Update` never reached the switch again. Both throws were invisible
+  because the `[UnityLog]` mirror bucketed every NRE by message. Fixes: nodes are removed
+  from their containers in `SentientRotSpores_Destroy` before destruction and rebuilt if
+  found dead in `DrawSprites`; `ClearStaleWorldCameras` (WorldLoaded) cleans the leasers
+  of any camera whose room is in a world other than `game.world`; the shutdown hook wraps
+  pre/orig/post in their own try/catch (a broken shutdown beats a permanent lockout);
+  the mirror keys on message + top two frames. Log lines to expect next time:
+  `[CameraMove] … cleared N sprite leasers left in unloaded world …` at a gate, and no
+  `[UnityLog]` at all.
+- **Stutter with three players.** The log's 46 `[FrameHitch]` lines are 50–100 ms with
+  `gcCollections=0` and no room events, clustered while all three were merged in one room
+  (HI_B04W): steady per-frame cost, not loads. Every RoomCamera ran DrawSprites over every
+  drawable per frame even with its Unity camera off. `SpriteLeaser_Update` now skips the
+  object draw for cameras not in `renderedCameraNumbers` (HUD, shader capture and leaser
+  deletion are unaffected). Not yet measured; the realizer budget (1500 + 750 per extra
+  player) is the other suspect if hitches persist with players in different rooms.
+
 ## 6. Open / unverified
 
 Ordered by confidence that something is still wrong or unknown.
@@ -597,14 +655,14 @@ Ordered by confidence that something is still wrong or unknown.
    Also note `IsCreatureDead` treats a *living* player whose realized creature is slated
    for deletion as dead; the last log shows camera 1 flip dead→alive→dead near the end,
    so a living-but-abstracted player can drop out of the layout.
-4. **Transition feel.** `transitionSeconds` (0.45), `SnapThreshold` (0.04) and the
-   hysteresis constants are untuned. A side swap rotates 180°, which is the old
-   "dynamic" look; if that reads as too much motion, shorten it or dissolve instead.
-5. **Rectangle layout feel.** Hysteresis margins (`SwitchMargin` 0.35, `layoutHoldSeconds`
-   2 s, `directionDeadZone`) and the 0.75 squareness weight are guesses tuned once from a
-   three-player complaint. Two-player stacking needs roughly 2.6× more vertical than
-   horizontal separation. Count `restructured` lines in the next log: more than one every
-   few seconds with three players standing still means the hold is still too short.
+4. **Transition feel.** `transitionSeconds` (0.45) is untuned for the fixed-slot
+   slides (a pair forming beside a third player, a death). There is no rotation or
+   side swap any more.
+5. **Fixed slots in play.** Since 2026-09-16 the layout only restructures on a merge,
+   a part, an arrival or a removal, so every `[CameraLayout] … restructured` line in
+   the next log should coincide with one of those; any other one is a bug in the
+   grouping inputs (screen keys), not in the solver. Whether players miss the old
+   world-direction ordering (camera 0 is always left/top now) is for the playtest.
 5b. **The freeze.** Unexplained. The next log will carry a `[Hang]` line naming the last
    marker; if the marker is `RainWorldGame.Update(orig)` look at realizer/shortcut
    interplay (three cameras, two in pipes to the same room, one `realizedRoom=null`), not

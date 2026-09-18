@@ -193,6 +193,15 @@ namespace SplitScreenCoop
                 }
             }
 
+            /// <summary>
+            /// Before this camera culls: Watcher mask meshes are shared between the
+            /// cameras, so put each one where this camera's DrawUpdate asked for it.
+            /// </summary>
+            public void OnPreCull()
+            {
+                PlaceMaskSourcesFor(Array.IndexOf(cameraListeners, this));
+            }
+
             private static void SetKeyword(string keyword, bool enabled)
             {
                 if (enabled) Shader.EnableKeyword(keyword);

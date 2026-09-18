@@ -220,6 +220,7 @@ namespace SplitScreenCoop
                 // Shader shenanigans
                 // wrapped calls to store shader globals
                 On.RoomCamera.DrawUpdate += RoomCamera_DrawUpdate;
+                On.RoomCamera.SpriteLeaser.Update += SpriteLeaser_Update; // no DrawSprites for cameras that do not render
                 On.RoomCamera.Update += RoomCamera_Update;
                 On.RoomCamera.MoveCamera_int += RoomCamera_MoveCamera_int;
                 On.RoomCamera.MoveCamera_Room_int += RoomCamera_MoveCamera_Room_int; // can also colapse to single cam if one of the cams is dead
@@ -652,27 +653,42 @@ namespace SplitScreenCoop
         public void RainWorldGame_ShutDownProcess(On.RainWorldGame.orig_ShutDownProcess orig, RainWorldGame self)
         {
             Logger.LogInfo("RainWorldGame_ShutDownProcess cleanups");
-            if ((dynamicActive || dynamicStyle) && !dualDisplays && self.cameras?.Length > 1)
+            // Nothing in here may throw past this method. ProcessManager calls
+            // ShutDownProcess from PreSwitchMainProcess and only clears
+            // currentMainLoop afterwards; an exception leaves the half-shut-down
+            // game as the current process, updated every frame with its HUD and
+            // rooms gone (JollyMeter.Update throws each frame), and the sleep or
+            // death screen never arrives. That was the seventh playtest's lockout.
+            try
             {
-                RestoreClassicWorld(self);
-                RestoreClassicHud(self);
+                if ((dynamicActive || dynamicStyle) && !dualDisplays && self.cameras?.Length > 1)
+                {
+                    RestoreClassicWorld(self);
+                    RestoreClassicHud(self);
+                }
+                ResetDynamicLayout();
+                SetSplitMode(SplitMode.NoSplit, self, "game shutdown");
+                if (dualDisplays && DualDisplaySupported())
+                {
+                    cameraListeners[1].mirrorMain = true;
+                }
+                realizer2 = null;
+                additionalRealizers.Clear();
+                ForgetLevelTextures();
             }
-            ResetDynamicLayout();
-            SetSplitMode(SplitMode.NoSplit, self, "game shutdown");
-            if (dualDisplays && DualDisplaySupported())
+            catch (Exception error) { LogHookError("RainWorldGame_ShutDownProcess.pre", error); }
+            try { orig(self); }
+            catch (Exception error) { LogHookError("RainWorldGame_ShutDownProcess.orig", error); }
+            try
             {
-                cameraListeners[1].mirrorMain = true;
+                DisposeWatcherMasks();
+                // Leave the cameras the way a menu needs them instead of relying on the
+                // watchdog to notice one frame later: SetSplitMode above just enabled
+                // whichever camera still had a living player and pointed camera 0 at its
+                // split texture.
+                RestoreMenuCameras("game shutdown");
             }
-            realizer2 = null;
-            additionalRealizers.Clear();
-            ForgetLevelTextures();
-            orig(self);
-            DisposeWatcherMasks();
-            // Leave the cameras the way a menu needs them instead of relying on the
-            // watchdog to notice one frame later: SetSplitMode above just enabled
-            // whichever camera still had a living player and pointed camera 0 at its
-            // split texture.
-            RestoreMenuCameras("game shutdown");
+            catch (Exception error) { LogHookError("RainWorldGame_ShutDownProcess.post", error); }
         }
 
         struct RoomTarget : IEquatable<RoomTarget>

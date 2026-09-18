@@ -121,7 +121,8 @@ namespace SplitScreenCoop
             // moved, or a destroyed GameObject), never let GetChildAt(0) throw
             // inside the draw loop: rebuild this camera's renderer first.
             if (sLeaser.containers == null || sLeaser.containers.Length == 0 || sLeaser.containers[0] == null ||
-                sLeaser.containers[0].GetChildCount() == 0)
+                sLeaser.containers[0].GetChildCount() == 0 ||
+                (sLeaser.containers[0].GetChildAt(0) is FGameObjectNode stale && !stale.gameObject))
             {
                 if (!InitiateRotSporeRenderer(self, sLeaser, rCam)) return;
             }
@@ -133,8 +134,21 @@ namespace SplitScreenCoop
             orig(self);
             RotSporeRenderers state;
             if (!rotSporeRenderers.TryGetValue(self, out state)) return;
+            // Take each node out of its camera's container *before* the GameObject
+            // dies. A camera whose player did not come through a gate keeps its
+            // sprite leasers for the unloaded world, and Futile keeps updating the
+            // node: with the GameObject already destroyed that is a
+            // NullReferenceException in Futile.LateUpdate every frame, and later the
+            // same throw from RestoreClassicWorld/ClearAllSprites re-parenting the
+            // layer aborts the process switch at the shelter (seventh playtest: the
+            // sleep screen never came and the dead game was updated forever).
             foreach (FGameObjectNode node in state.nodes.Values)
-                if (node != null && node.gameObject) UnityEngine.Object.Destroy(node.gameObject);
+            {
+                if (node == null) continue;
+                try { node.RemoveFromContainer(); }
+                catch (Exception error) { LogHookError("SentientRotSpores_Destroy.remove", error); }
+                if (node.gameObject) UnityEngine.Object.Destroy(node.gameObject);
+            }
             state.nodes.Clear();
             if (state.mesh != null) UnityEngine.Object.Destroy(state.mesh);
             state.mesh = null;

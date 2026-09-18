@@ -83,7 +83,17 @@ namespace SplitScreenCoop
         private static void OnUnityLogMessage(string condition, string stackTrace, LogType type)
         {
             if (type != LogType.Exception && type != LogType.Error && type != LogType.Assert) return;
+            // Key on the message plus the top two frames. Keyed on the message alone,
+            // every "NullReferenceException" from anywhere shared one bucket, printed
+            // with the first stack seen, and the throw that mattered (the shutdown
+            // one behind the sleep lockout) was never shown.
             string key = condition ?? "";
+            if (!string.IsNullOrEmpty(stackTrace))
+            {
+                int first = stackTrace.IndexOf('\n');
+                int second = first < 0 ? -1 : stackTrace.IndexOf('\n', first + 1);
+                key += "|" + (second < 0 ? stackTrace : stackTrace.Substring(0, second)).Trim();
+            }
             int count;
             unityErrorCounts.TryGetValue(key, out count);
             unityErrorCounts[key] = ++count;

@@ -128,20 +128,156 @@ internal static class Program
         }
     }
 
-    private static void Direction(float x, float y, bool expectColumns)
+    private static Vector2 CellMin(SplitLayoutSolver.ViewportState view)
     {
-        var layout = Settle(new SplitLayoutSolver(), P(0, -x, -y, 1), P(1, x, y, 2));
-        Tiling(layout, "direction");
-        Vector2 difference = layout.viewports[1].centroid - layout.viewports[0].centroid;
-        Check(Vector2.Dot(difference, new Vector2(x, y * Settings.screenAspect)) > 0f,
-            "Two-player region did not follow world direction " + x + ", " + y);
         Vector2 min, max;
-        Bounds(layout.viewports[0].polygon, out min, out max);
-        bool columns = max.y - min.y > 0.99f;
-        Check(columns == expectColumns, "Two-player split orientation wrong for " + x + ", " + y);
-        Check(Math.Abs(layout.viewports[0].areaFraction - 0.5f) < 0.001f, "Two-player area not half");
-        Check(layout.dividers.Length == 1 && layout.dividers[0].alpha == 1f, "Two-player divider missing");
-        PanBudget(layout, "direction");
+        Bounds(view.polygon, out min, out max);
+        return min;
+    }
+
+    private static Vector2 CellMax(SplitLayoutSolver.ViewportState view)
+    {
+        Vector2 min, max;
+        Bounds(view.polygon, out min, out max);
+        return max;
+    }
+
+    private static bool SameRect(Vector2[] a, Vector2[] b)
+    {
+        Vector2 aMin, aMax, bMin, bMax;
+        Bounds(a, out aMin, out aMax);
+        Bounds(b, out bMin, out bMax);
+        return (aMin - bMin).magnitude < 1e-4f && (aMax - bMax).magnitude < 1e-4f;
+    }
+
+    private static void TwoPlayerSlotsAreFixed()
+    {
+        // Whatever the world direction, camera 0 is the left column and camera 1
+        // the right column, each half the screen.
+        var directions = new[] { new Vector2(800f, 0f), new Vector2(-800f, 0f), new Vector2(0f, 800f),
+            new Vector2(0f, -800f), new Vector2(600f, 450f), new Vector2(-600f, -450f) };
+        foreach (Vector2 d in directions)
+        {
+            var layout = Settle(new SplitLayoutSolver(), P(0, -d.x, -d.y, 1), P(1, d.x, d.y, 2));
+            Tiling(layout, "two-fixed");
+            PanBudget(layout, "two-fixed");
+            Check(CellMax(layout.viewports[0]).x < 0.5f + 1e-4f && CellMin(layout.viewports[1]).x > 0.5f - 1e-4f,
+                "Camera 0 must be the left column and camera 1 the right for direction " + d);
+            Check(CellMax(layout.viewports[0]).y > 0.99f && CellMin(layout.viewports[0]).y < 0.01f,
+                "Two-player cells must be full-height columns for direction " + d);
+            Check(Math.Abs(layout.viewports[0].areaFraction - 0.5f) < 0.001f, "Two-player area not half");
+            Check(layout.dividers.Length == 1 && layout.dividers[0].alpha == 1f, "Two-player divider missing");
+        }
+        // Camera order, not input order, decides the slot.
+        var swapped = Settle(new SplitLayoutSolver(), P(1, -800f, 0f, 2), P(0, 800f, 0f, 1));
+        Check(swapped.viewports[0].cameraNumber == 1 && CellMin(swapped.viewports[0]).x > 0.5f - 1e-4f,
+            "Camera 1 given first must still take the right column");
+    }
+
+    private static void PositionsNeverRestructure()
+    {
+        // Players crossing sides, circling and jittering move nothing: no slide,
+        // no restructure, and every cell keeps its rectangle exactly.
+        var two = new SplitLayoutSolver();
+        var before = Settle(two, P(0, -600f, 0f, 1), P(1, 600f, 0f, 2));
+        for (int frame = 0; frame < 300; frame++)
+        {
+            double angle = frame / 300.0 * Math.PI * 2.0;
+            float wobble = (frame % 2 == 0 ? 1f : -1f) * 120f;
+            var next = two.Solve(new[] { P(0, (float)(700 * Math.Cos(angle)) + wobble, (float)(500 * Math.Sin(angle)), 1),
+                P(1, (float)(-700 * Math.Cos(angle)), (float)(-500 * Math.Sin(angle)) - wobble, 2) }, 1f / 60f, Settings);
+            Check(!next.restructured && !next.sliding, "Two players moving restructured the layout at frame " + frame);
+            for (int i = 0; i < 2; i++)
+                Check(SameRect(next.viewports[i].polygon, before.viewports[i].polygon),
+                    "Two-player cell " + i + " moved with the players at frame " + frame);
+        }
+
+        var three = new SplitLayoutSolver();
+        var settled = Settle(three, P(0, -1500f, 0f, 1), P(1, 400f, 300f, 2), P(2, 500f, -300f, 3));
+        for (int frame = 0; frame < 300; frame++)
+        {
+            double angle = frame / 300.0 * Math.PI * 2.0;
+            var next = three.Solve(new[] {
+                P(0, (float)(1500 * Math.Cos(angle)), (float)(900 * Math.Sin(angle)), 1),
+                P(1, (float)(-1500 * Math.Cos(angle)), (float)(-900 * Math.Sin(angle)), 2),
+                P(2, (float)(900 * Math.Sin(angle)), (float)(1500 * Math.Cos(angle)), 3) }, 1f / 60f, Settings);
+            Check(!next.restructured && !next.sliding, "Three players moving restructured the layout at frame " + frame);
+            for (int i = 0; i < 3; i++)
+                Check(SameRect(next.viewports[i].polygon, settled.viewports[i].polygon),
+                    "Three-player cell " + i + " moved with the players at frame " + frame);
+        }
+
+        // Rooms changing (map positions swinging) hold as well.
+        var rooms = new SplitLayoutSolver();
+        var a = Settle(rooms, P(0, -1500f, 0f, 1, 1), P(1, 400f, 300f, 2, 2), P(2, 500f, -300f, 3, 3));
+        var b = Settle(rooms, P(0, 1500f, 0f, 1, 9), P(1, -400f, -300f, 2, 9), P(2, -500f, 300f, 3, 9));
+        for (int i = 0; i < 3; i++)
+            Check(SameRect(a.viewports[i].polygon, b.viewports[i].polygon),
+                "Players changing rooms were rearranged by map position: cam " + a.viewports[i].cameraNumber);
+    }
+
+    private static void ThreePlayerSlots()
+    {
+        // Three singles: camera 0 owns the top half, cameras 1 and 2 the bottom
+        // quarters, left to right - wherever they stand.
+        var layout = Settle(new SplitLayoutSolver(), P(0, 1500f, -900f, 1), P(1, -400f, 300f, 2), P(2, 500f, 900f, 3));
+        Tiling(layout, "three");
+        PanBudget(layout, "three");
+        Check(Math.Abs(layout.viewports[0].areaFraction - 0.5f) < 0.02f, "Camera 0 did not get the half cell");
+        Check(CellMin(layout.viewports[0]).y > 0.5f - 1e-3f, "Camera 0's half is not the top half");
+        Check(Math.Abs(layout.viewports[1].areaFraction - 0.25f) < 0.02f &&
+            Math.Abs(layout.viewports[2].areaFraction - 0.25f) < 0.02f, "Remaining players did not get quarters");
+        Check(CellMax(layout.viewports[1]).x < 0.5f + 1e-3f && CellMin(layout.viewports[2]).x > 0.5f - 1e-3f,
+            "Bottom quarters are not ordered by camera number");
+        Check(layout.dividers.Length >= 2, "Three-player dividers missing");
+
+        // A merged pair beside a single takes the top, whoever is in it.
+        var pair = Settle(new SplitLayoutSolver(), P(0, 900f, 0f, 5), P(1, -70f, 0f, 1), P(2, 70f, 0f, 1), P(3, 2000f, 0f, 6));
+        Tiling(pair, "pair on top");
+        Check(pair.viewports[2].sharesImageWith == 1, "Cameras 1 and 2 did not merge");
+        Check(CellMin(pair.viewports[1]).y > 0.3f && CellMin(pair.viewports[2]).y > 0.3f &&
+            Math.Abs(pair.viewports[1].groupAreaFraction - 2f / 3f) < 0.02f,
+            "Merged pair did not take the top two thirds: " + pair.viewports[1].groupAreaFraction);
+        Check(CellMax(pair.viewports[0]).x < 0.5f + 1e-3f && CellMin(pair.viewports[3]).x > 0.5f - 1e-3f &&
+            CellMax(pair.viewports[0]).y < 0.4f, "Singles beside a merged pair are not the bottom quarters by number");
+    }
+
+    private static void FourPlayerGrid()
+    {
+        var layout = Settle(new SplitLayoutSolver(), P(0, 800f, -500f, 1), P(1, -800f, -500f, 2),
+            P(2, 800f, 500f, 3), P(3, -800f, 500f, 4));
+        Tiling(layout, "grid");
+        PanBudget(layout, "grid");
+        foreach (var view in layout.viewports)
+        {
+            Vector2 min, max;
+            Bounds(view.polygon, out min, out max);
+            Check(Math.Abs(max.x - min.x - 0.5f) < 0.01f && Math.Abs(max.y - min.y - 0.5f) < 0.01f,
+                "Four players did not form a 2x2 grid");
+        }
+        Check(layout.viewports[0].centroid.x < 0.5f && layout.viewports[0].centroid.y > 0.5f, "Camera 0 is not top-left");
+        Check(layout.viewports[1].centroid.x > 0.5f && layout.viewports[1].centroid.y > 0.5f, "Camera 1 is not top-right");
+        Check(layout.viewports[2].centroid.x < 0.5f && layout.viewports[2].centroid.y < 0.5f, "Camera 2 is not bottom-left");
+        Check(layout.viewports[3].centroid.x > 0.5f && layout.viewports[3].centroid.y < 0.5f, "Camera 3 is not bottom-right");
+    }
+
+    private static void PairSlotsFollowNumbers()
+    {
+        // Two pairs: the pair holding camera 0 is the left half; each pair tiles
+        // its half side by side... no, stacked: a half is taller than wide.
+        var layout = Settle(new SplitLayoutSolver(), P(0, -1000f, 0f), P(1, -990f, 0f), P(2, 990f, 0f, 2), P(3, 1000f, 0f, 2));
+        Tiling(layout, "2+2");
+        Check(layout.viewports[1].sharesImageWith == 0 && layout.viewports[3].sharesImageWith == 2, "Pairs did not merge");
+        Check(CellMax(layout.viewports[0]).x < 0.5f + 1e-3f && CellMax(layout.viewports[1]).x < 0.5f + 1e-3f,
+            "The pair with camera 0 is not the left half");
+        Check(CellMin(layout.viewports[2]).x > 0.5f - 1e-3f && CellMin(layout.viewports[3]).x > 0.5f - 1e-3f,
+            "The pair with camera 2 is not the right half");
+        Check(CellMin(layout.viewports[0]).y > CellMin(layout.viewports[1]).y, "Within a column the lower number is not on top");
+
+        // A single beside a pair: whoever has the lower number is left; the pair owns two thirds.
+        var single = Settle(new SplitLayoutSolver(), P(0, 900f, 0f, 2), P(1, -70f, 0f), P(2, 70f, 0f));
+        Check(CellMax(single.viewports[0]).x < 0.34f + 1e-3f, "Camera 0 alone is not the left third");
+        Check(Math.Abs(single.viewports[1].groupAreaFraction - 2f / 3f) < 0.02f, "Pair on the right does not own two thirds");
     }
 
     private static void Weighting(string name, float[] expected, params SplitLayoutSolver.PlayerInput[] input)
@@ -165,66 +301,6 @@ internal static class Program
                 Check(max.x - min.x >= 0.25f - 1e-3f && max.y - min.y >= 0.25f - 1e-3f,
                     name + ": cell " + view.cameraNumber + " is a sliver " + (max.x - min.x) + "x" + (max.y - min.y));
         }
-    }
-
-    private static void ThreePlayerIsolation()
-    {
-        // The player far from the other two owns the big half.
-        var layout = Settle(new SplitLayoutSolver(), P(0, -1500f, 0f, 1), P(1, 400f, 300f, 2), P(2, 500f, -300f, 3));
-        Tiling(layout, "isolation");
-        Check(Math.Abs(layout.viewports[0].areaFraction - 0.5f) < 0.02f, "Isolated player did not get the half cell");
-        Check(layout.viewports[0].centroid.x < 0.5f, "Isolated left player was placed on the right");
-        Check(Math.Abs(layout.viewports[1].areaFraction - 0.25f) < 0.02f &&
-            Math.Abs(layout.viewports[2].areaFraction - 0.25f) < 0.02f, "Remaining players did not get quarters");
-        Check(layout.viewports[1].centroid.y > layout.viewports[2].centroid.y,
-            "Stacked players are not ordered by height");
-        Check(layout.dividers.Length >= 2, "Three-player dividers missing");
-    }
-
-    private static void FourPlayerGrid()
-    {
-        var layout = Settle(new SplitLayoutSolver(), P(0, -800f, 500f, 1), P(1, 800f, 500f, 2),
-            P(2, -800f, -500f, 3), P(3, 800f, -500f, 4));
-        Tiling(layout, "grid");
-        PanBudget(layout, "grid");
-        foreach (var view in layout.viewports)
-        {
-            Vector2 min, max;
-            Bounds(view.polygon, out min, out max);
-            Check(Math.Abs(max.x - min.x - 0.5f) < 0.01f && Math.Abs(max.y - min.y - 0.5f) < 0.01f,
-                "Four players did not form a 2x2 grid");
-        }
-        Check(layout.viewports[0].centroid.x < 0.5f && layout.viewports[0].centroid.y > 0.5f, "Top-left player misplaced");
-        Check(layout.viewports[3].centroid.x > 0.5f && layout.viewports[3].centroid.y < 0.5f, "Bottom-right player misplaced");
-    }
-
-    private static void Hysteresis()
-    {
-        // Jittering around the diagonal must not flip the split orientation each frame.
-        var solver = new SplitLayoutSolver();
-        var first = Settle(solver, P(0, -600f, -300f, 1), P(1, 600f, 300f, 2));
-        int flips = 0;
-        bool lastVertical = first.viewports[0].polygon[2].y - first.viewports[0].polygon[0].y < 0.99f;
-        for (int frame = 0; frame < 240; frame++)
-        {
-            float wobble = (frame % 2 == 0 ? 1f : -1f) * 120f;
-            var layout = solver.Solve(new[] { P(0, -600f + wobble, -300f - wobble, 1), P(1, 600f - wobble, 300f + wobble, 2) },
-                1f / 60f, Settings);
-            bool vertical = layout.viewports[0].polygon[2].y - layout.viewports[0].polygon[0].y < 0.99f;
-            if (vertical != lastVertical) flips++;
-            lastVertical = vertical;
-        }
-        Check(flips == 0, "Split orientation flipped " + flips + " times on jitter");
-
-        // Crossing sides by less than the dead zone keeps the players where they are.
-        var sides = new SplitLayoutSolver();
-        Settle(sides, P(0, -500f, 0f, 1), P(1, 500f, 0f, 2));
-        var crossed = sides.Solve(new[] { P(0, 40f, 0f, 1), P(1, -40f, 0f, 2) }, 1f / 60f, Settings);
-        Check(crossed.viewports[0].centroid.x < crossed.viewports[1].centroid.x,
-            "Players swapped sides inside the dead zone");
-        var farCrossed = Settle(sides, P(0, 500f, 0f, 1), P(1, -500f, 0f, 2));
-        Check(farCrossed.viewports[0].centroid.x > farCrossed.viewports[1].centroid.x,
-            "Players never swapped sides after clearly crossing");
     }
 
     private static void Continuity()
@@ -392,105 +468,61 @@ internal static class Program
         Check(previous.viewports[0].imageBlend < 0.1f, "Images did not blend back on return");
     }
 
-    private static void GroupFormationSlides()
+    private static void MergeIsTheOnlyRestructure()
     {
-        // Two players beside a third join into one image: the outer cut should
-        // slide from a half to two thirds rather than pop.
+        // Three players: two of them approaching and merging is the one thing that
+        // rearranges the cells - once, as a slide - and moving apart again is the
+        // other. Everything in between holds.
         var solver = new SplitLayoutSolver();
         var apart = Settle(solver, P(0, -600f, 0f, 1), P(1, 600f, 0f, 1), P(2, 3000f, 0f, 2));
-        float before = apart.viewports[2].groupAreaFraction;
+        Check(Math.Abs(apart.viewports[2].groupAreaFraction - 0.25f) < 0.02f, "Setup: three singles should give camera 2 a quarter");
+        int restructures = 0;
         float largest = 0f;
         var previous = apart;
-        for (int frame = 0; frame < 120; frame++)
+        for (int frame = 0; frame < 150; frame++)
         {
             float half = Math.Max(50f, 600f - frame * 12f);
             var next = solver.Solve(new[] { P(0, -half, 0f, 1), P(1, half, 0f, 1), P(2, 3000f, 0f, 2) }, 1f / 60f, Settings);
-            largest = Math.Max(largest, Math.Abs(next.viewports[2].groupAreaFraction - previous.viewports[2].groupAreaFraction));
+            if (next.restructured) restructures++;
+            // What is drawn must move smoothly; the resting rectangle may change at once.
+            largest = Math.Max(largest, Math.Abs(Area(next.viewports[2].polygon) - Area(previous.viewports[2].polygon)));
             previous = next;
         }
         Check(previous.viewports[1].sharesImageWith == 0, "Pair did not merge while approaching");
-        Check(previous.viewports[2].groupAreaFraction < before - 0.05f, "Third player's cell did not shrink for the pair");
+        Check(restructures == 1, "Merging should restructure exactly once, got " + restructures);
+        Check(Math.Abs(previous.viewports[2].groupAreaFraction - 1f / 3f) < 0.02f,
+            "Single beside a merged pair should own a third: " + previous.viewports[2].groupAreaFraction);
+        Check(CellMin(previous.viewports[2]).x > 0.6f, "Camera 2 alone should be the right third");
         Check(largest < 0.03f, "Cell popped while a pair formed: " + largest);
-    }
 
-    private static void RotateTransition()
-    {
-        // Two players swap sides: the divider must sweep through intermediate
-        // angles, never jump, keep the screen covered and end on rectangles.
-        var solver = new SplitLayoutSolver();
-        var before = Settle(solver, P(0, -600f, 0f, 1), P(1, 600f, 0f, 2));
-        Check(before.viewports[0].centroid.x < 0.5f, "Setup: player 0 should start on the left");
-        bool sawDiagonal = false;
-        float largestCentroidStep = 0f;
-        var previous = before;
-        int frames = 0;
+        // Merged players wandering around each other on one screen change nothing.
         for (int frame = 0; frame < 120; frame++)
         {
-            var next = solver.Solve(new[] { P(0, 600f, 0f, 1), P(1, -600f, 0f, 2) }, 1f / 60f, Settings);
-            frames++;
-            float total = next.viewports[0].areaFraction + next.viewports[1].areaFraction;
-            Check(Math.Abs(total - 1f) < 0.01f, "Rotating cells do not cover the screen: " + total);
-            Check(Math.Abs(next.viewports[0].areaFraction - 0.5f) < 0.03f, "Rotating cell area drifted: " + next.viewports[0].areaFraction);
-            Vector2 min, max;
-            Bounds(next.viewports[0].polygon, out min, out max);
-            Check(next.viewports[0].zoom >= Math.Max(max.x - min.x, max.y - min.y) - 1e-4f,
-                "Rotating cell would sample outside its source screen");
-            if (!IsRectangle(next.viewports[0].polygon)) sawDiagonal = true;
-            largestCentroidStep = Math.Max(largestCentroidStep,
-                (next.viewports[0].centroid - previous.viewports[0].centroid).magnitude);
-            previous = next;
-            if (next.viewports[0].centroid.x > 0.5f && IsRectangle(next.viewports[0].polygon) && frame > 5) break;
+            double angle = frame / 120.0 * Math.PI * 2.0;
+            var next = solver.Solve(new[] { P(0, (float)(150 * Math.Cos(angle)), (float)(120 * Math.Sin(angle)), 1),
+                P(1, (float)(-150 * Math.Cos(angle)), (float)(-120 * Math.Sin(angle)), 1), P(2, 3000f, 0f, 2) }, 1f / 60f, Settings);
+            Check(!next.restructured, "Merged pair moving restructured the layout at frame " + frame);
         }
-        Check(sawDiagonal, "Side swap did not rotate through intermediate angles");
-        Check(previous.viewports[0].centroid.x > 0.5f && IsRectangle(previous.viewports[0].polygon),
-            "Side swap did not finish on the new rectangles");
-        Check(largestCentroidStep < 0.08f, "Cell jumped during the rotate transition: " + largestCentroidStep);
-        Check(frames < 100, "Rotate transition took too long: " + frames + " frames");
-    }
 
-    private static void SameScreenLineRotates()
-    {
-        // Two players far apart on one prebaked screen: the divider is a single
-        // line through the screen centre, perpendicular to the vector between them.
-        var layout = Settle(new SplitLayoutSolver(), P(0, -600f, -300f, 1), P(1, 600f, 300f, 1));
-        var a = layout.viewports[0];
-        var b = layout.viewports[1];
-        Check(!IsRectangle(a.polygon) && !IsRectangle(b.polygon), "Same-screen diagonal players still got rectangles");
-        Check(Math.Abs(a.areaFraction - 0.5f) < 0.001f && Math.Abs(b.areaFraction - 0.5f) < 0.001f,
-            "Centre line does not halve the screen: " + a.areaFraction);
-        Check(layout.dividers.Length == 1, "Expected one divider segment, got " + layout.dividers.Length);
-        Vector2 mid = (layout.dividers[0].start + layout.dividers[0].end) * 0.5f;
-        Check((mid - new Vector2(0.5f, 0.5f)).magnitude < 0.001f, "Divider does not pass through the centre: " + mid);
-        Vector2 along = (layout.dividers[0].end - layout.dividers[0].start).normalized;
-        // Perpendicular in pixel space to the players' vector (1200, 600).
-        Vector2 alongPixels = new Vector2(along.x * Settings.screenAspect, along.y).normalized;
-        Check(Math.Abs(Vector2.Dot(alongPixels, new Vector2(1200f, 600f).normalized)) < 0.02f,
-            "Divider is not perpendicular to the players' direction");
-        Check(a.centroid.x < b.centroid.x && a.centroid.y < b.centroid.y, "Players are on the wrong sides of the line");
-
-        // The line follows the players continuously: move player 1 around player 0
-        // and the divider angle must never jump.
-        var solver = new SplitLayoutSolver();
-        var previous = Settle(solver, P(0, 0f, 0f, 1), P(1, 1200f, 0f, 1));
-        float largestTurn = 0f;
-        for (int frame = 1; frame <= 180; frame++)
+        // Parting restructures once more and returns to the three-slot layout.
+        restructures = 0;
+        SplitLayoutSolver.Layout parted = null;
+        for (int frame = 0; frame < 240; frame++)
         {
-            double angle = frame / 180.0 * Math.PI;
-            var next = solver.Solve(new[] { P(0, 0f, 0f, 1), P(1, (float)(1200 * Math.Cos(angle)), (float)(700 * Math.Sin(angle)), 1) },
-                1f / 60f, Settings);
-            Vector2 previousAlong = (previous.dividers[0].end - previous.dividers[0].start).normalized;
-            Vector2 nextAlong = (next.dividers[0].end - next.dividers[0].start).normalized;
-            largestTurn = Math.Max(largestTurn, 1f - Math.Abs(Vector2.Dot(previousAlong, nextAlong)));
-            Check(Math.Abs(next.viewports[0].areaFraction - 0.5f) < 0.01f, "Centre line left the centre while turning");
-            previous = next;
+            parted = solver.Solve(new[] { P(0, -900f, 0f, 1), P(1, 900f, 0f, 1), P(2, 3000f, 0f, 2) }, 1f / 60f, Settings);
+            if (parted.restructured) restructures++;
         }
-        Check(largestTurn < 0.01f, "Divider angle jumped while the players circled: " + largestTurn);
+        Check(restructures == 1, "Parting should restructure exactly once, got " + restructures);
+        Check(parted.viewports[1].sharesImageWith < 0, "Pair did not part");
+        Check(Math.Abs(parted.viewports[0].areaFraction - 0.5f) < 0.02f && CellMin(parted.viewports[0]).y > 0.5f - 1e-3f,
+            "After parting camera 0 should be back on the top half");
+        Tiling(parted, "after parting");
     }
 
-    private static void SlideTransition()
+    private static void SlideOnMerge()
     {
-        // Three players restructure: every cell slides from its old rectangle to
-        // its new one; the target rectangles always tile the screen; nothing fades.
+        // Three players restructure through a merge: every cell slides from its old
+        // rectangle to its new one; the target rectangles always tile the screen.
         var solver = new SplitLayoutSolver();
         var before = Settle(solver, P(0, -1500f, 0f, 1), P(1, 400f, 300f, 2), P(2, 500f, -300f, 3));
         Check(!before.sliding, "Settled layout still sliding");
@@ -499,7 +531,7 @@ internal static class Program
         var previous = before;
         for (int frame = 0; frame < 120; frame++)
         {
-            var next = solver.Solve(new[] { P(0, -500f, 300f, 1), P(1, -400f, -300f, 2), P(2, 1500f, 0f, 3) }, 1f / 60f, Settings);
+            var next = solver.Solve(new[] { P(0, -1500f, 0f, 1), P(1, -50f, 0f, 3), P(2, 50f, 0f, 3) }, 1f / 60f, Settings);
             float targetTotal = 0f;
             foreach (var view in next.viewports)
             {
@@ -518,28 +550,8 @@ internal static class Program
             largestStep = Math.Max(largestStep, (next.viewports[0].centroid - previous.viewports[0].centroid).magnitude);
             previous = next;
         }
-        Check(sawSlide, "Restructure did not start a slide");
+        Check(sawSlide, "Merge did not start a slide");
         Check(largestStep < 0.06f, "Cell jumped during the slide: " + largestStep);
-    }
-
-    private static void SeparateRoomsHold()
-    {
-        // Three players in three rooms: map positions may swing however they like,
-        // the layout keeps its shape. Once they share a room it re-decides.
-        var solver = new SplitLayoutSolver();
-        var before = Settle(solver, P(0, -1500f, 0f, 1, 1), P(1, 400f, 300f, 2, 2), P(2, 500f, -300f, 3, 3));
-        var afterMove = Settle(solver, P(0, 1500f, 0f, 1, 1), P(1, -400f, -300f, 2, 2), P(2, -500f, 300f, 3, 3));
-        for (int i = 0; i < 3; i++)
-            Check((before.viewports[i].centroid - afterMove.viewports[i].centroid).magnitude < 1e-4f,
-                "Players in separate rooms were rearranged by map position: cam " + before.viewports[i].cameraNumber +
-                " " + before.viewports[i].centroid + " -> " + afterMove.viewports[i].centroid);
-        bool restructured = false;
-        for (int frame = 0; frame < 180; frame++)
-        {
-            var layout = solver.Solve(new[] { P(0, 1500f, 0f, 1, 9), P(1, -400f, -300f, 2, 9), P(2, -500f, 300f, 3, 9) }, 1f / 60f, Settings);
-            if (layout.restructured) restructured = true;
-        }
-        Check(restructured, "Players who pipe into one room were not rearranged");
     }
 
     private static Vector2 Bounds1(Vector2[] polygon)
@@ -581,17 +593,15 @@ internal static class Program
     {
         try
         {
-            RotateTransition();
-            SameScreenLineRotates();
+            TwoPlayerSlotsAreFixed();
+            PositionsNeverRestructure();
+            ThreePlayerSlots();
+            FourPlayerGrid();
+            PairSlotsFollowNumbers();
+            MergeIsTheOnlyRestructure();
+            SlideOnMerge();
             DividerFadesWithDistance();
-            SlideTransition();
-            SeparateRoomsHold();
             ScreenArrivalGlides();
-            Direction(800f, 0f, true);
-            Direction(-800f, 0f, true);
-            Direction(0f, 800f, false);
-            Direction(0f, -800f, false);
-            Direction(600f, 450f, true);
             Weighting("2", new[] { 0.5f, 0.5f }, P(0, -800f, 0f, 1), P(1, 800f, 0f, 2));
             Weighting("2+1", new[] { 2f / 3f, 2f / 3f, 1f / 3f }, P(0, -70f, 0f), P(1, 70f, 0f), P(2, 900f, 0f, 2));
             Weighting("1+1+1", new[] { 0.5f, 0.25f, 0.25f }, P(0, -900f, 0f, 1), P(1, 100f, 300f, 2), P(2, 200f, -300f, 3));
@@ -599,12 +609,8 @@ internal static class Program
             Weighting("1+1+1+1", new[] { 0.25f, 0.25f, 0.25f, 0.25f }, P(0, -800f, 400f, 1), P(1, 800f, 400f, 2), P(2, -800f, -400f, 3), P(3, 800f, -400f, 4));
             Weighting("3+1", new[] { 0.75f, 0.75f, 0.75f, 0.25f }, P(0, -20f, 0f), P(1, 0f, 0f), P(2, 20f, 0f), P(3, 900f, 0f, 2));
             Weighting("coincident", new[] { 2f / 3f, 2f / 3f, 1f / 3f }, P(0, 0f, 0f), P(1, 0f, 0f), P(2, 900f, 0f, 2));
-            ThreePlayerIsolation();
-            FourPlayerGrid();
-            Hysteresis();
             Continuity();
             MergeSplitSweep();
-            GroupFormationSlides();
             DeathReflow();
             DeathCurve();
             SharedSourceUv();

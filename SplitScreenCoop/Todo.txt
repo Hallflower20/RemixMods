@@ -53,9 +53,9 @@ Implemented
 [x] Cameras loading the same room share a screen key, so spawn-in no longer opens
     split for a couple of frames.
 
-[x] Layout cells are axis-aligned rectangles (2: side by side or stacked by world
-    direction; 3: the most isolated player gets a half, the others quarters; 4: a
-    2x2 grid). Each view samples one prebaked screen, and only a rectangle keeps
+[x] Layout cells are axis-aligned rectangles (2: side by side; 3: one half over
+    two quarters; 4: a 2x2 grid; slots by camera number, see below). Each view
+    samples one prebaked screen, and only a rectangle keeps
     enough pan to always show its own slugcat; the Voronoi cells could not, which
     is what the "player visibility correction" slack, the smeared edge strips and
     the per-frame jumps were compensating for. That slack is gone.
@@ -81,19 +81,35 @@ Implemented
     "centre my player" to "identity" as the split amount falls, so the halves
     line up and the divider vanishes; moving apart reverses it. The split
     amount is damped (0.25 s) so a player arriving on the other's screen
-    through a pipe glides in instead of popping. Two cells swap or reorient by
-    rotating their divider (0.45 s); three or more slide from their old
-    rectangles to their new ones over the resting layout. Cut positions slide.
+    through a pipe glides in instead of popping. Three or more cells slide from
+    their old rectangles to their new ones over the resting layout when the
+    grouping changes; a dying player's cut slides shut.
 [x] Only base cameras render; a cell always draws the camera whose prebaked
     screen its players share, so merged views are one image, not a blend.
 [x] A cell only starts drawing the other camera's image once its own camera is
     on that screen (the vanilla cut moment), and keeps sharing while its player
     stays visible there. Merging no longer swaps a cell to a different screen
     and swipes it into place; the line just fades as the pans converge.
-[x] Two players: one straight divider through the screen centre whose angle
-    follows the players continuously while they share a screen, and turns to
-    the nearest axis when they do not. Side swaps and axis flips are rotations.
-    Three and four players keep the rectangle tree.
+[x] Sleep lockout after a region change (seventh playtest): a rot-spore renderer
+    node of a camera left behind in the unloaded world held a destroyed
+    GameObject; re-parenting that camera's layers at shutdown threw, the
+    process switch aborted before clearing the current process, and the dead
+    game was updated forever. Nodes now leave their containers before their
+    GameObject dies, cameras left in an unloaded world drop their sprite
+    leasers when the new world loads, the shutdown hook contains every
+    exception, and [UnityLog] buckets by message plus top stack frames.
+[x] Cameras that are not rendering skip DrawSprites for their room objects
+    (three players in one room were three full draw passes per frame).
+[x] Watcher foliage, grass and other dynamic level elements keep their colour
+    on every camera. They are Unity mask meshes shared between cameras, and
+    only the last camera to draw had them in view; the others composited a
+    stale grab into their level texture. Each camera now places the meshes
+    for itself right before it renders (CameraListener.OnPreCull).
+[x] Cells sit in fixed slots by camera number (two: left/right; three: the
+    merged pair or camera 0 on top, the others below; four: a grid) and only a
+    merge, a part, an arrival or a death changes the layout. The rotating
+    two-player divider, side swaps, axis flips, dead zones and hold times are
+    gone: the screens no longer shift around with the players' positions.
 [x] The divider's opacity is how far apart the two views are in world pixels
     (fading over 4 to 300 px, damped 0.2 s per pair), so it fades across the
     whole glide as views converge and is hidden when the two halves are already
