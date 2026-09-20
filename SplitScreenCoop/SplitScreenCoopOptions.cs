@@ -16,14 +16,16 @@ namespace SplitScreenCoop
         public readonly Configurable<float> SmoothingTime;
         public readonly Configurable<string> ZoomedFilter;
         public readonly Configurable<bool> DebugOverlay;
+        public readonly Configurable<float> ExtraRealizerBudget;
+        public readonly Configurable<string> CameraRendering;
 
         // Shown in the Remix description box while the control or its label is
         // hovered. Remix reads a Configurable's info.description into the widget
         // by itself; labels get the same text explicitly.
         private const string SplitStyleHelp =
-            "Dynamic: everyone shares one full-screen view; players who move apart get their own cell " +
-            "(player 1 left/top, then by player number) and merge back into one image when they come close again. " +
-            "Classic: the original always-split layouts (1 left, 2 right; a triangle for three; corners for four).";
+            "Dynamic: one shared view; players who move apart get their own cell and merge back when close. " +
+            "Static: a fixed region for each living player (halves, thirds, quarters), never merging. " +
+            "Classic: the original always-split layouts.";
         private const string AlwaysSplitHelp =
             "Give every player their own cell at all times, even when standing together. " +
             "Off: players close together on one camera screen share a single full-size image.";
@@ -51,13 +53,20 @@ namespace SplitScreenCoop
             "Only matters when Zoom exponent is above 0.";
         private const string DebugOverlayHelp =
             "Draw cell outlines, camera numbers and layout values over the game. For diagnosing layout problems; leave off to play.";
+        private const string CameraRenderingHelp =
+            "Alternate frames: views take turns, so Watcher grab effects (foliage, terrain, slush) are right on every view; " +
+            "the frame limit rises to keep each view's speed (needs vsync off). Every frame: those effects suit one view. " +
+            "Auto takes turns while each view gets 38 fps.";
+        private const string ExtraRealizerBudgetHelp =
+            "Rooms kept loaded around each extra player (the game keeps 1500 worth around one). " +
+            "Lower it if the game lags with 3-4 players, raise it if entering rooms stutters. Applies when a region loads. Default 750.";
 
         public SplitScreenCoopOptions()
         {
             AlwaysSplit = config.Bind("AlwaysSplit", false, new ConfigurableInfo(AlwaysSplitHelp));
             DualDisplays = config.Bind("DualDisplays", false, new ConfigurableInfo(DualDisplaysHelp));
             SplitStyle = config.Bind("SplitStyle", "Dynamic", new ConfigurableInfo(SplitStyleHelp,
-                new ConfigAcceptableList<string>("Classic", "Dynamic")));
+                new ConfigAcceptableList<string>("Classic", "Dynamic", "Static")));
             MergeDistance = config.Bind("MergeDistance", 600f, new ConfigurableInfo(MergeDistanceHelp,
                 new ConfigAcceptableRange<float>(100f, 1400f)));
             BlendWidth = config.Bind("BlendWidth", 250f, new ConfigurableInfo(BlendWidthHelp,
@@ -80,6 +89,10 @@ namespace SplitScreenCoop
             ZoomedFilter = config.Bind("ZoomedFilter", "Bilinear", new ConfigurableInfo(ZoomedFilterHelp,
                 new ConfigAcceptableList<string>("Bilinear", "Point")));
             DebugOverlay = config.Bind("DebugOverlay", false, new ConfigurableInfo(DebugOverlayHelp));
+            ExtraRealizerBudget = config.Bind("ExtraRealizerBudget", 750f, new ConfigurableInfo(ExtraRealizerBudgetHelp,
+                new ConfigAcceptableRange<float>(0f, 1500f)));
+            CameraRendering = config.Bind("CameraRendering", "Auto", new ConfigurableInfo(CameraRenderingHelp,
+                new ConfigAcceptableList<string>("Auto", "Alternate frames", "Every frame")));
         }
 
         private static OpLabel Label(float x, float y, string text, string help, bool bigText = false)
@@ -92,6 +105,24 @@ namespace SplitScreenCoop
             return new OpLabel(x, y, text) { description = help, verticalAlignment = OpLabel.LabelVAlignment.Center };
         }
 
+        /// <summary>
+        /// Remix draws a tab's elements in the order they were added (OpTab._AddItem
+        /// appends each element's container), and a combo box's open list lives inside
+        /// the box's own container. A list therefore opens UNDERNEATH every element
+        /// added after its box: the style list slid under the two checkboxes below it.
+        /// Two guards. Boxes are added last, lowest first, so an open list also covers
+        /// a box beneath it; and every box made here moves itself to the front when its
+        /// list opens, which keeps working wherever a future box lands in AddItems.
+        /// Input needs nothing: while a list is open its box is Remix's held element
+        /// and nothing else reacts to the pointer. Always create boxes through this.
+        /// </summary>
+        private static OpComboBox Combo(Configurable<string> config, float x, float y, float width, string[] items)
+        {
+            var box = new OpComboBox(config, new Vector2(x, y), width, items);
+            box.OnListOpen += trigger => trigger?.myContainer?.MoveToFront();
+            return box;
+        }
+
         public override void Initialize()
         {
             var general = new OpTab(this, "General");
@@ -102,12 +133,14 @@ namespace SplitScreenCoop
             general.AddItems(new UIelement[]
             {
                 Label(10f, 550f, "Split-screen style", SplitStyleHelp, true),
-                new OpComboBox(SplitStyle, new Vector2(10f, 505f), 140f,
-                    new[] { "Dynamic", "Classic" }),
                 new OpCheckBox(AlwaysSplit, 10f, 465f),
                 CheckLabel(40f, 465f, "Permanent split", AlwaysSplitHelp),
                 dual,
-                CheckLabel(40f, 430f, "Dual Display (experimental)", DualDisplaysHelp)
+                CheckLabel(40f, 430f, "Dual Display (experimental)", DualDisplaysHelp),
+                Label(10f, 380f, "Extra rooms per player", ExtraRealizerBudgetHelp),
+                new OpFloatSlider(ExtraRealizerBudget, new Vector2(225f, 373f), 190, 0),
+                // Combo boxes last (see Combo): the open list must draw over the rows below.
+                Combo(SplitStyle, 10f, 505f, 140f, new[] { "Dynamic", "Static", "Classic" })
             });
             dynamic.AddItems(new UIelement[]
             {
@@ -125,10 +158,13 @@ namespace SplitScreenCoop
                 Label(10f, 282f, "Smoothing time", SmoothingTimeHelp),
                 new OpFloatSlider(SmoothingTime, new Vector2(225f, 275f), 190, 2),
                 Label(10f, 237f, "Zoomed filter", ZoomedFilterHelp),
-                new OpComboBox(ZoomedFilter, new Vector2(225f, 230f), 145f,
-                    new[] { "Bilinear", "Point" }),
-                new OpCheckBox(DebugOverlay, 10f, 175f),
-                CheckLabel(40f, 175f, "Show layout debug overlay", DebugOverlayHelp)
+                Label(10f, 192f, "Camera rendering", CameraRenderingHelp),
+                new OpCheckBox(DebugOverlay, 10f, 140f),
+                CheckLabel(40f, 140f, "Show layout debug overlay", DebugOverlayHelp),
+                // Combo boxes last, lowest first (see Combo): an open list covers the rows
+                // below it, the other box included.
+                Combo(CameraRendering, 225f, 185f, 145f, new[] { "Auto", "Alternate frames", "Every frame" }),
+                Combo(ZoomedFilter, 225f, 230f, 145f, new[] { "Bilinear", "Point" })
             });
         }
     }

@@ -48,6 +48,69 @@ namespace SplitScreenCoop
             return found;
         }
 
+        private static int CollectShaderRecipients(int nameID)
+        {
+            int found = CollectShaderRecipients();
+            AuditShaderWrite(nameID, null, found);
+            return found;
+        }
+
+        private static int CollectShaderRecipients(string name)
+        {
+            int found = CollectShaderRecipients();
+            AuditShaderWrite(0, name, found);
+            return found;
+        }
+
+        // ---- Shader write audit --------------------------------------------------
+        // Every per-camera shader difference so far came from a global written
+        // somewhere the mod did not attribute to a camera: from Room.Update using one
+        // camera's position (BlizzardGraphics' _tileCorrection), from a constructor,
+        // from a room object updating from cameras[0]. The first write of each global
+        // outside camera scope is logged with the vanilla method that made it, so the
+        // next log lists every candidate instead of the screen showing it.
+        private static readonly Dictionary<int, byte> auditedShaderWrites = new Dictionary<int, byte>();
+        private static Dictionary<int, string> shaderPropertyNames;
+
+        private static string ShaderPropertyName(int id)
+        {
+            if (shaderPropertyNames == null)
+            {
+                shaderPropertyNames = new Dictionary<int, string>();
+                foreach (var field in typeof(RainWorld).GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static))
+                    if (field.FieldType == typeof(int) && field.Name.StartsWith("ShadProp"))
+                        shaderPropertyNames[(int)field.GetValue(null)] = field.Name;
+            }
+            string name;
+            return shaderPropertyNames.TryGetValue(id, out name) ? name : "id " + id;
+        }
+
+        private static void AuditShaderWrite(int id, string name, int found)
+        {
+            byte scope = curCamera >= 0 ? (byte)1 : curRoom != null ? (byte)2 : (byte)4;
+            if (scope == 1) return;
+            if (name != null) id = Shader.PropertyToID(name);
+            byte seen;
+            auditedShaderWrites.TryGetValue(id, out seen);
+            if ((seen & scope) != 0) return;
+            auditedShaderWrites[id] = (byte)(seen | scope);
+            string site = "?";
+            try
+            {
+                var trace = new System.Diagnostics.StackTrace(2, false);
+                for (int i = 0; i < trace.FrameCount; i++)
+                {
+                    var method = trace.GetFrame(i).GetMethod();
+                    string type = method?.DeclaringType?.FullName ?? "";
+                    if (type.StartsWith("SplitScreenCoop") || type.StartsWith("UnityEngine.Shader") || type.StartsWith("MonoMod")) continue;
+                    site = (type.Length > 0 ? type + "." : "") + method.Name;
+                    break;
+                }
+            }
+            catch { }
+            sLogger?.LogInfo($"[ShaderAudit] frame={Time.frameCount} global {name ?? ShaderPropertyName(id)} first written outside camera scope ({(scope == 2 ? "room " + (curRoom?.abstractRoom?.name ?? "?") : "no room")}) by {site}; cameras receiving it={found}");
+        }
+
         public void Room_Update(On.Room.orig_Update orig, Room self)
         {
             Room previous = curRoom;
@@ -197,10 +260,32 @@ namespace SplitScreenCoop
         public void SpriteLeaser_Update(On.RoomCamera.SpriteLeaser.orig_Update orig, RoomCamera.SpriteLeaser self,
             float timeStacker, RoomCamera rCam, Vector2 camPos)
         {
-            if (!drawPathSafeMode && !dualDisplays && rCam != null && rCam.game?.cameras?.Length > 1 &&
-                renderedCameraNumbers.Count > 0 && !renderedCameraNumbers.Contains(rCam.cameraNumber))
+            if (!drawPathSafeMode && rCam != null && rCam.game?.cameras?.Length > 1 &&
+                renderedCameraNumbers.Count > 0 && !CameraRendersThisFrame(rCam.cameraNumber) &&
+                !DrawSpritesRetiresLeaser(self.drawableObject, rCam))
                 return;
             orig(self, timeStacker, rCam, camPos);
+            if (self.maskSources != null && self.maskSources.Length > 0 && !self.deleteMeNextFrame)
+                RecordLeaserMaskSources(self, rCam);
+        }
+
+        /// <summary>
+        /// Vanilla drawables retire their own leaser inside DrawSprites: nearly every
+        /// implementation ends with `if (slatedForDeletetion || room != rCam.room)
+        /// sLeaser.CleanSpritesAndRemove()`. Skipping DrawSprites on a camera that is
+        /// not rendering therefore leaked one leaser, sprites included, for every
+        /// object that died or left the room while that camera was off (eighth
+        /// playtest: 369 leasers on camera 0 against 557 and 745 on the two cameras
+        /// that had been off, all in one room). Let DrawSprites run whenever it would
+        /// clean up, and always for drawables whose owner cannot be read here.
+        /// </summary>
+        private static bool DrawSpritesRetiresLeaser(IDrawable drawable, RoomCamera rCam)
+        {
+            if (drawable is UpdatableAndDeletable deletable)
+                return deletable.slatedForDeletetion || deletable.room != rCam.room;
+            if (drawable is GraphicsModule graphics)
+                return graphics.owner == null || graphics.owner.slatedForDeletetion || graphics.owner.room != rCam.room;
+            return true;
         }
 
         public void RoomCamera_Update(On.RoomCamera.orig_Update orig, RoomCamera self)
@@ -209,6 +294,22 @@ namespace SplitScreenCoop
             try
             {
                 curCamera = self.cameraNumber;
+                // Jolly's part of RoomCamera.Update contains, in this order,
+                //   if (cutscenePlayer == null && coopRippleDimensionPlayer != null)
+                //       followAbstractCreature = coopRippleDimensionPlayer;
+                //   foreach player: if (game.ActiveRippleLayer != 0 && player is the Watcher)
+                //       coopRippleDimensionPlayer = player;   else it is cleared
+                // With one camera that means "follow the Watcher through the ripple
+                // layer". With a camera per player it dragged EVERY camera to that one
+                // player's room each tick, and EnsureStableCameraAssignments dragged it
+                // back on the next: two room moves and two level images per tick (log of
+                // 2026-09-18: 120 forced resyncs, camera 0 flipping between WRFA_A21 and
+                // WRFA_C11 every three frames). Clear it before vanilla reads it. Vanilla
+                // sets it again further down the same call, so JollyMeter and Player,
+                // which read cameras[0]'s copy, see what they always saw.
+                if (self.coopRippleDimensionPlayer != null && self.game?.cameras != null && self.game.Players != null &&
+                    self.game.cameras.Length > 1 && self.game.cameras.Length >= self.game.Players.Count)
+                    self.coopRippleDimensionPlayer = null;
                 orig(self);
                 NoteRoomCameraUpdated(self);
                 try { if (!drawPathSafeMode) CaptureRoomCameraShaderKeywords(self); }
@@ -259,6 +360,20 @@ namespace SplitScreenCoop
                 orig(self, newRoom, camPos);
                 NoteRoomCameraMoved(self, "WarpMoveCameraActual");
                 CaptureRoomCameraShaderKeywords(self);
+                // Vanilla precasts the warp destination texture (WarpMoveCameraPrecast)
+                // for the camera that triggered the warp. A camera that was not precast
+                // leaves here with loadingRoom set and nothing that will ever apply it.
+                // With a room it recovers through vanilla's "camera needs to move"
+                // check in Update; without one (a session resumed from a warp) it sat
+                // at room=null for a whole playtest, could never share a screen key
+                // with anyone, and the layout stayed split around an empty cell. Move
+                // it the ordinary way instead.
+                if (!self.warpApplyPosChangeWhenTextureIsLoaded && newRoom != null)
+                {
+                    int position = camPos >= 0 ? camPos : self.loadingWarpCameraPos;
+                    Logger.LogInfo($"[CameraMove] frame={Time.frameCount} cam={self.cameraNumber} warp move without a precast texture; moving normally to {newRoom.abstractRoom?.name} position={position}");
+                    self.MoveCamera(newRoom, position);
+                }
             }
             finally
             {
@@ -375,13 +490,170 @@ namespace SplitScreenCoop
             }
         }
 
+        /// <summary>
+        /// UpdateSnowLight blits the snow data (LevelSnowShader) during the update,
+        /// outside any camera render, from the globals bound at that moment: replay
+        /// this camera's own set first (level texture, palette, snow sources, rect).
+        /// Graphics.Blit also leaves its destination as the active render target;
+        /// restore it so nothing drawn to "the active target" afterwards lands in
+        /// this camera's snow texture.
+        /// </summary>
         public void RoomCamera_UpdateSnowLight(On.RoomCamera.orig_UpdateSnowLight orig, RoomCamera self)
         {
-            if (cameraListeners[self.cameraNumber] is CameraListener l)
+            RenderTexture previousTarget = RenderTexture.active;
+            var prev = curCamera;
+            try
             {
-                l.OnPreRender();
+                curCamera = self.cameraNumber;
+                if (self.cameraNumber >= 0 && self.cameraNumber < cameraListeners.Length &&
+                    cameraListeners[self.cameraNumber] is CameraListener l)
+                    l.OnPreRender();
+                // SnowSource.visibility is one field per source, and SnowSource_Update
+                // sets it when ANY camera in the room can see the source. This method
+                // packs every source marked visible, at most 20, relative to THIS
+                // camera's screen: a camera spent slots on sources only another screen
+                // could see, and past roughly three screens away the 0..1 position
+                // encoding (EncodeFloatRG) wraps round and the source lands on this
+                // screen as a phantom. Give the blit this camera's own answer.
+                List<MoreSlugcats.SnowSource> sources = self.room?.snowSources;
+                int[] shared = null;
+                if (sources != null && self.room.cameraPositions != null && self.currentCameraPosition >= 0 &&
+                    self.currentCameraPosition < self.room.cameraPositions.Length)
+                {
+                    shared = new int[sources.Count];
+                    for (int i = 0; i < shared.Length; i++)
+                    {
+                        shared[i] = sources[i].visibility;
+                        if (sources[i].room == self.room)
+                            sources[i].visibility = sources[i].CheckVisibility(self.currentCameraPosition);
+                    }
+                }
+                try { orig(self); }
+                finally
+                {
+                    if (shared != null)
+                        for (int i = 0; i < shared.Length && i < sources.Count; i++) sources[i].visibility = shared[i];
+                }
+                RememberVisibleSnow(self);
             }
-            orig(self);
+            finally
+            {
+                curCamera = prev;
+                RenderTexture.active = previousTarget;
+            }
+        }
+
+        // UpdateSnowLight leaves the number of sources it packed in room.snowObject.visibleSnow,
+        // and Snow.DrawSprites hides the snow sprite while that is zero: one field, written by
+        // whichever camera blitted last, read by every camera's leaser. A camera on a screen
+        // without snow showed the sprite over a snow map blitted with no sources, which
+        // vanilla never displays, whenever another camera of the room had snow in view.
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<MoreSlugcats.Snow, int[]> visibleSnowByCamera =
+            new System.Runtime.CompilerServices.ConditionalWeakTable<MoreSlugcats.Snow, int[]>();
+
+        private static void RememberVisibleSnow(RoomCamera camera)
+        {
+            MoreSlugcats.Snow snow = camera?.room?.snowObject;
+            if (snow == null || camera.cameraNumber < 0 || camera.cameraNumber >= 4) return;
+            visibleSnowByCamera.GetValue(snow, _ => new[] { -1, -1, -1, -1 })[camera.cameraNumber] = snow.visibleSnow;
+        }
+
+        private void Snow_DrawSprites(On.MoreSlugcats.Snow.orig_DrawSprites orig, MoreSlugcats.Snow self,
+            RoomCamera.SpriteLeaser sLeaser, RoomCamera rCam, float timeStacker, Vector2 camPos)
+        {
+            int[] counts;
+            if (rCam != null && rCam.cameraNumber >= 0 && rCam.cameraNumber < 4 &&
+                visibleSnowByCamera.TryGetValue(self, out counts) && counts[rCam.cameraNumber] >= 0)
+                self.visibleSnow = counts[rCam.cameraNumber];
+            orig(self, sLeaser, rCam, timeStacker, camPos);
+        }
+
+        // ---- Globals computed from one camera in room scope ------------------------
+        // BlizzardGraphics and DustWave are room objects that keep the RoomCamera
+        // that created them and write _tileCorrection (screen -> room tile space for
+        // the wind/dust maps) from that camera's screen position, in Update, i.e.
+        // room scope: every camera showing the room received the owner's value and
+        // the blizzard, snowfall, slush water and dust effects sampled the wind map
+        // at the wrong place on every other camera. Recompute it per camera.
+        private static void SetTileCorrectionPerCamera(Room room, Func<RoomCamera, Vector4> formula)
+        {
+            RainWorldGame game = room?.game;
+            if (game?.cameras == null) return;
+            foreach (RoomCamera camera in game.cameras)
+            {
+                if (camera?.room != room) continue;
+                Vector4 value = formula(camera);
+                WithWatcherCamera(camera, () => Shader.SetGlobalVector(RainWorld.ShadPropTileCorrection, value));
+            }
+        }
+
+        public void BlizzardGraphics_Update(On.MoreSlugcats.BlizzardGraphics.orig_Update orig, MoreSlugcats.BlizzardGraphics self, bool eu)
+        {
+            orig(self, eu);
+            if (self.room == null || self.slatedForDeletetion) return;
+            SetTileCorrectionPerCamera(self.room, camera => new Vector4(
+                camera.sSize.x / ((float)camera.room.TileWidth * 20f) * (1366f / camera.sSize.x) * 1.02f,
+                camera.sSize.y / ((float)camera.room.TileHeight * 20f) * 1.04f,
+                camera.room.cameraPositions[camera.currentCameraPosition].x / ((float)camera.room.TileWidth * 20f),
+                camera.room.cameraPositions[camera.currentCameraPosition].y / ((float)camera.room.TileHeight * 20f)));
+        }
+
+        public void DustWave_Update(On.MoreSlugcats.DustWave.orig_Update orig, MoreSlugcats.DustWave self, bool eu)
+        {
+            orig(self, eu);
+            if (self.room == null || self.slatedForDeletetion) return;
+            SetTileCorrectionPerCamera(self.room, camera => new Vector4(
+                camera.sSize.x / (((float)camera.room.TileWidth + 40f) * 20f) * (1366f / camera.sSize.x) * 1.02f,
+                camera.sSize.y / (((float)camera.room.TileHeight + 40f) * 20f) * 1.04f,
+                (camera.room.cameraPositions[camera.currentCameraPosition].x + 400f) / (((float)camera.room.TileWidth + 40f) * 20f),
+                (camera.room.cameraPositions[camera.currentCameraPosition].y + 400f) / (((float)camera.room.TileHeight + 40f) * 20f)));
+        }
+
+        // ---- Effects that only work when cameras[0] is in the room ----------------
+        // Vanilla gates several cosmetics on game.cameras[0]: environment-coloured
+        // lights and light beams sample cameras[0]'s palette only while camera 0 is
+        // in their room, and gold flakes, fairy particles, zero-g specks and the
+        // Outer Expanse clouds spawn around cameras[0].pos. On a view whose camera
+        // is not camera 0 those simply did not happen. Run their updates with the
+        // camera that is viewing the room standing in for cameras[0].
+        public void LightSource_Update(On.LightSource.orig_Update orig, LightSource self, bool eu)
+        {
+            WithViewingCameraAsPrimary(self.room, () => orig(self, eu));
+        }
+
+        public void LightBeam_Update(On.LightBeam.orig_Update orig, LightBeam self, bool eu)
+        {
+            WithViewingCameraAsPrimary(self.room, () => orig(self, eu));
+        }
+
+        public void EnergySwirl_Update(On.MoreSlugcats.EnergySwirl.orig_Update orig, MoreSlugcats.EnergySwirl self, bool eu)
+        {
+            WithViewingCameraAsPrimary(self.room, () => orig(self, eu));
+        }
+
+        public void GoldFlakes_Update(On.GoldFlakes.orig_Update orig, GoldFlakes self, bool eu)
+        {
+            WithViewingCameraAsPrimary(self.room, () => orig(self, eu));
+        }
+
+        public void GoldFlake_Update(On.GoldFlakes.GoldFlake.orig_Update orig, GoldFlakes.GoldFlake self, bool eu)
+        {
+            WithViewingCameraAsPrimary(self.room, () => orig(self, eu));
+        }
+
+        public void FairyParticle_Update(On.MoreSlugcats.FairyParticle.orig_Update orig, MoreSlugcats.FairyParticle self, bool eu)
+        {
+            WithViewingCameraAsPrimary(self.room, () => orig(self, eu));
+        }
+
+        public void GenericZeroGSpeck_Update(On.GenericZeroGSpeck.orig_Update orig, GenericZeroGSpeck self, bool eu)
+        {
+            WithViewingCameraAsPrimary(self.room, () => orig(self, eu));
+        }
+
+        public void AboveCloudsView_Update(On.AboveCloudsView.orig_Update orig, AboveCloudsView self, bool eu)
+        {
+            WithViewingCameraAsPrimary(self.room, () => orig(self, eu));
         }
 
         public delegate void delSetGlobalColor(int nameID, Color vec);
@@ -389,7 +661,7 @@ namespace SplitScreenCoop
         {
             orig(nameID, vec);
             if (restoringShaderState) return;
-            int found = CollectShaderRecipients();
+            int found = CollectShaderRecipients(nameID);
             for (int i = 0; i < found; i++) shaderRecordScratch[i].ShaderColors[nameID] = vec;
             RoomShaderState room = CurrentRoomRecord();
             if (room != null) room.colors[nameID] = vec;
@@ -405,7 +677,7 @@ namespace SplitScreenCoop
         {
             orig(nameID, values);
             if (restoringShaderState) return;
-            int found = CollectShaderRecipients();
+            int found = CollectShaderRecipients(nameID);
             for (int i = 0; i < found; i++) shaderRecordScratch[i].ShaderVectorArrays[nameID] = values?.ToArray();
             RoomShaderState room = CurrentRoomRecord();
             if (room != null) room.vectorArrays[nameID] = values?.ToArray();
@@ -416,7 +688,7 @@ namespace SplitScreenCoop
         {
             orig(nameID, values);
             if (restoringShaderState) return;
-            int found = CollectShaderRecipients();
+            int found = CollectShaderRecipients(nameID);
             for (int i = 0; i < found; i++)
                 shaderRecordScratch[i].ShaderVectorLists[nameID] = values == null ? null : new List<Vector4>(values);
         }
@@ -426,7 +698,7 @@ namespace SplitScreenCoop
         {
             orig(nameID, vec);
             if (restoringShaderState) return;
-            int found = CollectShaderRecipients();
+            int found = CollectShaderRecipients(nameID);
             for (int i = 0; i < found; i++) shaderRecordScratch[i].ShaderVectors[nameID] = vec;
             RoomShaderState room = CurrentRoomRecord();
             if (room != null) room.vectors[nameID] = vec;
@@ -442,7 +714,7 @@ namespace SplitScreenCoop
         {
             orig(nameID, f);
             if (restoringShaderState || nameID == RainWorld.ShadPropRain) return;
-            int found = CollectShaderRecipients();
+            int found = CollectShaderRecipients(nameID);
             for (int i = 0; i < found; i++) shaderRecordScratch[i].ShaderFloats[nameID] = f;
             RoomShaderState room = CurrentRoomRecord();
             if (room != null) room.floats[nameID] = f;
@@ -453,7 +725,7 @@ namespace SplitScreenCoop
         {
             orig(nameID, i);
             if (restoringShaderState) return;
-            int found = CollectShaderRecipients();
+            int found = CollectShaderRecipients(nameID);
             // underlying handler is the same
             for (int index = 0; index < found; index++) shaderRecordScratch[index].ShaderFloats[nameID] = i;
         }
@@ -463,7 +735,7 @@ namespace SplitScreenCoop
         {
             orig(nameID, t);
             if (restoringShaderState) return;
-            int found = CollectShaderRecipients();
+            int found = CollectShaderRecipients(nameID);
             for (int i = 0; i < found; i++) shaderRecordScratch[i].ShaderTextures[nameID] = t;
             RoomShaderState room = CurrentRoomRecord();
             if (room != null) room.textures[nameID] = t;
@@ -479,7 +751,7 @@ namespace SplitScreenCoop
         {
             orig(name, value);
             if (restoringShaderState) return;
-            int found = CollectShaderRecipients();
+            int found = CollectShaderRecipients(name);
             RoomShaderState room = CurrentRoomRecord();
             if (found == 0 && room == null) return;
             int id = Shader.PropertyToID(name);
@@ -492,7 +764,7 @@ namespace SplitScreenCoop
         {
             orig(name, value);
             if (restoringShaderState) return;
-            int found = CollectShaderRecipients();
+            int found = CollectShaderRecipients(name);
             RoomShaderState room = CurrentRoomRecord();
             if (found == 0 && room == null) return;
             int id = Shader.PropertyToID(name);
@@ -505,7 +777,7 @@ namespace SplitScreenCoop
         {
             orig(name, values);
             if (restoringShaderState) return;
-            int found = CollectShaderRecipients();
+            int found = CollectShaderRecipients(name);
             if (found == 0) return;
             int id = Shader.PropertyToID(name);
             for (int i = 0; i < found; i++) shaderRecordScratch[i].ShaderVectorArrays[id] = values?.ToArray();
@@ -516,7 +788,7 @@ namespace SplitScreenCoop
         {
             orig(name, values);
             if (restoringShaderState) return;
-            int found = CollectShaderRecipients();
+            int found = CollectShaderRecipients(name);
             if (found == 0) return;
             int id = Shader.PropertyToID(name);
             for (int i = 0; i < found; i++)
@@ -528,7 +800,7 @@ namespace SplitScreenCoop
         {
             orig(name, value);
             if (restoringShaderState) return;
-            int found = CollectShaderRecipients();
+            int found = CollectShaderRecipients(name);
             RoomShaderState room = CurrentRoomRecord();
             if (found == 0 && room == null) return;
             int id = Shader.PropertyToID(name);
@@ -541,7 +813,7 @@ namespace SplitScreenCoop
         {
             orig(name, value);
             if (restoringShaderState) return;
-            int found = CollectShaderRecipients();
+            int found = CollectShaderRecipients(name);
             if (found == 0) return;
             int id = Shader.PropertyToID(name);
             for (int i = 0; i < found; i++) shaderRecordScratch[i].ShaderFloats[id] = value;
@@ -552,7 +824,7 @@ namespace SplitScreenCoop
         {
             orig(name, value);
             if (restoringShaderState) return;
-            int found = CollectShaderRecipients();
+            int found = CollectShaderRecipients(name);
             RoomShaderState room = CurrentRoomRecord();
             if (found == 0 && room == null) return;
             int id = Shader.PropertyToID(name);

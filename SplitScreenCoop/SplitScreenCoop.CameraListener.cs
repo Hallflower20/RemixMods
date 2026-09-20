@@ -20,6 +20,18 @@ namespace SplitScreenCoop
             public Display display;
             public RenderTexture renderTexture;
             public RenderTexture tempTex;
+            /// <summary>
+            /// This camera's previous rendered frame, bound as _GrabTexture before it
+            /// renders (see BindOwnGrab). Unity's GrabPass leaves the last grab bound
+            /// as a global; a shader that reads _GrabTexture without taking its own
+            /// grab therefore sees whatever camera grabbed last, and the only such
+            /// shader drawn before this camera's first grab (DisplaySnowShader, queue
+            /// AlphaTest) painted the snow with raw data in the twelfth playtest.
+            /// </summary>
+            public RenderTexture lastFrame;
+            private static readonly int GrabTextureId = Shader.PropertyToID("_GrabTexture");
+            private static Texture2D grabFloorTexture;
+            private static Material grabFloorMaterial;
             public Dictionary<int, Color> ShaderColors = new Dictionary<int, Color>();
             public Dictionary<int, Vector4> ShaderVectors = new Dictionary<int, Vector4>();
             public Dictionary<int, Vector4[]> ShaderVectorArrays = new Dictionary<int, Vector4[]>();
@@ -186,10 +198,72 @@ namespace SplitScreenCoop
                     foreach (var kv in ShaderFloats) Shader.SetGlobalFloat(kv.Key, kv.Value);
                     foreach (var kv in ShaderTextures) Shader.SetGlobalTexture(kv.Key, kv.Value);
                     foreach (var kv in ShaderKeywords) SetKeyword(kv.Key, kv.Value);
+                    BindOwnGrab();
                 }
                 finally
                 {
                     restoringShaderState = false;
+                }
+            }
+
+            /// <summary>
+            /// Vanilla semantics for a shader that samples _GrabTexture without a
+            /// GrabPass of its own are "the previous grab": with one camera that is
+            /// this camera's own scene, a frame old. With several cameras it was the
+            /// last grab of whichever camera rendered before, and after a dark room
+            /// it could be black, which DisplaySnowShader treats as "nothing behind
+            /// me" and then draws its sky-sentinel pixels with an extrapolated fog
+            /// colour (lime and red snow). Bind this camera's own last frame instead,
+            /// lifted by 1% so no pixel is exactly black; white until it exists.
+            /// Anything with a real GrabPass overwrites this when it draws.
+            /// </summary>
+            private void BindOwnGrab()
+            {
+                if (!(rainworldGameObject?.processManager?.currentMainLoop is RainWorldGame)) return;
+                Shader.SetGlobalTexture(GrabTextureId,
+                    lastFrame != null && lastFrame.IsCreated() ? (Texture)lastFrame : Texture2D.whiteTexture);
+            }
+
+            private void CaptureLastFrame()
+            {
+                if (!(rainworldGameObject?.processManager?.currentMainLoop is RainWorldGame)) return;
+                RenderTexture source = fcamera != null ? fcamera.targetTexture : null;
+                if (source == null || !source.IsCreated()) return;
+                try
+                {
+                    if (lastFrame == null || lastFrame.width != source.width || lastFrame.height != source.height ||
+                        lastFrame.format != source.format)
+                    {
+                        ReleaseTexture(ref lastFrame);
+                        lastFrame = new RenderTexture(source.width, source.height, 0, source.format)
+                        {
+                            name = $"SplitScreen last frame {Array.IndexOf(cameraListeners, this)}",
+                            filterMode = FilterMode.Point,
+                            wrapMode = TextureWrapMode.Clamp
+                        };
+                        lastFrame.Create();
+                    }
+                    Graphics.CopyTexture(source, lastFrame);
+                    if (grabFloorMaterial == null && FShader.Basic?.shader != null)
+                    {
+                        grabFloorTexture = new Texture2D(1, 1, TextureFormat.ARGB32, false) { name = "SplitScreen grab floor" };
+                        grabFloorTexture.SetPixel(0, 0, new Color(1f, 1f, 1f, 0.012f));
+                        grabFloorTexture.Apply();
+                        grabFloorMaterial = new Material(FShader.Basic.shader) { name = "SplitScreen grab floor" };
+                    }
+                    if (grabFloorMaterial != null)
+                    {
+                        // Basic blends SrcAlpha/OneMinusSrcAlpha: every channel becomes
+                        // 0.988 * old + 0.012, so a pitch-black room still reads as "lit".
+                        RenderTexture previous = RenderTexture.active;
+                        Graphics.Blit(grabFloorTexture, lastFrame, grabFloorMaterial);
+                        RenderTexture.active = previous;
+                    }
+                }
+                catch (Exception error)
+                {
+                    sLogger?.LogWarning("[CameraLayout] last-frame copy failed: " + error.Message);
+                    ReleaseTexture(ref lastFrame);
                 }
             }
 
@@ -199,8 +273,12 @@ namespace SplitScreenCoop
             /// </summary>
             public void OnPreCull()
             {
+                renderStartTicks = phaseWatch.ElapsedTicks;
                 PlaceMaskSourcesFor(Array.IndexOf(cameraListeners, this));
             }
+
+            /// <summary>Main-thread time from this camera's cull to its OnPostRender, for [FrameHitch] and [Perf].</summary>
+            private long renderStartTicks = -1;
 
             private static void SetKeyword(string keyword, bool enabled)
             {
@@ -214,11 +292,23 @@ namespace SplitScreenCoop
             public void OnPostRender()
             {
                 lastPostRenderFrame = Time.frameCount;
+                if (renderStartTicks >= 0)
+                {
+                    frameRenderMs += (phaseWatch.ElapsedTicks - renderStartTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                    renderStartTicks = -1;
+                }
+                CaptureLastFrame();
+                PauseOverlayTick(this);
                 if (dynamicCompositing) return; // The final compositor camera draws all polygons after split cameras render.
                 if (!_direct)
                 {
                     RenderTexture destination = display.Extras().renderTexture;
                     if (destination == null || srcWidth <= 0 || srcHeight <= 0 || dstWidth <= 0 || dstHeight <= 0) return;
+                    // Only forward what this camera just rendered. If the camera has
+                    // been pointed elsewhere (a menu, after RestoreMenuCameras) the
+                    // split texture is stale, and copying it here painted the last
+                    // frame of the game over the sleep screen every frame.
+                    if (fcamera == null || fcamera.targetTexture != renderTexture) return;
 
                     int cameraNumber = Array.IndexOf(cameraListeners, this);
                     if (renderedCameraNumbers.Count > 0 && cameraNumber == renderedCameraNumbers[0] && lastCompositorClearFrame != Time.frameCount)
@@ -264,6 +354,7 @@ namespace SplitScreenCoop
                 display = null;
                 ReleaseTexture(ref renderTexture);
                 ReleaseTexture(ref tempTex);
+                ReleaseTexture(ref lastFrame);
             }
 
             internal void BindToDisplay(Display display)

@@ -106,6 +106,13 @@ namespace SplitScreenCoop
             public SplitScreenCoop owner;
             public int cameraNumber;
             public bool global;
+            private Camera ownCamera;
+            public void OnPreCull()
+            {
+                if (!global) return;
+                if (ownCamera == null) ownCamera = GetComponent<Camera>();
+                HideMaskSourcesFromOverlay(ownCamera);
+            }
             public void OnPreRender()
             {
                 int index = global ? owner.globalMeterSource : cameraNumber;
@@ -168,7 +175,14 @@ namespace SplitScreenCoop
             {
                 initialWorldCullingMasks[i] = fcameras[i]?.cullingMask ?? 0;
                 hudStages[i] = new FStage($"SplitScreen HUD {i}") { layer = hudLayers[i] };
-                Futile.AddStage(hudStages[i]);
+                // Stage list order IS draw order (Futile.LateUpdate hands out render
+                // queues 3000+n stage by stage). Dynamic gives every stage its own
+                // Unity camera, so the order only mattered between the global HUD and
+                // the root. Dual displays draw a camera's world, its HUD and the root
+                // stage with ONE camera, and with the stages appended after the root
+                // the world drew last: over the HUD, the pause menu and the pointer.
+                // Keep the list as world 0-3, HUD 0-3, global HUD, root.
+                Futile.AddStageAtIndex(hudStages[i], i);
                 var holder = new GameObject($"SplitScreen HUD camera {i}");
                 holder.transform.parent = futile.gameObject.transform;
                 hudCameras[i] = holder.AddComponent<Camera>();
@@ -185,16 +199,23 @@ namespace SplitScreenCoop
                 ReinitHudTexture(i);
             }
             globalHudStage = new FStage("SplitScreen global HUD") { layer = globalHudLayer };
-            Futile.AddStage(globalHudStage);
+            // Below Futile's root stage. Stages draw in list order, and the root
+            // stage holds what vanilla keeps above everything: the pause menu's mouse
+            // cursor (Menu.Menu adds cursorContainer to Futile.stage) and the fade to
+            // black. Appended after the root, this stage drew the pause menu's dark
+            // overlay and buttons over the cursor, so nobody could see what they
+            // were clicking.
+            Futile.AddStageAtIndex(globalHudStage, RootStageIndex());
             for (int i = 0; i < worldStages.Length; i++)
             {
                 worldStages[i] = new FStage($"SplitScreen world {i}") { layer = worldLayers[i] };
-                Futile.AddStage(worldStages[i]);
+                Futile.AddStageAtIndex(worldStages[i], i);
                 worldNameContainers[i] = new FContainer();
                 worldNameContainers[i].SetPosition(camOffsets[i]);
                 worldStages[i].AddChild(worldNameContainers[i]);
             }
             Logger.LogInfo($"[CameraLayout] isolated world layers=[{string.Join(",", worldLayers)}]; HUD layers=[{string.Join(",", hudLayers)}]; global HUD layer={globalHudLayer}");
+            Logger.LogInfo($"[CameraLayout] stage draw order (first is drawn underneath)=[{StageOrderForLog()}]");
             var globalHolder = new GameObject("SplitScreen global HUD camera");
             globalHolder.transform.parent = futile.gameObject.transform;
             globalHudCamera = globalHolder.AddComponent<Camera>();
@@ -212,6 +233,25 @@ namespace SplitScreenCoop
             globalRouter.global = true;
             ReinitGlobalHudTexture();
             dynamicPipelineAvailable = true;
+        }
+
+        /// <summary>Where Futile's own stage sits in the stage list; a stage inserted here draws just beneath it.</summary>
+        private static int RootStageIndex()
+        {
+            for (int i = 0; i < Futile.GetStageCount(); i++)
+                if (Futile.GetStageAt(i) == Futile.stage) return i;
+            return Futile.GetStageCount();
+        }
+
+        internal static string StageOrderForLog()
+        {
+            var names = new List<string>();
+            for (int i = 0; i < Futile.GetStageCount(); i++)
+            {
+                FStage stage = Futile.GetStageAt(i);
+                names.Add(stage == Futile.stage ? "root" : stage?.name ?? "null");
+            }
+            return string.Join(", ", names);
         }
 
         private void ReinitGlobalHudTexture()
@@ -248,7 +288,7 @@ namespace SplitScreenCoop
 
         private void MoveCameraHudToOverlay(RoomCamera camera)
         {
-            if (!dynamicStyle || dualDisplays || camera?.game == null ||
+            if (!(dynamicStyle || dualDisplays) || camera?.game == null ||
                 camera.game.session?.Players == null || camera.game.session.Players.Count <= 1 ||
                 camera.game.cameras == null || camera.game.cameras.Length <= 1 ||
                 camera.cameraNumber < 0 ||
@@ -260,9 +300,19 @@ namespace SplitScreenCoop
                 stage.AddChild(camera.hud.map.inFrontContainer);
         }
 
+        /// <summary>
+        /// Classic rendering keeps every camera's sprites on Futile's one root stage.
+        /// Futile batches a stage into meshes by atlas and shader, across containers,
+        /// and gives them unbounded bounds (FFacetRenderLayer: 1e10), so nothing is
+        /// ever frustum culled: every Unity camera draws the sprites of every
+        /// RoomCamera and runs every GrabPass in every world. Dual displays used that
+        /// path with two cameras rendering every frame, i.e. two displays times two to
+        /// four worlds. They now get the same per-camera stages as Dynamic; the
+        /// camera draws its own world, its own HUD, and the root stage (pause menus).
+        /// </summary>
         private void MoveCameraWorldToStage(RoomCamera camera)
         {
-            if (!dynamicStyle || dualDisplays || camera?.game?.cameras == null ||
+            if (!(dynamicStyle || dualDisplays) || camera?.game?.cameras == null ||
                 camera.game.cameras.Length <= 1 || camera.cameraNumber < 0 ||
                 camera.cameraNumber >= worldStages.Length || worldStages[camera.cameraNumber] == null)
                 return;
@@ -273,7 +323,10 @@ namespace SplitScreenCoop
                     worldStages[camera.cameraNumber].AddChild(layer);
             worldStages[camera.cameraNumber].AddChild(worldNameContainers[camera.cameraNumber]);
             if (fcameras[camera.cameraNumber] != null)
-                fcameras[camera.cameraNumber].cullingMask = 1 << worldLayers[camera.cameraNumber];
+                fcameras[camera.cameraNumber].cullingMask = dualDisplays
+                    ? (1 << worldLayers[camera.cameraNumber]) | (1 << hudLayers[camera.cameraNumber]) |
+                      (1 << (Futile.stage != null ? Futile.stage.layer : 0))
+                    : 1 << worldLayers[camera.cameraNumber];
         }
 
         private void MovePlayerNamesToWorld(RoomCamera camera)
@@ -336,9 +389,10 @@ namespace SplitScreenCoop
             if (prompt != null)
             {
                 FContainer promptDestination = camera.cameraNumber == globalPromptSource ? globalHudStage : null;
-                RouteNode(prompt.fullscreenFade, promptDestination);
+                // Vanilla's order: the two bars, the full-screen fade, the label.
                 if (prompt.sprites != null)
                     foreach (FSprite sprite in prompt.sprites) RouteNode(sprite, promptDestination);
+                RouteNode(prompt.fullscreenFade, promptDestination);
                 RouteNode(prompt.label, promptDestination);
                 RouteNode(prompt.musicSprite, promptDestination);
                 if (prompt.symbols != null)
@@ -383,18 +437,30 @@ namespace SplitScreenCoop
                 }
         }
 
+        /// <summary>
+        /// RouteNode appends, so the order of these calls IS the draw order on the
+        /// destination, and it has to be the order vanilla created the sprites in
+        /// (FoodMeter's constructor: every gradient, darkFade, lineSprite, then
+        /// AddCircles per pip, then the quarter pips). AddCircles creates a pip's
+        /// backCircle FIRST: in the Watcher campaign (hud.camoMeter != null) every pip
+        /// has a black disc, 70% opaque and one pixel smaller than the ring, that
+        /// belongs underneath the ring and the white fill. Routed last, as it was,
+        /// it covered the fill: every pip was a dark disc with a light rim, eaten or
+        /// not, for the whole session ("the food pips are always gray").
+        /// </summary>
         private static void RouteFoodMeter(HUD.FoodMeter food, FContainer destination)
         {
             if (food == null) return;
+            if (food.circles != null)
+                foreach (HUD.FoodMeter.MeterCircle meter in food.circles) RouteNode(meter?.gradient, destination);
             RouteNode(food.darkFade, destination);
             RouteNode(food.lineSprite, destination);
             if (food.circles != null)
                 foreach (HUD.FoodMeter.MeterCircle meter in food.circles)
                 {
-                    RouteNode(meter?.gradient, destination);
+                    RouteNode(meter?.backCircle?.sprite, destination);
                     if (meter?.circles != null)
                         foreach (HUD.HUDCircle circle in meter.circles) RouteNode(circle?.sprite, destination);
-                    RouteNode(meter?.backCircle?.sprite, destination);
                 }
             RouteNode(food.quarterPipShower?.quarterPips, destination);
             if (food.pupBars != null)
@@ -562,7 +628,9 @@ namespace SplitScreenCoop
             // Everyone is in the same shelter: there is one thing to look at and the
             // sleep sequence draws its own full-screen UI. Collapse to a single view
             // so only one HUD is composited instead of one per region.
-            if (count > 1 && AllPlayersInOneShelter(game, aliveCameras))
+            // Not in the Static style: its regions depend on who is alive and on
+            // nothing else.
+            if (count > 1 && !staticStyle && AllPlayersInOneShelter(game, aliveCameras))
             {
                 aliveCameras = aliveCameras.GetRange(0, 1);
                 count = 1;
@@ -735,7 +803,7 @@ namespace SplitScreenCoop
             }
             dynamicSettings.screenAspect = Futile.screen == null ? 1.75f :
                 (float)Futile.screen.pixelWidth / Mathf.Max(1f, Futile.screen.pixelHeight);
-            dynamicSettings.permanentSplit = alwaysSplit;
+            dynamicSettings.permanentSplit = NeverMerge;
             NoteFrameEvent("solve layout");
             HangMarker = "UpdateDynamicLayout.Solve";
             // This runs once per game tick, not once per rendered frame. At 240 fps
@@ -818,6 +886,102 @@ namespace SplitScreenCoop
         }
 
         private readonly Vector2[] liveSourceScratch = new Vector2[4];
+
+        // ---- One world camera per frame ------------------------------------------
+        // Unity performs a *named* GrabPass once per frame, for the first camera that
+        // draws the quad; every later camera that frame reuses that texture. The
+        // Watcher-era shaders use seventeen of them (_SlopedTerrainMask feeds 29
+        // shaders including slush water and backgrounds; _DynamicLevelElements,
+        // _RippleMask, _UrbanShadowsGrab, _PreLevelColorGrab, _WarpPointGrabPass ...),
+        // so with several cameras rendering in one frame every camera but the first
+        // composited the first camera's grabs: foliage black, terrain masks wrong,
+        // slush water twice as bright. Rendering the world cameras round-robin, one
+        // per frame, gives each frame exactly one grabbing camera and makes every
+        // named grab, present or future, correct per camera; it also renders one
+        // world per frame instead of up to four. Each cell then refreshes at
+        // fps / cameras, so it is only used while that stays comfortably above the
+        // 40 Hz game tick (Auto), or when the player asks for it.
+        internal static int frameRenderCamera = -1;
+        internal static bool alternateFrames;
+        public static string cameraRenderingMode = "Auto";
+        private int frameRenderCursor;
+        /// <summary>The rotation has switched rendered cameras off and has not handed them back yet.</summary>
+        private bool rotationHoldsCameras;
+        /// <summary>Application.targetFrameRate as found when the rotation raised it; int.MinValue while the limit is not ours.</summary>
+        private int frameCapBeforeRotation = int.MinValue;
+
+        private void SelectFrameCamera(RainWorldGame game)
+        {
+            frameRenderCamera = -1;
+            // Dual displays render each camera straight into its own display texture,
+            // which keeps its last frame, so they can take turns exactly like the
+            // dynamic cells do. Classic split composites both every frame and cannot.
+            bool rotate = (dynamicActive || dualDisplays) && alternateFrames && renderedCameraNumbers.Count > 1 && game?.cameras != null;
+            if (!rotate)
+            {
+                // The rotation leaves every camera but one switched off. The dynamic
+                // pipeline switches its cameras on again every tick; dual displays only
+                // in SetSplitMode. When Auto left the rotation there (log of 2026-09-19,
+                // twice) camera 1 stayed off and display 2 stood still, the first time
+                // through a whole pause, which is why "the pause menu did not show" on
+                // it, until the health watchdog noticed 268 frames later.
+                if (rotationHoldsCameras)
+                {
+                    rotationHoldsCameras = false;
+                    for (int i = 0; i < renderedCameraNumbers.Count; i++)
+                    {
+                        int number = renderedCameraNumbers[i];
+                        if (number >= 0 && number < fcameras.Length && fcameras[number] != null) fcameras[number].enabled = true;
+                    }
+                }
+                ApplyRotationFrameCap(1);
+                return;
+            }
+            rotationHoldsCameras = true;
+            frameRenderCursor = (frameRenderCursor + 1) % renderedCameraNumbers.Count;
+            frameRenderCamera = renderedCameraNumbers[frameRenderCursor];
+            for (int i = 0; i < renderedCameraNumbers.Count; i++)
+            {
+                int number = renderedCameraNumbers[i];
+                if (number >= 0 && number < fcameras.Length && fcameras[number] != null)
+                    fcameras[number].enabled = number == frameRenderCamera;
+            }
+            ApplyRotationFrameCap(renderedCameraNumbers.Count);
+        }
+
+        /// <summary>
+        /// While N views take turns each is drawn on every Nth frame, so under the
+        /// game's frame limit (60 unless the player changed it) two views got 30
+        /// frames a second each. That was the "persistent lag" of the 2026-09-19 dual
+        /// display test: the log shows a frame time that never left 16.7 ms, 2.5 ms
+        /// of it game tick and 1 ms drawing, on a machine with time to spare. Raise
+        /// the limit by the same factor for as long as the rotation runs, so every
+        /// view keeps the rate the player chose, and put back exactly what was there.
+        /// It does nothing under vsync, where the display sets the pace; Auto
+        /// (DecideFrameRendering) measures what each view really gets either way.
+        /// </summary>
+        private void ApplyRotationFrameCap(int turns)
+        {
+            if (turns <= 1)
+            {
+                if (frameCapBeforeRotation == int.MinValue) return;
+                Application.targetFrameRate = frameCapBeforeRotation;
+                frameCapBeforeRotation = int.MinValue;
+                return;
+            }
+            if (frameCapBeforeRotation == int.MinValue) frameCapBeforeRotation = Application.targetFrameRate;
+            int wanted = frameCapBeforeRotation > 0 ? frameCapBeforeRotation * turns : frameCapBeforeRotation;
+            if (Application.targetFrameRate != wanted) Application.targetFrameRate = wanted;
+        }
+
+        /// <summary>The frame limit each view ends up with: the player's own while the mod holds the raised one.</summary>
+        internal int FrameCapPerView => frameCapBeforeRotation != int.MinValue ? frameCapBeforeRotation : Application.targetFrameRate;
+
+        /// <summary>Whether camera <paramref name="number"/>'s Unity camera renders in this frame.</summary>
+        internal static bool CameraRendersThisFrame(int number)
+        {
+            return frameRenderCamera < 0 ? renderedCameraNumbers.Contains(number) : frameRenderCamera == number;
+        }
 
         /// <summary>
         /// Runs every rendered frame. Every cell draws the image of its base camera
@@ -916,8 +1080,14 @@ namespace SplitScreenCoop
 
         public void RainWorldGame_GrafUpdate(On.RainWorldGame.orig_GrafUpdate orig, RainWorldGame self, float timeStacker)
         {
+            // Before the draw: DrawSprites is skipped for cameras that do not render
+            // this frame, and OnPreCull only runs for enabled cameras.
+            try { SelectFrameCamera(self); }
+            catch (Exception error) { LogHookError("SelectFrameCamera", error); }
             HangMarker = "RainWorldGame.GrafUpdate(orig)";
+            long grafStart = phaseWatch.ElapsedTicks;
             orig(self, timeStacker);
+            frameGrafMs += (phaseWatch.ElapsedTicks - grafStart) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             HangMarker = "RefreshDynamicViewShifts";
             lastTimeStacker = self.pauseUpdate ? 1f : timeStacker;
             try { if (dynamicStyle && !dualDisplays) RefreshDynamicViewShifts(self, lastTimeStacker); }
@@ -1105,7 +1275,7 @@ namespace SplitScreenCoop
             RoomCamera camera = self.jollyHud.Camera;
             var viewport = DynamicViewportForCamera(camera.cameraNumber);
             if (viewport?.polygon == null) return;
-            bool merged = !alwaysSplit;
+            bool merged = !NeverMerge;
             foreach (var region in dynamicLayout.viewports)
                 if (!region.ghost && region.splitAmount > 0.05f) { merged = false; break; }
             if (merged || (TryProjectJollyPlayer(self, out Vector2 projected) &&
@@ -1277,7 +1447,7 @@ namespace SplitScreenCoop
         private void ApplyDynamicCameraRendering(RainWorldGame game)
         {
             if (dynamicLayout == null) return;
-            bool mergedFullScreen = !alwaysSplit;
+            bool mergedFullScreen = !NeverMerge;
             for (int i = 0; i < dynamicLayout.viewports.Length; i++)
                 if (dynamicLayout.viewports[i].splitAmount > 0f) mergedFullScreen = false;
             int directCamera = baseCameraNumbers.Length > 0 ? baseCameraNumbers[0] :
@@ -1386,7 +1556,7 @@ namespace SplitScreenCoop
                 GL.LoadOrtho();
                 GL.Clear(true, true, Color.black);
                 int liveSource = -1;
-                bool hasGhost = false, fullyMerged = !alwaysSplit;
+                bool hasGhost = false, fullyMerged = !NeverMerge;
                 for (int i = 0; i < dynamicLayout.viewports.Length; i++)
                 {
                     var view = dynamicLayout.viewports[i];
@@ -1456,13 +1626,17 @@ namespace SplitScreenCoop
             DrawDynamicPolygon(material, listener.renderTexture, polygon, shift, 1f, viewport.zoom);
         }
 
-        /// <summary>A camera's listener if that camera rendered within the last two frames.</summary>
+        /// <summary>
+        /// A camera's listener if that camera rendered recently: within two frames,
+        /// or within one round of the cameras when they take turns.
+        /// </summary>
         private static CameraListener FreshListener(int number)
         {
             if (number < 0 || number >= cameraListeners.Length) return null;
             CameraListener listener = cameraListeners[number];
-            if (listener?.renderTexture == null || fcameras[number] == null || !fcameras[number].enabled ||
-                listener.lastPostRenderFrame < Time.frameCount - 2) return null;
+            int allowed = Mathf.Max(2, renderedCameraNumbers.Count + 1);
+            if (listener?.renderTexture == null || fcameras[number] == null ||
+                !renderedCameraNumbers.Contains(number) || listener.lastPostRenderFrame < Time.frameCount - allowed) return null;
             return listener;
         }
 

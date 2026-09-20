@@ -335,6 +335,95 @@ internal static class Program
         Check(largestSplitStep < 0.08f, "Blend is not gradual: " + largestSplitStep);
     }
 
+    private static SplitLayoutSolver.Layout SettleWith(SplitLayoutSolver solver, SplitLayoutSolver.Settings settings,
+        params SplitLayoutSolver.PlayerInput[] input)
+    {
+        SplitLayoutSolver.Layout layout = null;
+        for (int i = 0; i < 180; i++) layout = solver.Solve(input, 1f / 60f, settings);
+        return layout;
+    }
+
+    private static SplitLayoutSolver.ViewportState View(SplitLayoutSolver.Layout layout, int camera)
+    {
+        foreach (var view in layout.viewports) if (view.cameraNumber == camera) return view;
+        throw new Exception("No region for camera " + camera);
+    }
+
+    private static bool IsRect(SplitLayoutSolver.ViewportState view, float x0, float y0, float x1, float y1)
+    {
+        Vector2 min = CellMin(view), max = CellMax(view);
+        return Math.Abs(min.x - x0) < 0.01f && Math.Abs(min.y - y0) < 0.01f &&
+            Math.Abs(max.x - x1) < 0.01f && Math.Abs(max.y - y1) < 0.01f;
+    }
+
+    // The Static split style is the solver's permanentSplit fed with the players
+    // who are alive. Its contract: regions depend on the number of living players
+    // and on nothing else - not on where they stand, not on sharing a screen - and a
+    // death or a revival hands the screen out again.
+    private static void StaticStyle()
+    {
+        var settings = new SplitLayoutSolver.Settings { permanentSplit = true };
+        for (int count = 1; count <= 4; count++)
+        {
+            var solver = new SplitLayoutSolver();
+            SplitLayoutSolver.Layout settled = null;
+            for (int tick = 0; tick < 240; tick++)
+            {
+                // Everybody on ONE screen of one room, wandering within a few tiles
+                // of each other: Dynamic merges this into a single view.
+                var input = new SplitLayoutSolver.PlayerInput[count];
+                for (int p = 0; p < count; p++)
+                    input[p] = P(p, 30f * p + 200f * (float)Math.Sin(tick * 0.05f + p),
+                        40f * (float)Math.Cos(tick * 0.03f + p), 1, 1);
+                var layout = solver.Solve(input, 1f / 40f, settings);
+                Check(layout.viewports.Length == count, "Static " + count + ": lost a region at tick " + tick);
+                if (tick < 60) continue;
+                if (tick == 60) settled = layout;
+                Tiling(layout, "static " + count + " tick " + tick);
+                Check(!layout.sliding && (tick == 60 || !layout.restructured),
+                    "Static " + count + ": layout moved at tick " + tick);
+                foreach (var view in layout.viewports)
+                {
+                    Check(!view.ghost && view.rendering && view.sharesImageWith == -1,
+                        "Static " + count + ": camera " + view.cameraNumber + " does not own its region");
+                    if (count > 1) Check(view.splitAmount == 1f, "Static " + count + ": regions started merging");
+                    Check(SameRect(view.polygon, View(settled, view.cameraNumber).polygon),
+                        "Static " + count + ": camera " + view.cameraNumber + "'s region moved at tick " + tick);
+                }
+                foreach (var divider in layout.dividers)
+                    Check(divider.alpha == 1f, "Static " + count + ": divider faded");
+            }
+            if (count == 1) Check(IsRect(View(settled, 0), 0f, 0f, 1f, 1f), "Static 1 is not full screen");
+            if (count == 2)
+                Check(IsRect(View(settled, 0), 0f, 0f, 0.5f, 1f) && IsRect(View(settled, 1), 0.5f, 0f, 1f, 1f),
+                    "Static 2 is not camera 0 left, camera 1 right");
+            if (count == 3)
+                Check(IsRect(View(settled, 0), 0f, 0.5f, 1f, 1f) && IsRect(View(settled, 1), 0f, 0f, 0.5f, 0.5f) &&
+                    IsRect(View(settled, 2), 0.5f, 0f, 1f, 0.5f), "Static 3 is not a half over two quarters");
+            if (count == 4)
+                Check(IsRect(View(settled, 0), 0f, 0.5f, 0.5f, 1f) && IsRect(View(settled, 1), 0.5f, 0.5f, 1f, 1f) &&
+                    IsRect(View(settled, 2), 0f, 0f, 0.5f, 0.5f) && IsRect(View(settled, 3), 0.5f, 0f, 1f, 0.5f),
+                    "Static 4 is not a grid in camera order");
+        }
+
+        // A death reassigns the screen to the survivors, a revival gives it back.
+        var game = new SplitLayoutSolver();
+        var three = SettleWith(game, settings, P(0, 0f, 0f, 1, 1), P(1, 10f, 0f, 1, 1), P(2, 20f, 0f, 1, 1));
+        var two = SettleWith(game, settings, P(0, 0f, 0f, 1, 1), P(2, 20f, 0f, 1, 1));
+        Check(two.viewports.Length == 2, "Static: the dead player's region was not removed");
+        Tiling(two, "static after a death");
+        Check(IsRect(View(two, 0), 0f, 0f, 0.5f, 1f) && IsRect(View(two, 2), 0.5f, 0f, 1f, 1f),
+            "Static: two survivors did not get the halves in camera order");
+        var one = SettleWith(game, settings, P(2, 20f, 0f, 1, 1));
+        Check(one.viewports.Length == 1 && IsRect(View(one, 2), 0f, 0f, 1f, 1f),
+            "Static: the last survivor did not get the whole screen");
+        var back = SettleWith(game, settings, P(0, 0f, 0f, 1, 1), P(1, 10f, 0f, 1, 1), P(2, 20f, 0f, 1, 1));
+        Tiling(back, "static after revivals");
+        for (int camera = 0; camera < 3; camera++)
+            Check(SameRect(View(back, camera).polygon, View(three, camera).polygon),
+                "Static: camera " + camera + " did not return to its three-player region");
+    }
+
     private static void DeathReflow()
     {
         var solver = new SplitLayoutSolver();
@@ -616,6 +705,7 @@ internal static class Program
             SharedSourceUv();
             ConservativeSameScreenSplit();
             SharedCameraWindow();
+            StaticStyle();
             Console.WriteLine("PASS: " + checks + " layout checks");
             return 0;
         }

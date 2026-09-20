@@ -11,6 +11,24 @@ namespace SplitScreenCoop
 {
     public partial class SplitScreenCoop
     {
+        /// <summary>
+        /// Vanilla bug, not ours, but it ruined a session (log of 2026-09-18: 1201
+        /// exceptions, one per tick, until the game was closed). Frog.ReleaseGrasp reads
+        /// base.grasps[grasp].grabbed without checking the slot, and
+        /// Creature.LoseAllGrasps calls ReleaseGrasp for every slot, empty ones included.
+        /// A frog that is attached to a creature (FrogState.creatureAttachedTo) but holds
+        /// nothing in that slot therefore throws whenever anything makes it lose its
+        /// grasps. An activating warp point does that every tick from
+        /// WarpPoint.SuckInCreatures; the exception aborts Room.Update, so the whole room
+        /// stops updating. Creature.ReleaseGrasp does nothing for an empty slot, and
+        /// neither does this.
+        /// </summary>
+        private void Frog_ReleaseGrasp(On.Watcher.Frog.orig_ReleaseGrasp orig, Watcher.Frog self, int grasp)
+        {
+            if (self?.grasps == null || grasp < 0 || grasp >= self.grasps.Length || self.grasps[grasp] == null) return;
+            orig(self, grasp);
+        }
+
         public delegate AbstractCreature orig_get_FirstAlivePlayer(RainWorldGame self);
         public AbstractCreature get_FirstAlivePlayer(orig_get_FirstAlivePlayer orig, RainWorldGame self)
         {

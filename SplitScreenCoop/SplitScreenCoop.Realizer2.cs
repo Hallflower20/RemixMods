@@ -26,7 +26,11 @@ namespace SplitScreenCoop
             // one budget (see RoomRealizer_CurrentPerformanceEstimation), so the
             // budget grows with the player count instead of each realizer silently
             // owning a full vanilla budget of its own.
-            float budget = 1500f + 750f * additionalRealizers.Count;
+            // Vanilla keeps 1500 worth of rooms realized around one player. Every extra
+            // player adds a share for their own surroundings; the Remix slider trades
+            // room-load hitches (low) against rooms updating every tick (high).
+            float perExtraPlayer = Options != null ? Options.ExtraRealizerBudget.Value : 750f;
+            float budget = 1500f + perExtraPlayer * additionalRealizers.Count;
             game.roomRealizer.performanceBudget = budget;
             foreach (RoomRealizer realizer in additionalRealizers) realizer.performanceBudget = budget;
             Logger.LogInfo($"Created {additionalRealizers.Count} additional room realizer(s); shared performance budget={budget}");
@@ -93,6 +97,13 @@ namespace SplitScreenCoop
             foreach (RoomCamera camera in game.cameras)
             {
                 if (camera?.room == null || camera.room.world == game.world || camera.spriteLeasers == null) continue;
+                // A camera already heading for a room of the new world (every camera
+                // during a warp: WarpMoveCameraActual runs before WorldLoaded finishes)
+                // is on its way, not left behind. Clearing it here tore the warp's
+                // ripple and hold-frame mask sources out from under the camera the
+                // players were watching and left its colours broken, and emptied the
+                // other two cells until their move completed.
+                if (camera.loadingRoom != null) continue;
                 int count = camera.spriteLeasers.Count;
                 for (int i = 0; i < count; i++)
                 {

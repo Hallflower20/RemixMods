@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using MonoMod.Cil;
 using Mono.Cecil.Cil;
 using UnityEngine;
@@ -17,6 +18,59 @@ namespace SplitScreenCoop
         /// </summary>
         private static readonly string[] loadedLevelTextureKeys = new string[4];
         private static int sharedLevelTextureCopies;
+
+        /// <summary>
+        /// Decoded level images, keyed like the sibling copy. Decoding a 1400x800 PNG
+        /// on the main thread is the 50-100 ms hitch on every screen change, and
+        /// players walk the same screens back and forth all cycle. Keep the last few
+        /// decoded images (about 4.5 MB each) and upload them raw instead.
+        /// </summary>
+        private const int LevelTextureCacheEntries = 12;
+        private sealed class CachedLevelTexture
+        {
+            public string key;
+            public byte[] pixels;
+            public int width, height, mipmapCount;
+            public TextureFormat format;
+        }
+        private static readonly List<CachedLevelTexture> levelTextureCache = new List<CachedLevelTexture>();
+
+        private static CachedLevelTexture FindCachedLevelTexture(string key)
+        {
+            for (int i = 0; i < levelTextureCache.Count; i++)
+                if (levelTextureCache[i].key == key) return levelTextureCache[i];
+            return null;
+        }
+
+        private static void RememberLevelTexture(string key, Texture2D texture)
+        {
+            if (key == null || texture == null) return;
+            try
+            {
+                CachedLevelTexture entry = FindCachedLevelTexture(key);
+                if (entry == null)
+                {
+                    entry = new CachedLevelTexture { key = key };
+                    levelTextureCache.Add(entry);
+                    while (levelTextureCache.Count > LevelTextureCacheEntries) levelTextureCache.RemoveAt(0);
+                }
+                else
+                {
+                    // Most recently used goes last.
+                    levelTextureCache.Remove(entry);
+                    levelTextureCache.Add(entry);
+                }
+                entry.pixels = texture.GetRawTextureData<byte>().ToArray();
+                entry.width = texture.width;
+                entry.height = texture.height;
+                entry.mipmapCount = texture.mipmapCount;
+                entry.format = texture.format;
+            }
+            catch (Exception error)
+            {
+                sLogger?.LogWarning("[LevelTexture] could not cache " + key + ": " + error.Message);
+            }
+        }
 
         /// <summary>
         /// Every session creates new cameras with blank level textures. A key left
@@ -89,9 +143,32 @@ namespace SplitScreenCoop
                     }
                 }
             }
+            if (tracked && key != null && texture != null)
+            {
+                CachedLevelTexture cached = FindCachedLevelTexture(key);
+                if (cached != null && cached.pixels != null && cached.width == texture.width && cached.height == texture.height &&
+                    cached.format == texture.format && cached.mipmapCount == texture.mipmapCount)
+                {
+                    try
+                    {
+                        texture.LoadRawTextureData(cached.pixels);
+                        texture.Apply(false, false);
+                        loadedLevelTextureKeys[number] = key;
+                        levelTextureCache.Remove(cached);
+                        levelTextureCache.Add(cached);
+                        NoteFrameEvent("level texture cached cam=" + number);
+                        return true;
+                    }
+                    catch (Exception error)
+                    {
+                        sLogger?.LogWarning("[LevelTexture] cached upload failed, decoding instead: " + error.Message);
+                    }
+                }
+            }
             NoteFrameEvent("level texture decode cam=" + number);
             bool loaded = ImageConversion.LoadImage(texture, bytes, markNonReadable);
             if (tracked) loadedLevelTextureKeys[number] = loaded ? key : null;
+            if (loaded && tracked && key != null && !markNonReadable) RememberLevelTexture(key, texture);
             return loaded;
         }
 

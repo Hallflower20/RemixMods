@@ -64,6 +64,18 @@ namespace SplitScreenCoop
 
         public static SplitMode CurrentSplitMode;
         public static bool alwaysSplit;
+        /// <summary>
+        /// The "Static" split style: the Dynamic pipeline with cells that never merge.
+        /// Every living player owns a fixed region decided by how many are alive (one,
+        /// two halves, a half over two quarters, four quarters); a death or a revival
+        /// hands the screen out again, nothing else moves it.
+        /// </summary>
+        public static bool staticStyle;
+        /// <summary>
+        /// Cells never merge: the "Permanent split" checkbox, or the Static style.
+        /// Dual displays keep their own rules (they force alwaysSplit off).
+        /// </summary>
+        public static bool NeverMerge => alwaysSplit || (staticStyle && !dualDisplays);
         public static bool dualDisplays;
         public static bool stickTogetherEnabled;
 
@@ -198,6 +210,10 @@ namespace SplitScreenCoop
                 IL.HUD.Map.Draw += HudMap_Draw;
                 On.HUD.KarmaMeter.Draw += KarmaMeter_Draw;
                 On.HUD.FoodMeter.Draw += FoodMeter_Draw;
+                On.RoomPreparer.Update += RoomPreparer_Update; // name slow room-loading slices in [FrameHitch]
+                On.RainWorld.Update += RainWorld_Update; // [FrameHitch]: everything the game's scripts do in a frame
+                On.Futile.LateUpdate += Futile_LateUpdate; // [FrameHitch]: Futile's mesh rebuild
+                On.Watcher.Frog.ReleaseGrasp += Frog_ReleaseGrasp; // vanilla null dereference that froze a room every tick
                 On.HUD.RainMeter.Draw += RainMeter_Draw;
                 On.HUD.TextPrompt.Draw += TextPrompt_Draw;
 
@@ -221,10 +237,23 @@ namespace SplitScreenCoop
                 // wrapped calls to store shader globals
                 On.RoomCamera.DrawUpdate += RoomCamera_DrawUpdate;
                 On.RoomCamera.SpriteLeaser.Update += SpriteLeaser_Update; // no DrawSprites for cameras that do not render
+                On.RoomCamera.PausedDrawUpdate += RoomCamera_PausedDrawUpdate; // paused draws count as draws
+                // Globals computed from one camera in room scope, and effects gated on cameras[0]
+                On.MoreSlugcats.BlizzardGraphics.Update += BlizzardGraphics_Update;
+                On.MoreSlugcats.DustWave.Update += DustWave_Update;
+                On.LightSource.Update += LightSource_Update;
+                On.LightBeam.Update += LightBeam_Update;
+                On.MoreSlugcats.EnergySwirl.Update += EnergySwirl_Update;
+                On.GoldFlakes.Update += GoldFlakes_Update;
+                On.GoldFlakes.GoldFlake.Update += GoldFlake_Update;
+                On.MoreSlugcats.FairyParticle.Update += FairyParticle_Update;
+                On.GenericZeroGSpeck.Update += GenericZeroGSpeck_Update;
+                On.AboveCloudsView.Update += AboveCloudsView_Update;
                 On.RoomCamera.Update += RoomCamera_Update;
                 On.RoomCamera.MoveCamera_int += RoomCamera_MoveCamera_int;
                 On.RoomCamera.MoveCamera_Room_int += RoomCamera_MoveCamera_Room_int; // can also colapse to single cam if one of the cams is dead
                 On.RoomCamera.UpdateSnowLight += RoomCamera_UpdateSnowLight;
+                On.MoreSlugcats.Snow.DrawSprites += Snow_DrawSprites; // visibleSnow is one field for every camera
                 // Palette changes reach ApplyPalette from room effects, the day/night
                 // cycle and palette-changing rooms, none of which run inside a scoped
                 // RoomCamera call. Its fog-amount global would then be recorded against
@@ -265,6 +294,7 @@ namespace SplitScreenCoop
                 On.Watcher.DynamicLevelElement.AddLevelCombiner += DynamicLevelElement_AddLevelCombiner;
                 On.Watcher.DynamicLevelElement.DrawSprites += DynamicLevelElement_DrawSprites;
                 On.Watcher.MaskSource.DrawUpdate += MaskSource_DrawUpdate;
+                On.Watcher.MaskSource.CreateGameObject += MaskSource_CreateGameObject;
                 On.Watcher.FloatingDebris.RippleFlow.Update += RippleFlow_Update;
                 On.Watcher.RippleSpider.RippleSpiderSpawner.SpawnRippleTear += RippleSpiderSpawner_SpawnRippleTear;
                 On.RoomCamera.ClearMaskMaker += RoomCamera_ClearMaskMaker;
@@ -301,6 +331,10 @@ namespace SplitScreenCoop
                     typeof(SplitScreenCoop).GetMethod("Shader_SetGlobalTextureString"), this);
                 new Hook(typeof(Watcher.MaskSource).GetProperty("isVisible", BindingFlags.Public | BindingFlags.Instance).GetGetMethod(),
                     typeof(SplitScreenCoop).GetMethod("MaskSource_get_IsVisible"), this);
+                // Every way vanilla moves a mask mesh ends in these three setters (see MaskPlacement).
+                foreach (string setter in new[] { "GameObjectPos", "GameObjectRotation", "GameObjectScale" })
+                    new Hook(typeof(Watcher.MaskSource).GetProperty("set" + setter, BindingFlags.Public | BindingFlags.Instance).GetSetMethod(),
+                        typeof(SplitScreenCoop).GetMethod("MaskSource_set_" + setter), this);
 
                 Logger.LogInfo("OnModsInit done");
 
@@ -354,6 +388,7 @@ namespace SplitScreenCoop
         {
             dualDisplays = Options.DualDisplays.Value;
             alwaysSplit = Options.AlwaysSplit.Value;
+            staticStyle = Options.SplitStyle.Value == "Static";
             dynamicStyle = Options.SplitStyle.Value != "Classic" && dynamicPipelineAvailable &&
                 !dynamicPipelineFailed;
             // Existing installs may still hold the old eager default in their
@@ -366,6 +401,7 @@ namespace SplitScreenCoop
             dynamicSettings.zoomExponent = Options.ZoomExponent.Value;
             dynamicSettings.dividerWidth = Options.DividerWidth.Value;
             dynamicSettings.smoothingTime = Options.SmoothingTime.Value;
+            cameraRenderingMode = Options.CameraRendering.Value;
             dynamicDebugOverlay = Options.DebugOverlay.Value;
             FilterMode zoomFilter = Options.ZoomedFilter.Value == "Point"
                 ? FilterMode.Point : FilterMode.Bilinear;
@@ -382,9 +418,29 @@ namespace SplitScreenCoop
             }
             else
             {
-                cameraListeners[1]?.BindToDisplay(Display.main);
+                // A second display that was active earlier keeps its last texture for
+                // ever unless it is pointed back at the main screen.
+                MirrorSecondaryDisplays();
+                foreach (CameraListener listener in cameraListeners)
+                    if (listener?.display != null && listener.display != Display.main)
+                        listener.BindToDisplay(Display.main);
                 dualDisplays = false;
             }
+        }
+
+        /// <summary>
+        /// Every secondary display shows Futile's main screen, and any camera bound
+        /// to one stops rendering, until SetSplitMode binds a camera to it again:
+        /// menus, shutdown, one survivor. Works on the displays themselves, so it
+        /// does not matter which camera last owned display 2.
+        /// </summary>
+        public static void MirrorSecondaryDisplays()
+        {
+            if (Futile.screen?.renderTexture == null) return;
+            foreach (CameraListener listener in cameraListeners)
+                if (listener?.display != null && listener.display != Display.main) listener.mirrorMain = true;
+            foreach (DisplayExtras extras in displayExtras)
+                if (extras != null && extras.display != Display.main) extras.MapToTexture(Futile.screen.renderTexture);
         }
 
         public static bool DualDisplaySupported()
@@ -521,6 +577,7 @@ namespace SplitScreenCoop
                 if (hudCameras[i] != null) hudCameras[i].transform.position = new Vector3(x, y, -10f);
             }
             if (globalHudCamera != null) globalHudCamera.transform.position = fcameras[0].transform.position;
+            foreach (DisplayExtras extras in displayExtras) extras?.SyncImageRect();
         }
 
 
@@ -586,6 +643,7 @@ namespace SplitScreenCoop
             pendingKarmaFlowerPosition = null;
             CurrentSplitMode = SplitMode.NoSplit;
             ResetCameraDiagnostics();
+            inputLoggedAfterStart = false;
             ResetDynamicLayout();
 
             orig(self, manager);
@@ -606,7 +664,7 @@ namespace SplitScreenCoop
                     MovePlayerNamesToWorld(self.cameras[i]);
                 }
                 SetSplitMode(dynamicStyle && !dualDisplays ? SplitMode.NoSplit :
-                    alwaysSplit ? ResolveSplitMode(self.session.Players.Count) : SplitMode.NoSplit, self, "game start");
+                    NeverMerge ? ResolveSplitMode(self.session.Players.Count) : SplitMode.NoSplit, self, "game start");
                 // SetSplitMode leaves camera 0 rendering straight to the display with
                 // the HUD cameras still off. Without a layout solved here the first
                 // frames after spawn-in show one un-composited world and no HUD,
@@ -619,6 +677,9 @@ namespace SplitScreenCoop
                 Logger.LogInfo("no camera2");
                 SetSplitMode(SplitMode.NoSplit, self, "single camera game start");
             }
+            EnsurePlayerControllers(self);
+            LogInputSetups(self, "game start");
+            Logger.LogInfo($"[CameraLayout] frame={Time.frameCount} split style={Options?.SplitStyle.Value}; dynamicPipeline={dynamicStyle}; static={staticStyle}; neverMerge={NeverMerge}; dualDisplays={dualDisplays}");
             Logger.LogInfo("RainWorldGame_ctor done");
         }
 
@@ -661,17 +722,19 @@ namespace SplitScreenCoop
             // death screen never arrives. That was the seventh playtest's lockout.
             try
             {
-                if ((dynamicActive || dynamicStyle) && !dualDisplays && self.cameras?.Length > 1)
+                // Dual displays isolate each camera's world and HUD on its own stage
+                // too, so they need the same hand-back to Futile's root stage.
+                if ((dynamicActive || dynamicStyle || dualDisplays) && self.cameras?.Length > 1)
                 {
                     RestoreClassicWorld(self);
                     RestoreClassicHud(self);
                 }
                 ResetDynamicLayout();
+                frameRenderCamera = -1;
+                rotationHoldsCameras = false;
+                ApplyRotationFrameCap(1); // menus run at the player's own frame limit
                 SetSplitMode(SplitMode.NoSplit, self, "game shutdown");
-                if (dualDisplays && DualDisplaySupported())
-                {
-                    cameraListeners[1].mirrorMain = true;
-                }
+                if (DualDisplaySupported()) MirrorSecondaryDisplays();
                 realizer2 = null;
                 additionalRealizers.Clear();
                 ForgetLevelTextures();
@@ -682,6 +745,12 @@ namespace SplitScreenCoop
             try
             {
                 DisposeWatcherMasks();
+                // Vanilla never removes AbstractSpaceVisualizer's ~500 hidden community
+                // labels from Futile.stage (PreSwitchMainProcess only hides them), so
+                // the root stage grew by 500 nodes per session (2983 after six) that
+                // Futile walked every frame.
+                if (self.abstractSpaceVisualizer?.communityLabels != null)
+                    foreach (FLabel label in self.abstractSpaceVisualizer.communityLabels) label?.RemoveFromContainer();
                 // Leave the cameras the way a menu needs them instead of relying on the
                 // watchdog to notice one frame later: SetSplitMode above just enabled
                 // whichever camera still had a living player and pointed camera 0 at its
@@ -727,18 +796,31 @@ namespace SplitScreenCoop
             HangMarker = "EnsureStableCameraAssignments";
             if (self.IsStorySession && self.cameras?.Length > 1) EnsureStableCameraAssignments(self);
             HangMarker = "RainWorldGame.Update(orig)";
+            long tickStart = phaseWatch.ElapsedTicks;
             orig(self);
+            long tickEnd = phaseWatch.ElapsedTicks;
+            frameUpdateMs += (tickEnd - tickStart) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            frameTicks++;
             HangMarker = "RainWorldGame_Update.post";
             // An exception here would leave RawUpdate before GrafUpdate: game logic
             // and audio would continue while nothing is ever drawn again.
             try { RainWorldGame_UpdatePost(self); }
             catch (Exception error) { LogHookError("RainWorldGame_Update.post", error); }
+            frameModTickMs += (phaseWatch.ElapsedTicks - tickEnd) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             HangMarker = "idle";
         }
 
         private void RainWorldGame_UpdatePost(RainWorldGame self)
         {
             if (!self.IsStorySession) return;
+            if (!inputLoggedAfterStart)
+            {
+                // The constructor's [Input] line runs before the game is the current
+                // process, so its multiplayerContext is always False. Log once more
+                // from the first tick, where it means something.
+                inputLoggedAfterStart = true;
+                LogInputSetups(self, "first tick");
+            }
             if (self.cameras.Length > 1 && dynamicStyle && dynamicPipelineFailed)
             {
                 Logger.LogWarning($"[CameraLayout] frame={Time.frameCount} restoring Classic after compositor failure");
@@ -761,6 +843,11 @@ namespace SplitScreenCoop
                 }
                 else
                 {
+                // SetSplitMode falls back to camera 0 when nobody is alive. Ask for the
+                // same here, or the comparison below fails on every tick of a game over
+                // and SetSplitMode, with its display rebinding and two log lines, runs
+                // forty times a second (84 times in the log of 2026-09-19).
+                if (aliveCameras.Count == 0 && self.cameras.Length > 0) aliveCameras.Add(self.cameras[0].cameraNumber);
                 bool splitTargets = aliveCameras
                     .Select(cameraNumber => self.cameras.FirstOrDefault(camera => camera.cameraNumber == cameraNumber))
                     .Where(camera => camera != null)
@@ -769,7 +856,7 @@ namespace SplitScreenCoop
                         : new RoomTarget())
                     .Distinct()
                     .Count() > 1;
-                SplitMode desiredMode = !dualDisplays && aliveCameras.Count > 1 && (alwaysSplit || splitTargets)
+                SplitMode desiredMode = !dualDisplays && aliveCameras.Count > 1 && (NeverMerge || splitTargets)
                     ? ResolveSplitMode(aliveCameras.Count)
                     : SplitMode.NoSplit;
                 List<int> desiredRenderedCameras = dualDisplays
@@ -845,6 +932,9 @@ namespace SplitScreenCoop
 
                 if (dualDisplays)
                 {
+                    // With one survivor display 2 has no camera; show the main screen
+                    // there instead of the last frame its previous camera drew.
+                    if (renderedCameraNumbers.Count < 2) MirrorSecondaryDisplays();
                     for (int slot = 0; slot < renderedCameraNumbers.Count; slot++)
                     {
                         int cameraNumber = renderedCameraNumbers[slot];
@@ -938,14 +1028,22 @@ namespace SplitScreenCoop
 
         private List<int> GetAliveCameraNumbers(RainWorldGame game)
         {
-            if (game?.session?.Players == null || game.cameras == null) return new List<int>();
-            return game.session.Players
-                .Where(player => !IsCreatureDead(player))
-                .OrderBy(player => (player.state as PlayerState)?.playerNumber ?? int.MaxValue)
-                .Select(player => (player.state as PlayerState)?.playerNumber ?? game.session.Players.IndexOf(player))
-                .Where(playerNumber => game.cameras.Any(camera => camera.cameraNumber == playerNumber))
-                .Distinct()
-                .ToList();
+            // Living players that own a camera, by player number, each once. This runs
+            // every tick and more; it was a seven-stage LINQ chain with a closure per
+            // player.
+            var alive = new List<int>(4);
+            if (game?.session?.Players == null || game.cameras == null) return alive;
+            for (int i = 0; i < game.session.Players.Count; i++)
+            {
+                AbstractCreature player = game.session.Players[i];
+                if (IsCreatureDead(player)) continue;
+                int number = (player.state as PlayerState)?.playerNumber ?? i;
+                if (alive.Contains(number)) continue;
+                foreach (RoomCamera camera in game.cameras)
+                    if (camera != null && camera.cameraNumber == number) { alive.Add(number); break; }
+            }
+            alive.Sort();
+            return alive;
         }
 
         /// <summary>
@@ -1139,30 +1237,31 @@ namespace SplitScreenCoop
             }
         }
 
+        // Reused by the meter hooks below: they ran with two new lists per meter per camera per frame.
+        private readonly List<Vector2> hudScratchA = new List<Vector2>(), hudScratchB = new List<Vector2>();
+
         public void RainMeter_Draw(On.HUD.RainMeter.orig_Draw orig, HUD.RainMeter self, float timeStacker)
         {
             if (dynamicStyle && !dualDisplays) { orig(self, timeStacker); return; }
-            List<Vector2> oldPoses = new List<Vector2>();
-            List<Vector2> oldLastPoses = new List<Vector2>();
             RoomCamera cam = GetHUDPartCurrentCamera(self);
-            if (cam != null)
+            Vector2 offset = cam != null ? GetGlobalHudOffset(cam) : Vector2.zero;
+            // Dual displays and a single camera on screen have nothing to move.
+            if (offset == Vector2.zero) { orig(self, timeStacker); return; }
+            hudScratchA.Clear(); hudScratchB.Clear();
+            for (int i = 0; i < self.circles.Length; i++)
             {
-                var offset = GetGlobalHudOffset(cam);
-                for (int i = 0; i < self.circles.Length; i++)
-                {
-                    oldPoses.Add(self.circles[i].pos);
-                    oldLastPoses.Add(self.circles[i].lastPos);
-                    self.circles[i].pos += offset;
-                    self.circles[i].lastPos += offset;
-                }
+                hudScratchA.Add(self.circles[i].pos);
+                hudScratchB.Add(self.circles[i].lastPos);
+                self.circles[i].pos += offset;
+                self.circles[i].lastPos += offset;
             }
-            orig(self, timeStacker);
-            if (cam != null)
+            try { orig(self, timeStacker); }
+            finally
             {
-                for (int j = 0; j < self.circles.Length; j++)
+                for (int j = 0; j < self.circles.Length && j < hudScratchA.Count; j++)
                 {
-                    self.circles[j].pos = oldPoses[j];
-                    self.circles[j].lastPos = oldLastPoses[j];
+                    self.circles[j].pos = hudScratchA[j];
+                    self.circles[j].lastPos = hudScratchB[j];
                 }
             }
         }
@@ -1216,66 +1315,98 @@ namespace SplitScreenCoop
             }
         }
 
+        /// <summary>
+        /// The warmth meter. Vanilla places its ten circles INSIDE Draw
+        /// (circles[i].pos = pos + ...), unlike RainMeter, which places them in
+        /// Update. This hook used to shift the circles, let Draw overwrite pos, then
+        /// "restore" every circle's pos to what it held before Draw. HUDCircle.Update
+        /// copies pos into lastPos on the next tick, so lastPos never left the
+        /// constructor's (-100, -100), and a circle is drawn at
+        /// Lerp(lastPos, pos, timeStacker): every circle swept from beyond the bottom
+        /// left corner of the screen to its place, forty times a second, whenever the
+        /// hook took that path, i.e. in Classic split and on dual displays, even with
+        /// an offset of zero ("the warmth indicator is bugging around the bottom
+        /// left", 2026-09-19). Move the meter, which is what Draw reads, and leave
+        /// the circles alone.
+        /// </summary>
         public void HypothermiaMeter_Draw(On.MoreSlugcats.HypothermiaMeter.orig_Draw orig, MoreSlugcats.HypothermiaMeter self, float timeStacker)
         {
-            if (dynamicStyle && !dualDisplays) { orig(self, timeStacker); return; }
-            List<Vector2> oldPoses = new List<Vector2>();
-            List<Vector2> oldLastPoses = new List<Vector2>();
-            RoomCamera cam = GetHUDPartCurrentCamera(self);
-            if (cam != null)
+            Vector2 offset = HypothermiaMeterOffset(self);
+            if (offset == Vector2.zero) { orig(self, timeStacker); return; }
+            Vector2 pos = self.pos, lastPos = self.lastPos;
+            self.pos += offset;
+            self.lastPos += offset;
+            try { orig(self, timeStacker); }
+            finally
             {
-                var offset = GetGlobalHudOffset(cam);
-                for (int i = 0; i < self.circles.Length; i++)
-                {
-                    oldPoses.Add(self.circles[i].pos);
-                    oldLastPoses.Add(self.circles[i].lastPos);
-                    self.circles[i].pos += offset;
-                    self.circles[i].lastPos += offset;
-                }
+                self.pos = pos;
+                self.lastPos = lastPos;
             }
-            orig(self, timeStacker);
-            if (cam != null)
-            {
-                for (int j = 0; j < self.circles.Length; j++)
-                {
-                    self.circles[j].pos = oldPoses[j];
-                    self.circles[j].lastPos = oldLastPoses[j];
-                }
-            }
+        }
+
+        private Vector2 HypothermiaMeterOffset(MoreSlugcats.HypothermiaMeter self)
+        {
+            RoomCamera cam = CameraOfHud(self?.hud);
+            if (cam == null) return Vector2.zero;
+            if (!(dynamicStyle && !dualDisplays)) return GetGlobalHudOffset(cam);
+            // Dynamic and Static: warmth is a reading per player, so unlike food, karma
+            // and rain it stays in its own view's HUD. That HUD texture is drawn into
+            // the view's cell shifted by DynamicHudShift (a point h of the texture lands
+            // at h - shift on screen), which leaves the HUD's bottom left corner, where
+            // this meter lives, outside every cell smaller than the screen: the meter
+            // was simply not visible. Put it in the corner of its own cell.
+            if (!dynamicActive) return Vector2.zero;
+            var view = DynamicViewportForCamera(cam.cameraNumber);
+            if (view?.polygon == null || view.ghost) return Vector2.zero;
+            Vector2 min = new Vector2(1f, 1f), max = Vector2.zero;
+            ExpandBounds(view.polygon, ref min, ref max);
+            if (min.x > max.x || min.y > max.y) return Vector2.zero;
+            Vector2 shift = DynamicHudShift(view);
+            return new Vector2((min.x + shift.x) * cam.sSize.x, (min.y + shift.y) * cam.sSize.y);
+        }
+
+        /// <summary>The camera a HUD belongs to, whoever is drawing it.</summary>
+        private static RoomCamera CameraOfHud(HUD.HUD hud)
+        {
+            RainWorldGame game = hud?.rainWorld?.processManager?.currentMainLoop as RainWorldGame;
+            if (game?.cameras == null) return null;
+            foreach (RoomCamera camera in game.cameras)
+                if (camera != null && camera.hud == hud) return camera;
+            return null;
         }
 
         public void GourmandMeter_Draw(On.MoreSlugcats.GourmandMeter.orig_Draw orig, MoreSlugcats.GourmandMeter self, float timeStacker)
         {
             if (dynamicStyle && !dualDisplays) { orig(self, timeStacker); return; }
-            List<Vector2> oldPoses = new List<Vector2>();
-            List<Vector2> oldGoalPoses = new List<Vector2>();
             RoomCamera cam = GetHUDPartCurrentCamera(self);
-            if (cam != null)
+            Vector2 offset = cam != null ? GetGlobalHudOffset(cam) : Vector2.zero;
+            if (offset == Vector2.zero) { orig(self, timeStacker); return; }
+            hudScratchA.Clear(); hudScratchB.Clear();
+            for (int i = 0; i < self.CollectedSymbols.Count; i++)
             {
-                var offset = GetGlobalHudOffset(cam);
-                for (int i = 0; i < self.CollectedSymbols.Count; i++)
-                {
-                    oldPoses.Add(self.CollectedSymbols[i].Pos);
-                    oldGoalPoses.Add(self.CollectedSymbols[i].GoalPos);
-                    self.CollectedSymbols[i].Pos += offset;
-                    self.CollectedSymbols[i].GoalPos += offset;
-                }
+                hudScratchA.Add(self.CollectedSymbols[i].Pos);
+                hudScratchB.Add(self.CollectedSymbols[i].GoalPos);
+                self.CollectedSymbols[i].Pos += offset;
+                self.CollectedSymbols[i].GoalPos += offset;
             }
-            orig(self, timeStacker);
-            if (cam != null)
+            try { orig(self, timeStacker); }
+            finally
             {
-                for (int j = 0; j < self.CollectedSymbols.Count; j++)
+                for (int j = 0; j < self.CollectedSymbols.Count && j < hudScratchA.Count; j++)
                 {
-                    self.CollectedSymbols[j].Pos = oldPoses[j];
-                    self.CollectedSymbols[j].GoalPos = oldGoalPoses[j];
+                    self.CollectedSymbols[j].Pos = hudScratchA[j];
+                    self.CollectedSymbols[j].GoalPos = hudScratchB[j];
                 }
             }
         }
 
         public RoomCamera GetHUDPartCurrentCamera(HUD.HudPart hudPart)
         {
+            // While paused RainWorldGame.GrafUpdate draws each HUD itself, outside any
+            // camera's DrawUpdate; the meters lost their split offset for the length of
+            // the pause. A HUD knows its camera whoever draws it.
             if (curCamera == -1)
-                return null;
+                return CameraOfHud(hudPart?.hud);
             var loop = hudPart.hud.rainWorld.processManager.currentMainLoop;
             if (loop is RainWorldGame)
                 return ((RainWorldGame)loop).cameras[curCamera];
@@ -1683,7 +1814,11 @@ namespace SplitScreenCoop
             }
             if (flag && self.room.snow && self.room.BeingViewed)
             {
-                int finalVisibility = self.visibility;
+                // Not visible unless a camera says so. This started from self.visibility,
+                // so a source outside every camera's screen stayed at 2 ("never checked"),
+                // which is itself a reason to run this block: every camera in the room
+                // re-blitted its full-screen snow map on every tick, for ever.
+                int finalVisibility = 0;
                 for (int j = 0; j < self.room.game.cameras.Length; j++)
                 {
                     RoomCamera cam = self.room.game.cameras[j];

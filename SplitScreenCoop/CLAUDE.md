@@ -63,7 +63,75 @@ csc.exe /nologo /target:exe /out:Tests.exe SplitLayoutSolver.cs Tests\UnityMathS
   `PUBLIC-Assembly-CSharp.dll` from `BepInEx/utils`, not the stock assembly. The reflection
   in `RotSpores.cs` is defensive, not required.
 - **After the game shuts down, exactly one camera may draw:** camera 0 into Futile's
-  screen texture. `RestoreMenuCameras` does this; do not re-isolate masks at shutdown.
+  screen texture, with its `CameraListener` direct and not compositing. `RestoreMenuCameras`
+  does this; do not re-isolate masks at shutdown. A listener left in split mode copies
+  its stale texture over the menu every frame (the "frozen screen after sleep").
+- **Vanilla draws with `PausedDrawUpdate` while paused.** Anything that watches the draw
+  loop must count those draws too.
+- **The stutter players report at 240 fps is tick judder** (40 Hz tick on one frame in
+  six). Read the `[Perf]` line: avg vs p95. Vanilla's FPS cap option is the remedy.
+- **Drawables retire their leaser inside `DrawSprites`** (`if (slatedForDeletetion ||
+  room != rCam.room) sLeaser.CleanSpritesAndRemove()`). Anything that skips `DrawSprites`
+  for a camera must still call it in that case, or the camera leaks sprites for ever.
+- **A named `GrabPass` happens once per frame, not once per camera** — and the Watcher
+  shaders use seventeen of them. That is why Dynamic mode renders one world camera per
+  frame (`SelectFrameCamera`, Auto/option). Before touching that, read HANDOFF §5 "Camera
+  audit": it lists every per-camera input and how it is replicated.
+- **A shader global written in `Room.Update` must not depend on a camera.** If vanilla
+  does (`_tileCorrection`), recompute it per viewing camera. `[ShaderAudit]` in the log
+  names every global written outside camera scope and the method that wrote it.
+- **Flat lime/red (or any flat data colour) on screen is a raw Watcher mask mesh, not a
+  palette or grab problem.** `MaskSource`s are Unity meshes on layer 0 whose shaders
+  write data; only a camera that also has the layer's grab quad may see them. Vanilla
+  moves them three ways (`DrawUpdate`, the `setGameObject*` setters directly, or not at
+  all), so placement is recorded from the setters and from the sprite leaser, never
+  from one call site. Any camera that draws layer 0 without world content (the overlay
+  camera) must refuse them (`HideMaskSourcesFromOverlay`, `[MaskAudit]`). An artifact
+  that crosses the split divider unclipped is drawn by the overlay camera: look there
+  first. HANDOFF §5 "Fifteenth log" has the three rounds this cost.
+- **Vanilla follows the Watcher with every camera in the ripple layer**
+  (`coopRippleDimensionPlayer`). `RoomCamera_Update` clears it before `orig` when each
+  player has a camera, or the cameras fight `EnsureStableCameraAssignments` every tick.
+- **Remix draws elements in add order** and a combo box's list belongs to its box: make
+  boxes with `Combo(...)` and add them last, lowest first.
+- **A shader that reads `_GrabTexture` without its own `GrabPass` sees the last grab of
+  any camera - but only if it draws before its own camera's first grab.** Futile sets
+  every sprite layer's queue itself (`3000 + depth`), so a shader's `Queue` tag means
+  nothing: draw order is container order. (An earlier note here blamed the lime/red
+  artifact on `DisplaySnowShader`; it was never the snow sprite, see the rule above.)
+  Each camera binds its previous frame as `_GrabTexture` in
+  `OnPreRender` (`BindOwnGrab`). HANDOFF §5 "Thirteenth log" has the audit of all 306
+  shaders; `Tools/grabaudit.py` and `Tools/shaderdisasm2.py` re-run it (pip install UnityPy).
+- **Taking turns costs every view its share of the frames.** Under the game's 60 fps
+  limit two views got 30 each, which players report as lag although `[Perf]` is flat.
+  `ApplyRotationFrameCap` raises `Application.targetFrameRate` by the number of views
+  for as long as the rotation runs and puts the old value back. Auto judges only
+  frames in which the rotation ran (median, per view, 38 fps) and retries with a
+  back-off; it must not flap on merged states or on a load in the window. Check
+  `[Perf] fpsPerView= frameLimit= vsync=`.
+- **Whoever stops the rotation hands the cameras back.** It leaves all but one camera
+  disabled; only the dynamic pipeline re-enables them by itself. A frozen second
+  display, or a pause menu missing on one display, is this.
+- **A HUD part that places sprites inside `Draw` cannot be moved by shifting those
+  sprites around `orig`** (`HypothermiaMeter`): shift the part's own `pos`/`lastPos`.
+  Read the vanilla `Draw` before writing such a hook.
+- **Three split styles.** Dynamic (merge and part), Static (the same pipeline with
+  `NeverMerge`: a fixed region per *living* player, reflowing only on death or revival,
+  no shelter collapse) and Classic (the original non-isolated layouts). Read
+  `NeverMerge`, not `alwaysSplit`, anywhere merging is decided.
+- **Futile's stage list order is draw order** (render queue 3000 + depth, handed out stage
+  by stage). Harmless while every stage has its own Unity camera; the moment one camera
+  draws several stages (dual displays: world + HUD + root) they must be listed bottom to
+  top. The list is world 0-3, HUD 0-3, global HUD, root; startup logs it.
+- **Dual displays use the per-camera stages too.** On the root stage every Unity camera
+  draws every RoomCamera's sprites: Futile meshes have 1e10 bounds and are never culled.
+- **Anything moved to another container must be moved in vanilla's creation order.**
+  `RouteNode` appends, so call order is draw order. The Watcher gives every food pip a
+  black `backCircle` that is created first and belongs underneath; routed last it hid the
+  white fill and every pip looked gray for the whole session. When routing a new HUD part,
+  read its constructor for the `AddChild` order first.
+- **Vanilla precasts warps for `cameras[0]` only.** Cameras 1–3 need the `MoveCamera`
+  fallback in `RoomCamera_WarpMoveCameraActual` or they never arrive.
 - **Static per-session state must be reset** in `RainWorldGame_ctor` and
   `RainWorldGame_ShutDownProcess` (level texture keys, safe mode, layout).
 - Log tags and what they mean are tabulated in HANDOFF section 7. Playtest logs arrive as

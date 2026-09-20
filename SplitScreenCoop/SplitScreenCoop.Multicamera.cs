@@ -90,7 +90,9 @@ namespace SplitScreenCoop
                 return;
             }
 
-            if (CurrentSplitMode != SplitMode.NoSplit && renderedCameraNumbers.Count > 1 && !inpause)
+            // Dual displays never leave NoSplit but render two cameras, and each
+            // display needs its own menu; the per-slot offsets are zero there.
+            if ((CurrentSplitMode != SplitMode.NoSplit || dualDisplays) && renderedCameraNumbers.Count > 1 && !inpause)
             {
                 inpause = true;
                 try
@@ -119,6 +121,17 @@ namespace SplitScreenCoop
                     inpause = false;
                 }
             }
+            else if (!(dynamicStyle && !dualDisplays) && renderedCameraNumbers.Count > 0 && !inpause)
+            {
+                // One rendered camera in classic or dual mode. The menu is built at
+                // the world origin, which only camera 0 looks at; when camera 0's
+                // player is dead the survivor's camera renders and the menu was
+                // invisible on every screen.
+                self.container.SetPosition(camOffsets[renderedCameraNumbers[0]]);
+            }
+            // After the menus are placed, and not for the extra menus built above.
+            if (dualDisplays && !inpause) LogPauseDiagnostics(self, "pause menu opened");
+            if (!inpause) ArmPauseOverlayCheck(); // measures, 0.8 s from now, whether each view really got the menu
         }
 
         public void PauseMenu_GrafUpdate(On.Menu.PauseMenu.orig_GrafUpdate orig,
@@ -158,6 +171,7 @@ namespace SplitScreenCoop
         /// </summary>
         public void PauseMenu_ShutDownProcess(On.Menu.PauseMenu.orig_ShutDownProcess orig, Menu.PauseMenu self)
         {
+            if (dualDisplays && !inpause) LogPauseDiagnostics(self, "pause menu closing");
             orig(self);
             if (CurrentSplitMode != SplitMode.NoSplit)
             {
@@ -212,8 +226,9 @@ namespace SplitScreenCoop
         public void Water_InitiateSprites(On.Water.orig_InitiateSprites orig, Water self, RoomCamera.SpriteLeaser sLeaser, RoomCamera rCam)
         {
             orig(self, sLeaser, rCam);
-            if ((dynamicStyle && !dualDisplays && rCam.game?.cameras?.Length > 1) ||
-                CurrentSplitMode != SplitMode.NoSplit)
+            // Every mode with a second camera, dual displays included (they stay in
+            // NoSplit while rendering two cameras).
+            if (rCam.game?.cameras?.Length > 1)
             {
                 var camPos = rCam.pos + rCam.offset;
                 float y = -10f;

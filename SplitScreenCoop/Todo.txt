@@ -90,6 +90,42 @@ Implemented
     on that screen (the vanilla cut moment), and keeps sharing while its player
     stays visible there. Merging no longer swaps a cell to a different screen
     and swipes it into place; the line just fades as the pans converge.
+[ ] Whole-process freezes (26-69 s frames, no [Hang]) in the twelfth log: not
+    the mod's frame cost (p95 4 ms). Next log: look for "[Hang] the whole
+    process stood still" and the renderTextures count; on the playtest PC
+    check RAM use and Event Viewer for display-driver resets.
+[x] Camera audit (HANDOFF §5 "Camera audit"): every named screen grab (17 of
+    them; _SlopedTerrainMask alone feeds slush water and backgrounds) was
+    camera 0's on the other cameras. World cameras now render one per frame
+    (Auto while every view keeps 50 fps; Remix "Camera rendering"), so each
+    frame has one grabbing camera. _tileCorrection (blizzard, dust wave) is
+    recomputed per camera; environment-coloured lights, light beams, gold
+    flakes, fairy particles, zero-g specks and OE clouds run with the viewing
+    camera as cameras[0]. [ShaderAudit] logs any global written outside camera
+    scope with the method that wrote it.
+[x] Sleep/death screens no longer freeze on the last game frame when the
+    surviving player was not camera 0 (listener 0 left in split mode kept
+    copying its stale texture over the menu).
+[x] A pause no longer trips the draw-stall detector on unpausing (paused draws
+    count), and pass-through mode ends by itself after 600 healthy frames.
+[x] The pause menu's cursor draws above the menu again (global HUD stage sits
+    below Futile's root stage).
+[x] Hidden AbstractSpaceVisualizer labels are removed at shutdown (the root
+    stage grew by 500 per session).
+[x] Revisited screens upload a cached level image instead of decoding the PNG.
+[x] Cameras that skip DrawSprites while off still let objects retire their
+    leasers (the skip had leaked every dead object's sprites on those cameras).
+[x] Dynamic level elements (foliage, grass, rot tubes, candles) get their own
+    per-camera grab: Unity's named GrabPass happens once per frame, so the
+    other cameras had combined camera 0's grab into their level texture.
+[x] A warp moves every camera, not only the precast one; a session resumed
+    from a warp no longer leaves cameras 1-3 at room=null with the screen
+    split around an empty cell.
+[x] The unloaded-world cleanup skips cameras already loading a room, so a
+    warp no longer strips the watched camera's ripple masks (broken colours)
+    or empties the other cells.
+[x] [Perf] heartbeat line and an "Extra rooms per player" Remix slider for the
+    realizer budget.
 [x] Sleep lockout after a region change (seventh playtest): a rot-spore renderer
     node of a camera left behind in the unloaded world held a destroyed
     GameObject; re-parenting that camera's layers at shutdown threw, the
@@ -217,6 +253,55 @@ Needs in-game confirmation
     region's AboveCloudsView/RoofTopView effects were the leak.
 [ ] Watch for "[RoomRealizer] refused to abstractize" in the log - a steady stream
     of those would mean rooms are being held realized too aggressively.
+[ ] Snow dunes and other sloped terrain render normally on every view, split or merged:
+    no flat lime hill with a dark red top anywhere, and none crossing the divider (it
+    was a Watcher terrain mask mesh drawn raw by the overlay camera). The log must not
+    contain [MaskAudit]. Grass, candles, pearl reader images and urban shadows now get
+    their masks under Dynamic and Static as well: report anything that looks new.
+[ ] Food pips in the Watcher campaign with 2+ players: eaten pips are white, uneaten
+    ones are rings, both on a dark backing disc (they were all dark discs because the
+    backing disc was routed on top of the fill).
+[ ] Dual display: the [Input] line at game start lists a device for player 2 and
+    player 2 moves; both displays keep updating with one camera per frame (Auto). If a
+    display looks frozen, set Camera rendering to "Every frame" and report.
+[ ] Split on a 60 fps machine: [Perf] shows alternate=True while rendered=[0,1], and the
+    water / foliage / terrain masks are right on the second view.
+[ ] Watcher in the ripple layer with 2+ players: every camera keeps following its own
+    player; no run of "[CameraHealth] forcing room resync ... reason=player assignment".
+[ ] A frog attached to a creature next to an activating warp point no longer fills the
+    log with NullReferenceException in Watcher.Frog.ReleaseGrasp, and the room keeps
+    updating.
+[ ] Remix menu: the split style list opens over the two checkboxes, and on the Dynamic
+    tab the filter list opens over the camera rendering box and that one over the debug
+    checkbox.
+[ ] Dual display pause: the FIRST pause of a session shows the menu on both displays
+    (display 2 used to be frozen: its camera had been left switched off). In the log
+    every pause has "[Pause] ... overlay check" for cam=0 and cam=1 with "IS drawn",
+    and there is no "[CameraHealth] ... stopped rendering".
+[ ] Smoothness with two views (dual displays and split screen): each view should feel
+    like single player. [Perf] shows fpsPerView equal to the game's frame limit and
+    frameLimit at twice that while alternate=True. With vsync on at 60 Hz Auto should
+    say so once and render every camera every frame.
+[ ] Warmth meter in a cold region: ten steady circles under the food pips on dual
+    displays and Classic split; under Dynamic and Static each view shows its own
+    player's meter in the bottom left corner of its own cell.
+[ ] Pausing in a big room: if the game crawls while paused, send the log; the
+    [FrameHitch] lines with paused=True now say where the time went.
+[ ] Static style: 2, 3 and 4 players get halves / half over two quarters / quarters from
+    the first frame, stay split when standing together or sharing a shelter, and the
+    screen is handed out again when a player dies and again when they are revived.
+    Log line: [CameraLayout] split style=Static; static=True; neverMerge=True.
+[ ] Dual display pause: both displays show their pause menu over the game, the pointer
+    is on top on display 1, and the HUD is visible in play (the 19:16 build drew the
+    world over all three). Log line to check: [CameraLayout] stage draw order ends in
+    "global HUD, root" and starts with the world stages.
+[ ] Dual display after isolation: both displays draw world and HUD, pause menus show, and
+    [Perf] frame times are lower than before. Send the log: [Pause] lines explain the
+    missing pointer, [FrameHitch] updateMs/grafMs and "prepare ROOM" events explain lag.
+[ ] Dual display: pause shows a menu on both displays; after player 1 dies the menu is
+    still visible; display 2 shows the menus (not a frozen game frame) after sleeping,
+    dying, and after toggling fullscreen; a second monitor of another aspect is
+    letterboxed, not stretched.
 
 Build notes
 -----------

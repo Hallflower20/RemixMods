@@ -16,7 +16,8 @@ namespace SplitScreenCoop
         private readonly bool[] cameraRoomResyncInProgress = new bool[4];
         private readonly string[] lastCameraStateKeys = new string[4];
         private int lastCameraHealthScanFrame = -CameraHealthScanInterval;
-        private int lastCameraHeartbeatFrame = -600;
+        private float lastCameraHeartbeatTime = -1000f;
+        private int heartbeatsSinceTextureCensus = 1000;
 
         // Frame-hitch diagnostics. Playtests reported stutter, but the log had no
         // timing at all; now any frame over the threshold is logged together with
@@ -43,9 +44,50 @@ namespace SplitScreenCoop
             frameEvents.Append(text);
         }
 
+        // Steady per-frame cost, as opposed to hitches: the last 600 frame times feed
+        // the [Perf] line of the heartbeat, which is what "it lags with three
+        // players" needs to become a number and a suspect.
+        private readonly float[] recentFrameSeconds = new float[600];
+        private int recentFrameIndex;
+        private int recentFrameCount;
+
+        // Where a frame's CPU time went. Update ticks and GrafUpdate are timed around
+        // vanilla's own methods; what is left of the frame is rendering, the GPU and
+        // the wait for vsync. Time.unscaledDeltaTime measures the frame *before* the
+        // one that is ending, so the hitch line reports the previous frame's phases.
+        internal static readonly System.Diagnostics.Stopwatch phaseWatch = System.Diagnostics.Stopwatch.StartNew();
+        internal static double frameUpdateMs, frameModTickMs, frameGrafMs;
+        // The rest of the main thread: all of RainWorld.Update (ticks, drawing, menus, side
+        // processes such as pause menus), Futile's mesh rebuild in LateUpdate, and each world
+        // camera from cull to OnPostRender. What is still missing from a slow frame after
+        // these is the GPU, the present and other plugins. These three are read one frame
+        // late by construction, which is the frame Time.unscaledDeltaTime describes.
+        internal static double frameRainWorldMs, frameFutileMs, frameRenderMs;
+        private double perfRainWorldMsSum, perfFutileMsSum, perfRenderMsSum;
+        internal static int frameTicks;
+        private double lastFrameUpdateMs, lastFrameModTickMs, lastFrameGrafMs;
+        private int lastFrameTicks;
+        private double perfUpdateMsSum, perfModTickMsSum, perfGrafMsSum;
+        private int perfTickSum, perfFrameSum;
+        private bool inputLoggedAfterStart;
+
         private void NoteFrameTime()
         {
+            double hitchUpdateMs = lastFrameUpdateMs, hitchModTickMs = lastFrameModTickMs, hitchGrafMs = lastFrameGrafMs;
+            int hitchTicks = lastFrameTicks;
+            lastFrameUpdateMs = frameUpdateMs; lastFrameModTickMs = frameModTickMs; lastFrameGrafMs = frameGrafMs;
+            lastFrameTicks = frameTicks;
+            perfUpdateMsSum += frameUpdateMs; perfModTickMsSum += frameModTickMs; perfGrafMsSum += frameGrafMs;
+            perfTickSum += frameTicks; perfFrameSum++;
+            frameUpdateMs = 0; frameModTickMs = 0; frameGrafMs = 0; frameTicks = 0;
+            double hitchRainWorldMs = frameRainWorldMs, hitchFutileMs = frameFutileMs, hitchRenderMs = frameRenderMs;
+            perfRainWorldMsSum += frameRainWorldMs; perfFutileMsSum += frameFutileMs; perfRenderMsSum += frameRenderMs;
+            frameFutileMs = 0; frameRenderMs = 0;
             float seconds = Time.unscaledDeltaTime;
+            NoteRotationFrame(seconds);
+            recentFrameSeconds[recentFrameIndex] = seconds;
+            recentFrameIndex = (recentFrameIndex + 1) % recentFrameSeconds.Length;
+            if (recentFrameCount < recentFrameSeconds.Length) recentFrameCount++;
             int collections = GC.CollectionCount(0);
             int collectionDelta = collections - lastGcCollectionCount;
             lastGcCollectionCount = collections;
@@ -56,7 +98,7 @@ namespace SplitScreenCoop
                 return;
             }
             string events = frameEventFrame >= Time.frameCount - 1 ? frameEvents.ToString() : "";
-            Logger.LogInfo($"[FrameHitch] frame={Time.frameCount} ms={seconds * 1000f:0} gcCollections={collectionDelta} suppressedSinceLast={suppressedHitches} sharedLevelTextures={sharedLevelTextureCopies} events=[{events}]");
+            Logger.LogInfo($"[FrameHitch] frame={Time.frameCount} ms={seconds * 1000f:0} ticks={hitchTicks} updateMs={hitchUpdateMs:0} modTickMs={hitchModTickMs:0} grafMs={hitchGrafMs:0} rainWorldMs={hitchRainWorldMs:0} futileMs={hitchFutileMs:0} renderMs={hitchRenderMs:0} paused={(rainworldGameObject?.processManager?.currentMainLoop as RainWorldGame)?.GamePaused} gcCollections={collectionDelta} suppressedSinceLast={suppressedHitches} sharedLevelTextures={sharedLevelTextureCopies} events=[{events}]");
             suppressedHitches = 0;
             lastHitchLogFrame = Time.frameCount;
         }
@@ -130,6 +172,8 @@ namespace SplitScreenCoop
         private int drawStallLoggedFrame = -10000;
         private int drawStallSince = -1;
 
+        private int drawLoopHealthySince = -1;
+
         private void DetectDrawStall(RainWorldGame game)
         {
             if (game?.cameras == null || game.cameras.Length == 0 || game.GamePaused) { drawStallSince = -1; return; }
@@ -137,7 +181,26 @@ namespace SplitScreenCoop
             if (number < 0 || number >= lastRoomCameraDrawFrames.Length) return;
             int drawAge = FrameAge(lastRoomCameraDrawFrames[number]);
             int updateAge = FrameAge(lastRoomCameraUpdateFrames[number]);
-            if (drawAge < 30 || updateAge > 2 || lastRoomCameraDrawFrames[number] < 0) { drawStallSince = -1; return; }
+            if (drawAge < 30 || updateAge > 2 || lastRoomCameraDrawFrames[number] < 0)
+            {
+                drawStallSince = -1;
+                // Pass-through is a diagnosis mode, not a state to stay in: once the
+                // draw loop has completed for 600 frames, put the mod's draw path
+                // back. A false alarm (a long pause, before paused draws counted)
+                // used to leave shader capture and HUD routing off all session.
+                if (drawPathSafeMode)
+                {
+                    if (drawLoopHealthySince < 0) drawLoopHealthySince = Time.frameCount;
+                    else if (Time.frameCount - drawLoopHealthySince > 600)
+                    {
+                        drawPathSafeMode = false;
+                        drawLoopHealthySince = -1;
+                        Logger.LogInfo($"[CameraHealth] frame={Time.frameCount} draw loop completed for 600 frames; the mod's draw-path code is active again");
+                    }
+                }
+                return;
+            }
+            drawLoopHealthySince = -1;
             if (drawStallSince < 0) drawStallSince = Time.frameCount;
             if (Time.frameCount - drawStallLoggedFrame < 300) return;
             drawStallLoggedFrame = Time.frameCount;
@@ -166,9 +229,21 @@ namespace SplitScreenCoop
             hangWatchdog = new System.Threading.Thread(() =>
             {
                 int lastFrame = -1, stalledSeconds = 0;
+                long lastTick = DateTime.UtcNow.Ticks;
                 while (true)
                 {
                     System.Threading.Thread.Sleep(1000);
+                    // This thread sleeps one second. If that took several, every
+                    // thread stood still: the process was paged out, the GPU driver
+                    // was resetting, or the OS suspended the game. That is not a
+                    // main-thread hang and the game loop's marker says nothing about
+                    // it; the twelfth log had 26 s, 34 s and 69 s frames of this kind
+                    // with no [Hang] line, and p95 frame time still at 4 ms.
+                    long now = DateTime.UtcNow.Ticks;
+                    double slept = (now - lastTick) / 10000000.0;
+                    lastTick = now;
+                    if (slept >= 3.0)
+                        sLogger?.LogWarning($"[Hang] the whole process stood still for {slept:0.0} s (every thread, not the game loop): system paging, a GPU driver reset or the window being suspended; last marker={HangMarker}");
                     int frame = WatchdogFrame;
                     if (frame == lastFrame)
                     {
@@ -247,6 +322,18 @@ namespace SplitScreenCoop
         {
             var corrections = new List<string>(4);
             if (fcameras[0] == null || Futile.screen?.renderTexture == null) return corrections;
+            // SetSplitMode(NoSplit) at shutdown makes only the camera that was
+            // rendering direct. When that was not camera 0 (its player dead, another
+            // the sole survivor) camera 0's listener stayed in split mode and its
+            // OnPostRender copied the stale split texture over Futile's screen every
+            // frame: the sleep screen ran underneath a frozen last frame of the game.
+            CameraListener primary = cameraListeners.Length > 0 ? cameraListeners[0] : null;
+            if (primary != null && (!primary.direct || primary.dynamicCompositing))
+            {
+                primary.dynamicCompositing = false;
+                primary.direct = true;
+                corrections.Add("camera 0 listener was still split/compositing");
+            }
             if (!fcameras[0].enabled) { fcameras[0].enabled = true; corrections.Add("camera 0 was disabled"); }
             if (fcameras[0].targetTexture != Futile.screen.renderTexture)
             {
@@ -293,7 +380,9 @@ namespace SplitScreenCoop
         private void ResetCameraDiagnostics()
         {
             lastCameraHealthScanFrame = -CameraHealthScanInterval;
-            lastCameraHeartbeatFrame = -600;
+            lastCameraHeartbeatTime = -1000f;
+            heartbeatsSinceTextureCensus = 1000;
+            ResetFrameRenderingDecision();
             renderedCameraNumbers.Clear();
             for (int i = 0; i < lastRoomCameraUpdateFrames.Length; i++)
             {
@@ -314,6 +403,21 @@ namespace SplitScreenCoop
         private void NoteRoomCameraDrawn(RoomCamera camera)
         {
             if (ValidCameraNumber(camera)) lastRoomCameraDrawFrames[camera.cameraNumber] = Time.frameCount;
+        }
+
+        /// <summary>
+        /// While the game is paused vanilla draws with PausedDrawUpdate instead of
+        /// DrawUpdate. Counting only DrawUpdate made any pause longer than 30 frames
+        /// read as "camera 0 has not drawn while Update runs" on the first tick after
+        /// unpausing (Update precedes GrafUpdate in RawUpdate), which switched the
+        /// mod's draw path to pass-through for the rest of the session (frame 123019
+        /// of the tenth log, after a four-second pause).
+        /// </summary>
+        public void RoomCamera_PausedDrawUpdate(On.RoomCamera.orig_PausedDrawUpdate orig, RoomCamera self,
+            float timeStacker, float timeSpeed)
+        {
+            orig(self, timeStacker, timeSpeed);
+            NoteRoomCameraDrawn(self);
         }
 
         private void NoteRoomCameraMoved(RoomCamera camera, string source)
@@ -365,11 +469,13 @@ namespace SplitScreenCoop
             if (game?.cameras == null || Time.frameCount - lastCameraHealthScanFrame < CameraHealthScanInterval) return;
             lastCameraHealthScanFrame = Time.frameCount;
             DetectDrawStall(game);
+            DecideFrameRendering(game);
             LogCameraSnapshot(game, "state change", false);
-            if (Time.frameCount - lastCameraHeartbeatFrame >= 600)
+            if (Time.realtimeSinceStartup - lastCameraHeartbeatTime >= 10f)
             {
-                lastCameraHeartbeatFrame = Time.frameCount;
+                lastCameraHeartbeatTime = Time.realtimeSinceStartup;
                 LogCameraSnapshot(game, "periodic heartbeat", true);
+                LogPerformance(game);
             }
 
             foreach (int i in renderedCameraNumbers.ToArray())
@@ -448,7 +554,7 @@ namespace SplitScreenCoop
                 CameraListener listener = i < cameraListeners.Length ? cameraListeners[i] : null;
                 Creature followedCreature = roomCamera?.followAbstractCreature?.realizedCreature;
                 string realizedRoom = RoomName(followedCreature?.room);
-                string key = $"mode={CurrentSplitMode}|world={game.world?.name}|room={RoomName(roomCamera?.room)}|loading={RoomName(roomCamera?.loadingRoom)}|position={roomCamera?.currentCameraPosition}|follow={PlayerNumber(roomCamera?.followAbstractCreature)}|realizedRoom={realizedRoom}|enabled={unityCamera?.enabled}|direct={listener?.direct}|target={RenderTargetState(listener)}|zoom={cameraZoomed[i]}";
+                string key = $"mode={CurrentSplitMode}|world={game.world?.name}|room={RoomName(roomCamera?.room)}|loading={RoomName(roomCamera?.loadingRoom)}|position={roomCamera?.currentCameraPosition}|follow={PlayerNumber(roomCamera?.followAbstractCreature)}|realizedRoom={realizedRoom}|enabled={(frameRenderCamera >= 0 && renderedCameraNumbers.Contains(i) ? "turns" : unityCamera?.enabled.ToString())}|direct={listener?.direct}|target={RenderTargetState(listener)}|zoom={cameraZoomed[i]}";
                 if (!force && lastCameraStateKeys[i] == key) continue;
                 lastCameraStateKeys[i] = key;
                 // Palette state rides along on the heartbeat so two views that render
@@ -464,6 +570,439 @@ namespace SplitScreenCoop
             }
         }
 
+        // ---- Auto camera rendering ---------------------------------------------
+        // Frame times measured only while the views take turns, since that is the one
+        // thing Auto has to judge: what each view really gets. The median, because a
+        // region load in the window is not a frame rate (the log of 2026-09-19 left
+        // the rotation 120 frames into the game on "fps=28", which was one 1.8 s
+        // load; and again after a pause).
+        private const float RotationMinPerViewFps = 38f; // the game ticks at 40
+        private readonly float[] rotationSamples = new float[240];
+        private readonly float[] rotationSorted = new float[240];
+        private int rotationSampleCount, rotationSampleIndex, rotationSampleViews;
+        private float nextRenderingDecision, nextRotationAttempt, rotationBackoff = 30f, rotationSince;
+        private string lastRenderingWhy;
+
+        private void ResetFrameRenderingDecision()
+        {
+            rotationSampleCount = 0; rotationSampleIndex = 0; rotationSampleViews = 0;
+            nextRenderingDecision = 0f; nextRotationAttempt = 0f; rotationBackoff = 30f;
+            lastRenderingWhy = null;
+        }
+
+        private void NoteRotationFrame(float seconds)
+        {
+            // Not while paused: the log of 2026-09-19 has a pause whose every frame took
+            // 67 ms for reasons that had nothing to do with taking turns, and Auto left
+            // the rotation on the strength of it the moment the game resumed.
+            if ((rainworldGameObject?.processManager?.currentMainLoop as RainWorldGame)?.GamePaused == true) return;
+            int views = frameRenderCamera >= 0 ? renderedCameraNumbers.Count : 0;
+            if (views != rotationSampleViews)
+            {
+                rotationSampleViews = views;
+                rotationSampleCount = 0;
+                rotationSampleIndex = 0;
+            }
+            if (views <= 1) return;
+            rotationSamples[rotationSampleIndex] = seconds;
+            rotationSampleIndex = (rotationSampleIndex + 1) % rotationSamples.Length;
+            if (rotationSampleCount < rotationSamples.Length) rotationSampleCount++;
+        }
+
+        private float RotationMedianFps()
+        {
+            if (rotationSampleCount == 0) return 0f;
+            Array.Copy(rotationSamples, rotationSorted, rotationSampleCount);
+            Array.Sort(rotationSorted, 0, rotationSampleCount);
+            return 1f / Mathf.Max(0.0001f, rotationSorted[rotationSampleCount / 2]);
+        }
+
+        /// <summary>
+        /// Whether the views take turns (see SelectFrameCamera). Taking turns makes
+        /// every named grab right on every view and costs each view its share of the
+        /// frames; ApplyRotationFrameCap gives the frames back by raising the limit.
+        /// Auto keeps the rotation while each view really gets 38 frames a second,
+        /// judged only from frames in which the rotation ran. When it does not (a
+        /// slow machine, or vsync pacing the game at 60) every camera renders every
+        /// frame, and the rotation is tried again later, 30 s doubling to 5 min. It
+        /// cannot be judged from outside: under the normal limit the frame rate says
+        /// nothing about what the machine could do with the limit raised.
+        /// </summary>
+        private void DecideFrameRendering(RainWorldGame game)
+        {
+            float now = Time.realtimeSinceStartup;
+            if (now < nextRenderingDecision) return;
+            nextRenderingDecision = now + 1f;
+            bool before = alternateFrames;
+            bool canRotate = dynamicActive || dualDisplays;
+            bool wanted;
+            string why;
+            if (cameraRenderingMode == "Alternate frames") { wanted = true; why = cameraRenderingMode; }
+            else if (cameraRenderingMode == "Every frame") { wanted = false; why = cameraRenderingMode; }
+            else if (alternateFrames)
+            {
+                // Merged, one survivor, or too few rotating frames yet: nothing to judge.
+                if (frameRenderCamera < 0 || rotationSampleViews <= 1 || rotationSampleCount < 90) return;
+                float fps = RotationMedianFps();
+                float perView = fps / rotationSampleViews;
+                if (perView >= RotationMinPerViewFps)
+                {
+                    if (now - rotationSince > 60f) rotationBackoff = 30f;
+                    return;
+                }
+                wanted = false;
+                why = $"Auto: {fps:0} fps while {rotationSampleViews} views took turns is {perView:0} each, under {RotationMinPerViewFps:0}" +
+                    $"{(QualitySettings.vSyncCount > 0 ? "; vsync sets the pace, turn it off to let the frame limit rise" : "")}; next try in {rotationBackoff:0} s";
+                nextRotationAttempt = now + rotationBackoff;
+                rotationBackoff = Mathf.Min(rotationBackoff * 2f, 300f);
+            }
+            else
+            {
+                if (!canRotate || renderedCameraNumbers.Count <= 1 || now < nextRotationAttempt) return;
+                int views = renderedCameraNumbers.Count;
+                if (QualitySettings.vSyncCount > 0)
+                {
+                    // Under vsync the outcome is known without trying.
+                    float paced = Screen.currentResolution.refreshRate / (float)QualitySettings.vSyncCount;
+                    if (paced > 0f && paced / views < RotationMinPerViewFps)
+                    {
+                        string vsyncWhy = $"Auto: vsync paces the game at {paced:0} fps, {views} views taking turns would get {paced / views:0} each; every camera renders every frame. " +
+                            "Turn vsync off in the game's options to get correct grab effects on every view at full speed";
+                        if (vsyncWhy != lastRenderingWhy) Logger.LogInfo($"[CameraLayout] frame={Time.frameCount} camera rendering: {vsyncWhy}");
+                        lastRenderingWhy = vsyncWhy;
+                        nextRotationAttempt = now + 30f;
+                        return;
+                    }
+                }
+                wanted = true;
+                why = "Auto: trying one camera per frame with the frame limit raised to match";
+            }
+            alternateFrames = wanted && canRotate;
+            if (alternateFrames == before) return;
+            if (alternateFrames) rotationSince = now;
+            rotationSampleCount = 0; rotationSampleIndex = 0;
+            // The dynamic-level-element pass decides at build time whether to emulate
+            // its grab per camera; rebuild it when the answer changes.
+            RebuildDynamicElementPasses(game);
+            lastRenderingWhy = why;
+            Logger.LogInfo($"[CameraLayout] frame={Time.frameCount} camera rendering: {(alternateFrames ? "one camera per frame" : "every camera every frame")} ({why}); frame limit per view={FrameCapPerView} vsync={QualitySettings.vSyncCount}");
+        }
+
+        private void RainWorld_Update(On.RainWorld.orig_Update orig, RainWorld self)
+        {
+            long start = phaseWatch.ElapsedTicks;
+            try { orig(self); }
+            finally { frameRainWorldMs = (phaseWatch.ElapsedTicks - start) * 1000.0 / System.Diagnostics.Stopwatch.Frequency; }
+        }
+
+        private void Futile_LateUpdate(On.Futile.orig_LateUpdate orig, Futile self)
+        {
+            long start = phaseWatch.ElapsedTicks;
+            try { orig(self); }
+            finally { frameFutileMs += (phaseWatch.ElapsedTicks - start) * 1000.0 / System.Diagnostics.Stopwatch.Frequency; }
+        }
+
+        /// <summary>
+        /// Vanilla prepares a room on the main thread in slices (RoomPreparer.Update)
+        /// while its first visitor waits in the pipe. In single player the screen is
+        /// still then; with a second player still playing, every slow slice is a
+        /// visible hitch. Name them so [FrameHitch] can tell room loading from drawing.
+        /// </summary>
+        private void RoomPreparer_Update(On.RoomPreparer.orig_Update orig, RoomPreparer self)
+        {
+            long start = phaseWatch.ElapsedTicks;
+            orig(self);
+            double ms = (phaseWatch.ElapsedTicks - start) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            if (ms >= 8.0) NoteFrameEvent($"prepare {self.room?.abstractRoom?.name ?? "?"} {ms:0}ms");
+        }
+
+        /// <summary>
+        /// The pause-menu pointer is reported missing in dual display mode only, and
+        /// nothing in the code explains it. Record what decides it: whether the game
+        /// is in mouse mode, where Unity and Futile think the pointer is (Unity
+        /// reports it relative to the display under it once two are active), where the
+        /// cursor container hangs, and what each display's camera looks at.
+        /// </summary>
+        internal static void LogPauseDiagnostics(Menu.PauseMenu menu, string reason)
+        {
+            try
+            {
+                var cameras = new List<string>();
+                for (int i = 0; i < fcameras.Length; i++)
+                    if (fcameras[i] != null && fcameras[i].enabled)
+                        cameras.Add($"cam{i}(mask={fcameras[i].cullingMask} pos=({fcameras[i].transform.position.x:0},{fcameras[i].transform.position.y:0}) display={(cameraListeners[i]?.display == Display.main ? 0 : 1)})");
+                FContainer cursor = menu?.cursorContainer;
+                Vector3 relative = Display.RelativeMouseAt(Input.mousePosition);
+                sLogger?.LogInfo($"[Pause] frame={Time.frameCount} {reason}; dualDisplays={dualDisplays}; mouseMode={menu?.manager?.menuesMouseMode}; " +
+                    $"showCursor={menu?.ShowCursor}; unityMouse=({Input.mousePosition.x:0},{Input.mousePosition.y:0}); relativeMouse=({relative.x:0},{relative.y:0},display {relative.z:0}); " +
+                    $"futileMouse=({Futile.mousePosition.x:0},{Futile.mousePosition.y:0}); screen={Screen.width}x{Screen.height}; futileScreen={Futile.screen?.pixelWidth}x{Futile.screen?.pixelHeight}; " +
+                    $"cursorParent={(cursor?.container == null ? "none" : cursor.container == Futile.stage ? "root stage" : "other")} cursorChildren={cursor?.GetChildCount()}; " +
+                    $"menuPos=({menu?.container?.x:0},{menu?.container?.y:0}); pauseMenus={menu?.manager?.sideProcesses?.FindAll(p => p is Menu.PauseMenu).Count}; rendered=[{string.Join(",", renderedCameraNumbers)}]; {string.Join(" ", cameras)}; stages=[{StageOrderForLog()}]");
+            }
+            catch (Exception error) { LogHookError("LogPauseDiagnostics", error); }
+        }
+
+        // ---- Pause overlay self check ---------------------------------------------
+        // Whether the pause menu is drawn over the world is a purely visual fact that
+        // no game state records, and in dual display mode it has been reported wrong
+        // twice. It can still be measured. Vanilla's pause menu lays a black sprite
+        // over the whole screen that fades in to 25% within half a second, and the
+        // world stands still while paused: a view the menu is drawn over gets a
+        // quarter darker, a view whose menu is missing or behind the world does not
+        // change. Classic and dual only; Dynamic draws its one menu over the finished
+        // composite, not into a camera's frame.
+        private static readonly float[] pauseLuminanceBefore = { -1f, -1f, -1f, -1f };
+        private static readonly float[] pauseCheckAt = { -1f, -1f, -1f, -1f };
+
+        private const int SmallReadWidth = 64, SmallReadHeight = 36;
+        private static RenderTexture smallReadTarget;
+        private static Texture2D smallReadPixels;
+
+        /// <summary>Nearest-neighbour 64x36 read-back of a texture. A GPU stall; only for one-off diagnostics.</summary>
+        private static Color32[] ReadSmall(Texture source)
+        {
+            if (smallReadTarget == null)
+            {
+                smallReadTarget = new RenderTexture(SmallReadWidth, SmallReadHeight, 0, RenderTextureFormat.ARGB32)
+                {
+                    name = "SplitScreen diagnostic read-back",
+                    filterMode = FilterMode.Point
+                };
+                smallReadTarget.Create();
+                smallReadPixels = new Texture2D(SmallReadWidth, SmallReadHeight, TextureFormat.RGBA32, false) { name = "SplitScreen diagnostic pixels" };
+            }
+            RenderTexture previous = RenderTexture.active;
+            try
+            {
+                Graphics.Blit(source, smallReadTarget);
+                RenderTexture.active = smallReadTarget;
+                smallReadPixels.ReadPixels(new Rect(0f, 0f, SmallReadWidth, SmallReadHeight), 0, 0, false);
+            }
+            finally { RenderTexture.active = previous; }
+            return smallReadPixels.GetPixels32();
+        }
+
+        private static float MeanLuminance(Color32[] pixels)
+        {
+            if (pixels == null || pixels.Length == 0) return 0f;
+            double sum = 0.0;
+            foreach (Color32 c in pixels) sum += 0.299 * c.r + 0.587 * c.g + 0.114 * c.b;
+            return (float)(sum / (255.0 * pixels.Length));
+        }
+
+        /// <summary>Remember how bright each rendered view was just before the pause menu existed.</summary>
+        internal static void ArmPauseOverlayCheck()
+        {
+            try
+            {
+                for (int i = 0; i < 4; i++) { pauseCheckAt[i] = -1f; pauseLuminanceBefore[i] = -1f; }
+                foreach (int number in renderedCameraNumbers)
+                {
+                    if (number < 0 || number >= 4) continue;
+                    CameraListener listener = cameraListeners[number];
+                    if (listener?.lastFrame == null || !listener.lastFrame.IsCreated()) continue;
+                    pauseLuminanceBefore[number] = MeanLuminance(ReadSmall(listener.lastFrame));
+                    pauseCheckAt[number] = Time.realtimeSinceStartup + 0.8f;
+                }
+            }
+            catch (Exception error) { LogHookError("ArmPauseOverlayCheck", error); }
+        }
+
+        /// <summary>Called from a world camera's OnPostRender, after its frame was copied to lastFrame.</summary>
+        internal static void PauseOverlayTick(CameraListener listener)
+        {
+            try
+            {
+                int number = Array.IndexOf(cameraListeners, listener);
+                if (number < 0 || number >= 4 || pauseCheckAt[number] < 0f ||
+                    Time.realtimeSinceStartup < pauseCheckAt[number]) return;
+                pauseCheckAt[number] = -1f;
+                RainWorldGame game = rainworldGameObject?.processManager?.currentMainLoop as RainWorldGame;
+                if (game?.pauseMenu == null || listener.lastFrame == null)
+                {
+                    sLogger?.LogInfo($"[Pause] frame={Time.frameCount} overlay check cam={number}: the menu closed before it could be measured");
+                    return;
+                }
+                float before = pauseLuminanceBefore[number];
+                float after = MeanLuminance(ReadSmall(listener.lastFrame));
+                string verdict = before < 0.03f ? "view too dark to tell"
+                    : after <= before * 0.9f ? "the menu's dark overlay IS drawn over this view"
+                    : "NOT darkened: the pause menu is missing from this view or drawn behind the world";
+                sLogger?.LogInfo($"[Pause] frame={Time.frameCount} overlay check cam={number} display={(listener.display == Display.main ? 0 : 1)}: " +
+                    $"luminance before={before:0.000} after={after:0.000} ratio={(before > 0f ? after / before : 0f):0.00} -> {verdict}; " +
+                    $"render queues by stage (higher draws later)=[{StageQueuesForLog()}]");
+            }
+            catch (Exception error) { LogHookError("PauseOverlayTick", error); }
+        }
+
+        /// <summary>The render queue range of every stage's live layers: what Unity actually sorts one camera's draws by.</summary>
+        internal static string StageQueuesForLog()
+        {
+            var parts = new List<string>();
+            for (int i = 0; i < Futile.GetStageCount(); i++)
+            {
+                FStage stage = Futile.GetStageAt(i);
+                List<FFacetRenderLayer> layers = stage?.renderer?._liveLayers;
+                if (layers == null || layers.Count == 0) continue;
+                int low = int.MaxValue, high = int.MinValue;
+                foreach (FFacetRenderLayer layer in layers)
+                {
+                    int queue = layer?._material != null ? layer._material.renderQueue : -1;
+                    if (queue < low) low = queue;
+                    if (queue > high) high = queue;
+                }
+                parts.Add($"{(stage == Futile.stage ? "root" : stage.name)}={low}..{high}");
+            }
+            return string.Join(", ", parts);
+        }
+
+        /// <summary>
+        /// Which devices each player's control setup owns, logged at game start. A
+        /// player whose Rewired player has no controller cannot move; player 1 with the
+        /// "any" preference owns the keyboard and every joystick at once.
+        /// </summary>
+        internal static void LogInputSetups(RainWorldGame game, string reason)
+        {
+            try
+            {
+                global::Options options = game?.rainWorld?.options;
+                if (options?.controls == null) return;
+                int players = game.session?.Players?.Count ?? 0;
+                var parts = new List<string>();
+                for (int i = 0; i < options.controls.Length && i < 4; i++)
+                {
+                    global::Options.ControlSetup setup = options.controls[i];
+                    if (setup == null) { parts.Add($"p{i}=null"); continue; }
+                    string devices = "none";
+                    if (setup.player != null)
+                    {
+                        var names = new List<string>();
+                        foreach (Rewired.Controller controller in setup.player.controllers.Controllers)
+                            if (controller.type != Rewired.ControllerType.Mouse) names.Add(controller.type + ":" + controller.name);
+                        if (names.Count > 0) devices = string.Join("|", names);
+                    }
+                    parts.Add($"p{i}(active={setup.GetActive()} preference={setup.GetControlPreference()} gamePad={setup.gamePadNumber} " +
+                        $"guid={(string.IsNullOrEmpty(setup.gamePadGuid) ? "-" : setup.gamePadGuid)} preset={setup.GetActivePreset()} devices=[{devices}])");
+                }
+                sLogger?.LogInfo($"[Input] frame={Time.frameCount} reason={reason}; players={players}; selfSufficientCoop={selfSufficientCoop}; " +
+                    $"jolly={ModManager.JollyCoop}; multiplayerContext={game.rainWorld?.processManager?.IsGameInMultiplayerContext()}; dualDisplays={dualDisplays}; {string.Join("; ", parts)}");
+            }
+            catch (Exception error) { LogHookError("LogInputSetups", error); }
+        }
+
+        /// <summary>
+        /// Self-sufficient co-op signs players 2-4 in with no joystick. If that leaves a
+        /// control setup active but without any device (its preference was never
+        /// applied, or the configured pad was not found at load), re-apply the
+        /// preference configured in Input Settings, defaulting to vanilla's "specific
+        /// gamepad" for players 2-4. Player 1 keeps whatever it has: with the default
+        /// "any" preference it owns the keyboard and every joystick, which is why a
+        /// pad meant for player 2 also moves player 1 until Input Settings say
+        /// otherwise.
+        /// </summary>
+        internal static void EnsurePlayerControllers(RainWorldGame game)
+        {
+            if (!selfSufficientCoop) return;
+            try
+            {
+                global::Options options = game?.rainWorld?.options;
+                int players = game?.session?.Players?.Count ?? 0;
+                if (options?.controls == null) return;
+                for (int i = 1; i < players && i < options.controls.Length; i++)
+                {
+                    global::Options.ControlSetup setup = options.controls[i];
+                    if (setup == null) continue;
+                    if (!setup.GetActive()) setup.SetActive(true);
+                    if (setup.player == null) setup.InitRewiredObjects();
+                    if (setup.player == null) { sLogger?.LogWarning($"[Input] player {i} has no Rewired player"); continue; }
+                    if (setup.player.controllers.joystickCount > 0 || setup.player.controllers.hasKeyboard) continue;
+                    global::Options.ControlSetup.ControlToUse preference = setup.GetControlPreference();
+                    if (preference == global::Options.ControlSetup.ControlToUse.UNDEFINED)
+                        preference = global::Options.ControlSetup.ControlToUse.SPECIFIC_GAMEPAD;
+                    setup.UpdateControlPreference(preference, forceUpdate: true);
+                    sLogger?.LogInfo($"[Input] frame={Time.frameCount} player {i} had no device; re-applied preference {preference} " +
+                        $"(gamePad {setup.gamePadNumber}); joysticks now={setup.player.controllers.joystickCount} keyboard={setup.player.controllers.hasKeyboard}");
+                }
+            }
+            catch (Exception error) { LogHookError("EnsurePlayerControllers", error); }
+        }
+
+        /// <summary>
+        /// One line per heartbeat with the numbers behind "it lags": frame time
+        /// average, 95th percentile and worst over the last 600 frames, which
+        /// cameras rendered, how many rooms are realized (every one of them updates
+        /// every tick) against the realizer budget, and each camera's sprite leaser
+        /// count (a room's object count; growing without bound means a leak).
+        /// </summary>
+        private void LogPerformance(RainWorldGame game)
+        {
+            if (recentFrameCount == 0) return;
+            float[] sorted = new float[recentFrameCount];
+            Array.Copy(recentFrameSeconds, sorted, recentFrameCount);
+            Array.Sort(sorted);
+            float total = 0f;
+            for (int i = 0; i < sorted.Length; i++) total += sorted[i];
+            float average = total / sorted.Length;
+            float p95 = sorted[Mathf.Clamp(Mathf.FloorToInt(sorted.Length * 0.95f), 0, sorted.Length - 1)];
+            float p99 = sorted[Mathf.Clamp(Mathf.FloorToInt(sorted.Length * 0.99f), 0, sorted.Length - 1)];
+            int turns = frameRenderCamera >= 0 ? Mathf.Max(1, renderedCameraNumbers.Count) : 1;
+            float worst = sorted[sorted.Length - 1];
+            int realized = 0;
+            var names = new List<string>(8);
+            if (game?.world?.activeRooms != null)
+                foreach (Room room in game.world.activeRooms)
+                {
+                    if (room?.abstractRoom == null || room.abstractRoom.offScreenDen) continue;
+                    realized++;
+                    if (names.Count < 12) names.Add(room.abstractRoom.name);
+                }
+            var leasers = new List<string>(4);
+            if (game?.cameras != null)
+                foreach (RoomCamera camera in game.cameras)
+                    leasers.Add((camera?.spriteLeasers?.Count ?? -1).ToString());
+            float budget = game?.roomRealizer?.performanceBudget ?? 0f;
+            Logger.LogInfo($"[Perf] frame={Time.frameCount} avgMs={average * 1000f:0.0} p95Ms={p95 * 1000f:0.0} p99Ms={p99 * 1000f:0.0} maxMs={worst * 1000f:0} fps={1f / Mathf.Max(0.0001f, average):0} fpsPerView={1f / Mathf.Max(0.0001f, average) / turns:0} frameLimit={Application.targetFrameRate} vsync={QualitySettings.vSyncCount} rendered=[{string.Join(",", renderedCameraNumbers)}] alternate={alternateFrames} realizedRooms={realized} [{string.Join(",", names)}] budget={budget:0} tickMs={(perfTickSum > 0 ? perfUpdateMsSum / perfTickSum : 0):0.0} ticksPerFrame={(perfFrameSum > 0 ? (double)perfTickSum / perfFrameSum : 0):0.00} modTickMs={(perfFrameSum > 0 ? perfModTickMsSum / perfFrameSum : 0):0.0} grafMs={(perfFrameSum > 0 ? perfGrafMsSum / perfFrameSum : 0):0.0} rainWorldMs={(perfFrameSum > 0 ? perfRainWorldMsSum / perfFrameSum : 0):0.0} futileMs={(perfFrameSum > 0 ? perfFutileMsSum / perfFrameSum : 0):0.0} renderMs={(perfFrameSum > 0 ? perfRenderMsSum / perfFrameSum : 0):0.0} leasers=[{string.Join(",", leasers)}] maskSources={placedMaskSources.Count}");
+            perfUpdateMsSum = 0; perfModTickMsSum = 0; perfGrafMsSum = 0; perfTickSum = 0; perfFrameSum = 0;
+            perfRainWorldMsSum = 0; perfFutileMsSum = 0; perfRenderMsSum = 0;
+            // Resources.FindObjectsOfTypeAll walks every loaded object: once a minute, not every heartbeat.
+            if (++heartbeatsSinceTextureCensus >= 6)
+            {
+                heartbeatsSinceTextureCensus = 0;
+                LogRenderTextures();
+            }
+        }
+
+        /// <summary>
+        /// Render texture census, every heartbeat. A count that climbs across
+        /// rooms is a leak; the memory total says whether the GPU is being pushed
+        /// into the paging that shows up as multi-second frames and garbage in
+        /// grab-based shaders. Names also reveal Unity's grab textures.
+        /// </summary>
+        private void LogRenderTextures()
+        {
+            try
+            {
+                RenderTexture[] textures = Resources.FindObjectsOfTypeAll<RenderTexture>();
+                var byName = new Dictionary<string, int>();
+                double megabytes = 0;
+                foreach (RenderTexture texture in textures)
+                {
+                    if (texture == null) continue;
+                    megabytes += (double)texture.width * texture.height * 4 / (1024 * 1024);
+                    string name = string.IsNullOrEmpty(texture.name) ? "(unnamed)" : texture.name;
+                    int n;
+                    byName.TryGetValue(name, out n);
+                    byName[name] = n + 1;
+                }
+                var top = new List<KeyValuePair<string, int>>(byName);
+                top.Sort((a, b) => b.Value.CompareTo(a.Value));
+                var parts = new List<string>(8);
+                for (int i = 0; i < top.Count && i < 8; i++) parts.Add(top[i].Key + "x" + top[i].Value);
+                Logger.LogInfo($"[Perf] frame={Time.frameCount} renderTextures={textures.Length} approxMB={megabytes:0} top=[{string.Join(", ", parts)}]");
+            }
+            catch (Exception error) { LogHookError("LogRenderTextures", error); }
+        }
+
         private static string RenderTargetState(CameraListener listener)
         {
             RenderTexture texture = listener?.fcamera?.targetTexture;
@@ -477,7 +1016,14 @@ namespace SplitScreenCoop
             int cameraNumber = camera.cameraNumber;
             if (cameraRoomResyncInProgress[cameraNumber]) return;
             Room desiredRoom = player.realizedCreature?.room ?? player.Room?.realizedRoom;
-            if (desiredRoom == null || camera.room == desiredRoom || camera.loadingRoom == desiredRoom)
+            // A load counts as in progress only while something will still apply it.
+            // WarpMoveCameraActual on a camera that was never precast sets loadingRoom
+            // and nothing else; treating that as "already on its way" kept two cameras
+            // at room=null for a whole session.
+            bool loadPending = camera.loadingRoom == desiredRoom &&
+                (camera.applyPosChangeWhenTextureIsLoaded || (camera.useWarpMove && camera.warpApplyPosChangeWhenTextureIsLoaded));
+            bool stuckLoad = camera.loadingRoom == desiredRoom && !loadPending;
+            if (desiredRoom == null || camera.room == desiredRoom || loadPending)
             {
                 roomMismatchSinceFrames[cameraNumber] = -1;
                 return;
@@ -495,7 +1041,7 @@ namespace SplitScreenCoop
             bool playerInShortcut = player.realizedCreature is Creature creature && creature.inShortcut;
             if (playerInShortcut && !wrongWorld) return;
             if (!immediate && !wrongWorld && mismatchAge < RoomMismatchRecoveryFrames) return;
-            if (camera.AboutToSwitchRoom && !wrongWorld && mismatchAge < RoomMismatchRecoveryFrames * 4) return;
+            if (camera.AboutToSwitchRoom && !wrongWorld && !stuckLoad && mismatchAge < RoomMismatchRecoveryFrames * 4) return;
 
             int node = player.pos.abstractNode;
             int viewingNode = desiredRoom.CameraViewingNode(node >= 0 ? node : 0);
