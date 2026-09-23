@@ -76,6 +76,11 @@ namespace SplitScreenCoop
                     {
                         renderTexture.Release();
                         renderTexture.DiscardContents();
+                        // Release frees the pixels, not the object: one more texture was
+                        // left behind on every screen-size change. ReinitRenderTexture
+                        // points the image at the new one straight after, and its
+                        // callers retarget the cameras (FScreen_ReinitRenderTexture).
+                        UnityEngine.Object.Destroy(renderTexture);
                     }
                     renderTexture = null;
                 }

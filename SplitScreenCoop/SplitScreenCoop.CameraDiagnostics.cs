@@ -6,15 +6,28 @@ namespace SplitScreenCoop
 {
     public partial class SplitScreenCoop
     {
-        private const int CameraHealthScanInterval = 15;
-        private const int RenderStallFrames = 80;
-        private const int RenderRecoveryCooldown = 240;
-        private const int RoomMismatchRecoveryFrames = 60;
+        // Durations are seconds, turned into frames at the current frame rate and never
+        // fewer than at 60 fps. Written as frame counts they shrank with the frame rate:
+        // at 240 fps (the rotation's raised limit) a room mismatch forced a synchronous
+        // resync after 0.25 s, a stuck camera was rebuilt every second, and the health
+        // scan ran 16 times a second.
+        private static int FramesFor(float seconds)
+        {
+            int atSixty = Mathf.CeilToInt(seconds * 60f);
+            int atCurrentRate = Mathf.CeilToInt(seconds / Mathf.Max(0.001f, typicalFrameSeconds));
+            return Math.Max(atSixty, atCurrentRate);
+        }
+
+        private static int CameraHealthScanInterval => FramesFor(0.25f);
+        private static int RenderStallFrames => FramesFor(80f / 60f);
+        private static int RenderRecoveryCooldown => FramesFor(4f);
+        private static int RoomMismatchRecoveryFrames => FramesFor(1f);
         private readonly int[] lastRoomCameraUpdateFrames = { -1, -1, -1, -1 };
         private readonly int[] lastRoomCameraDrawFrames = { -1, -1, -1, -1 };
         private readonly int[] roomMismatchSinceFrames = { -1, -1, -1, -1 };
         private readonly bool[] cameraRoomResyncInProgress = new bool[4];
-        private readonly string[] lastCameraStateKeys = new string[4];
+        /// <summary>Per camera: a hash of what the [CameraState] line says; long.MinValue means "log it next scan".</summary>
+        private readonly long[] lastCameraStateSignatures = { long.MinValue, long.MinValue, long.MinValue, long.MinValue };
         private int lastCameraHealthScanFrame = -CameraHealthScanInterval;
         private float lastCameraHeartbeatTime = -1000f;
         private int heartbeatsSinceTextureCensus = 1000;
@@ -22,34 +35,83 @@ namespace SplitScreenCoop
         // Frame-hitch diagnostics. Playtests reported stutter, but the log had no
         // timing at all; now any frame over the threshold is logged together with
         // the expensive things that happened in it.
-        private const float HitchThresholdSeconds = 0.05f;
         private const int HitchLogCooldownFrames = 30;
-        private static readonly System.Text.StringBuilder frameEvents = new System.Text.StringBuilder(256);
+        private static System.Text.StringBuilder frameEvents = new System.Text.StringBuilder(256);
+        private static System.Text.StringBuilder previousFrameEvents = new System.Text.StringBuilder(256);
         private static int frameEventCount;
         private static int frameEventFrame = -1;
+        private static int previousFrameEventFrame = -1;
         private int lastHitchLogFrame = -10000;
         private int suppressedHitches;
-        private int lastGcCollectionCount;
 
         internal static void NoteFrameEvent(string text)
         {
-            if (frameEventFrame != Time.frameCount)
-            {
-                frameEvents.Length = 0;
-                frameEventCount = 0;
-                frameEventFrame = Time.frameCount;
-            }
+            RollFrameEvents();
             if (frameEventCount++ >= 8) return;
             if (frameEvents.Length > 0) frameEvents.Append("; ");
             frameEvents.Append(text);
         }
 
-        // Steady per-frame cost, as opposed to hitches: the last 600 frame times feed
-        // the [Perf] line of the heartbeat, which is what "it lags with three
-        // players" needs to become a number and a suspect.
-        private readonly float[] recentFrameSeconds = new float[600];
-        private int recentFrameIndex;
-        private int recentFrameCount;
+        /// <summary>
+        /// Keeps the events of the frame before this one. A hitch is logged at the end of
+        /// the frame after the slow one (Time.unscaledDeltaTime measures the previous
+        /// frame), and that frame's first event used to wipe the buffer: in Dynamic every
+        /// tick notes "solve layout", so the real cause of a hitch was nearly always gone.
+        /// </summary>
+        private static void RollFrameEvents()
+        {
+            int now = Time.frameCount;
+            if (frameEventFrame == now) return;
+            System.Text.StringBuilder older = previousFrameEvents;
+            previousFrameEvents = frameEvents;
+            previousFrameEventFrame = frameEventFrame;
+            frameEvents = older;
+            frameEvents.Length = 0;
+            frameEventCount = 0;
+            frameEventFrame = now;
+        }
+
+        // Steady per-frame cost, as opposed to hitches: every unpaused frame since the
+        // last heartbeat feeds the [Perf] line, which is what "it lags with three
+        // players" needs to become a number and a suspect. A time window: the old ring
+        // of 600 frames held a quarter of the 10 s at 240 fps.
+        private readonly FrameTimeWindow perfWindow = new FrameTimeWindow(8192);
+        private int perfPausedFrames;
+        private float perfPausedMaxSeconds;
+        private float perfWindowStart;
+        /// <summary>Median frame of the last [Perf] window: what a hitch is measured against, and what FramesFor converts with.</summary>
+        private static float typicalFrameSeconds = 1f / 60f;
+
+        // Collections and heap sampled at the start of every frame (RainWorld.Update), so
+        // a hitch line carries the collections of the frame it measures. Counted from the
+        // end of one frame's drawing to the next they fell on the frame after, and the
+        // first line of a session showed every collection since startup (190).
+        private int gcAtFrameStart = -1;
+        private int gcDuringLastFrame;
+        private int perfGcCollections;
+        private readonly AllocationMeter allocationMeter = new AllocationMeter();
+
+        private void NoteFrameStart()
+        {
+            int collections = GC.CollectionCount(0);
+            gcDuringLastFrame = gcAtFrameStart < 0 ? 0 : collections - gcAtFrameStart;
+            gcAtFrameStart = collections;
+            perfGcCollections += gcDuringLastFrame;
+            allocationMeter.Note(GC.GetTotalMemory(false), gcDuringLastFrame > 0);
+        }
+
+        private void ResetPerfWindow()
+        {
+            perfWindow.Clear();
+            perfPausedFrames = 0;
+            perfPausedMaxSeconds = 0f;
+            perfGcCollections = 0;
+            allocationMeter.Reset();
+            perfWindowStart = Time.realtimeSinceStartup;
+            perfUpdateMsSum = 0; perfModTickMsSum = 0; perfGrafMsSum = 0; perfTickSum = 0; perfFrameSum = 0;
+            perfRainWorldMsSum = 0; perfFutileMsSum = 0; perfRenderMsSum = 0;
+            perfReplayMsSum = 0; perfReplaySum = 0;
+        }
 
         // Where a frame's CPU time went. Update ticks and GrafUpdate are timed around
         // vanilla's own methods; what is left of the frame is rendering, the GPU and
@@ -64,6 +126,13 @@ namespace SplitScreenCoop
         // late by construction, which is the frame Time.unscaledDeltaTime describes.
         internal static double frameRainWorldMs, frameFutileMs, frameRenderMs;
         private double perfRainWorldMsSum, perfFutileMsSum, perfRenderMsSum;
+        // Shader-state replays (CameraListener.OnPreRender): world cameras, HUD cameras,
+        // the overlay camera, snow blits. Timed to decide whether skipping unchanged
+        // values would pay (audit of 2026-09-22 estimated 0.1-0.35 ms a frame).
+        internal static double frameReplayMs;
+        internal static int frameReplays;
+        private double perfReplayMsSum;
+        private int perfReplaySum;
         internal static int frameTicks;
         private double lastFrameUpdateMs, lastFrameModTickMs, lastFrameGrafMs;
         private int lastFrameTicks;
@@ -83,22 +152,26 @@ namespace SplitScreenCoop
             double hitchRainWorldMs = frameRainWorldMs, hitchFutileMs = frameFutileMs, hitchRenderMs = frameRenderMs;
             perfRainWorldMsSum += frameRainWorldMs; perfFutileMsSum += frameFutileMs; perfRenderMsSum += frameRenderMs;
             frameFutileMs = 0; frameRenderMs = 0;
+            perfReplayMsSum += frameReplayMs; perfReplaySum += frameReplays;
+            frameReplayMs = 0; frameReplays = 0;
             float seconds = Time.unscaledDeltaTime;
             NoteRotationFrame(seconds);
-            recentFrameSeconds[recentFrameIndex] = seconds;
-            recentFrameIndex = (recentFrameIndex + 1) % recentFrameSeconds.Length;
-            if (recentFrameCount < recentFrameSeconds.Length) recentFrameCount++;
-            int collections = GC.CollectionCount(0);
-            int collectionDelta = collections - lastGcCollectionCount;
-            lastGcCollectionCount = collections;
-            if (seconds < HitchThresholdSeconds) return;
+            bool paused = (rainworldGameObject?.processManager?.currentMainLoop as RainWorldGame)?.GamePaused == true;
+            if (paused)
+            {
+                perfPausedFrames++;
+                if (seconds > perfPausedMaxSeconds) perfPausedMaxSeconds = seconds;
+            }
+            else perfWindow.Add(seconds);
+            if (!FrameTimeWindow.IsHitch(seconds, typicalFrameSeconds)) return;
             if (Time.frameCount - lastHitchLogFrame < HitchLogCooldownFrames)
             {
                 suppressedHitches++;
                 return;
             }
-            string events = frameEventFrame >= Time.frameCount - 1 ? frameEvents.ToString() : "";
-            Logger.LogInfo($"[FrameHitch] frame={Time.frameCount} ms={seconds * 1000f:0} ticks={hitchTicks} updateMs={hitchUpdateMs:0} modTickMs={hitchModTickMs:0} grafMs={hitchGrafMs:0} rainWorldMs={hitchRainWorldMs:0} futileMs={hitchFutileMs:0} renderMs={hitchRenderMs:0} paused={(rainworldGameObject?.processManager?.currentMainLoop as RainWorldGame)?.GamePaused} gcCollections={collectionDelta} suppressedSinceLast={suppressedHitches} sharedLevelTextures={sharedLevelTextureCopies} events=[{events}]");
+            RollFrameEvents();
+            string events = previousFrameEventFrame == Time.frameCount - 1 ? previousFrameEvents.ToString() : "";
+            Logger.LogInfo($"[FrameHitch] frame={Time.frameCount} ms={seconds * 1000f:0} typicalMs={typicalFrameSeconds * 1000f:0.0} ticks={hitchTicks} updateMs={hitchUpdateMs:0} modTickMs={hitchModTickMs:0} grafMs={hitchGrafMs:0} rainWorldMs={hitchRainWorldMs:0} futileMs={hitchFutileMs:0} renderMs={hitchRenderMs:0} paused={paused} gcCollections={gcDuringLastFrame} suppressedSinceLast={suppressedHitches} sharedLevelTextures={sharedLevelTextureCopies} events=[{events}]");
             suppressedHitches = 0;
             lastHitchLogFrame = Time.frameCount;
         }
@@ -128,24 +201,48 @@ namespace SplitScreenCoop
             // Key on the message plus the top two frames. Keyed on the message alone,
             // every "NullReferenceException" from anywhere shared one bucket, printed
             // with the first stack seen, and the throw that mattered (the shutdown
-            // one behind the sleep lockout) was never shown.
-            string key = condition ?? "";
+            // one behind the sleep lockout) was never shown. Numbers in the message
+            // (an index, a size, an instance id) are not a new error: each value was a
+            // bucket of its own, logged at once and kept for the whole session.
+            string key = WithoutNumbers(condition);
             if (!string.IsNullOrEmpty(stackTrace))
             {
                 int first = stackTrace.IndexOf('\n');
                 int second = first < 0 ? -1 : stackTrace.IndexOf('\n', first + 1);
                 key += "|" + (second < 0 ? stackTrace : stackTrace.Substring(0, second)).Trim();
             }
+            // Past the cap, new kinds share one bucket per type, still rate limited.
+            if (unityErrorCounts.Count >= UnityErrorKeyLimit && !unityErrorCounts.ContainsKey(key))
+                key = "(further distinct errors)|" + type;
             int count;
             unityErrorCounts.TryGetValue(key, out count);
             unityErrorCounts[key] = ++count;
             lastUnityError = key;
             int last;
             bool seen = unityErrorLastLogged.TryGetValue(key, out last);
-            if (seen && Time.frameCount - last < 600) return;
+            if (seen && Time.frameCount - last < FramesFor(10f)) return;
             unityErrorLastLogged[key] = Time.frameCount;
             string trace = string.IsNullOrEmpty(stackTrace) ? "" : "\n" + stackTrace.TrimEnd();
             sLogger?.LogError($"[UnityLog] frame={Time.frameCount} {type} (x{count}): {condition}{trace}");
+        }
+
+        private const int UnityErrorKeyLimit = 256;
+        private static readonly System.Text.StringBuilder unityErrorKey = new System.Text.StringBuilder(256);
+
+        /// <summary>The text with every run of digits replaced by one '#'. Main thread only (logMessageReceived).</summary>
+        private static string WithoutNumbers(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return "";
+            unityErrorKey.Length = 0;
+            bool inNumber = false;
+            foreach (char c in text)
+            {
+                bool digit = c >= '0' && c <= '9';
+                if (!digit) unityErrorKey.Append(c);
+                else if (!inNumber) unityErrorKey.Append('#');
+                inNumber = digit;
+            }
+            return unityErrorKey.ToString();
         }
 
         /// <summary>
@@ -157,7 +254,7 @@ namespace SplitScreenCoop
         internal static void LogHookError(string site, Exception error)
         {
             int last;
-            if (hookErrorLastLogged.TryGetValue(site, out last) && Time.frameCount - last < 600) return;
+            if (hookErrorLastLogged.TryGetValue(site, out last) && Time.frameCount - last < FramesFor(10f)) return;
             hookErrorLastLogged[site] = Time.frameCount;
             sLogger?.LogError($"[HookError] frame={Time.frameCount} in {site}: {error}");
         }
@@ -181,7 +278,7 @@ namespace SplitScreenCoop
             if (number < 0 || number >= lastRoomCameraDrawFrames.Length) return;
             int drawAge = FrameAge(lastRoomCameraDrawFrames[number]);
             int updateAge = FrameAge(lastRoomCameraUpdateFrames[number]);
-            if (drawAge < 30 || updateAge > 2 || lastRoomCameraDrawFrames[number] < 0)
+            if (drawAge < FramesFor(0.5f) || updateAge > 2 || lastRoomCameraDrawFrames[number] < 0)
             {
                 drawStallSince = -1;
                 // Pass-through is a diagnosis mode, not a state to stay in: once the
@@ -191,18 +288,18 @@ namespace SplitScreenCoop
                 if (drawPathSafeMode)
                 {
                     if (drawLoopHealthySince < 0) drawLoopHealthySince = Time.frameCount;
-                    else if (Time.frameCount - drawLoopHealthySince > 600)
+                    else if (Time.frameCount - drawLoopHealthySince > FramesFor(10f))
                     {
                         drawPathSafeMode = false;
                         drawLoopHealthySince = -1;
-                        Logger.LogInfo($"[CameraHealth] frame={Time.frameCount} draw loop completed for 600 frames; the mod's draw-path code is active again");
+                        Logger.LogInfo($"[CameraHealth] frame={Time.frameCount} draw loop completed for 10 s; the mod's draw-path code is active again");
                     }
                 }
                 return;
             }
             drawLoopHealthySince = -1;
             if (drawStallSince < 0) drawStallSince = Time.frameCount;
-            if (Time.frameCount - drawStallLoggedFrame < 300) return;
+            if (Time.frameCount - drawStallLoggedFrame < FramesFor(5f)) return;
             drawStallLoggedFrame = Time.frameCount;
             if (!drawPathSafeMode)
             {
@@ -270,6 +367,7 @@ namespace SplitScreenCoop
         // culprit if it ever recurs.
         private MainLoopProcess lastObservedProcess;
         private int lastMenuCorrectionLogFrame = -10000;
+        private readonly List<string> menuCorrections = new List<string>(4);
 
         internal void EnforceMenuCameraState()
         {
@@ -277,6 +375,10 @@ namespace SplitScreenCoop
             MainLoopProcess process = manager?.currentMainLoop;
             if (process == null || process is RainWorldGame || fcameras[0] == null || Futile.screen?.renderTexture == null) return;
             var corrections = RestoreMenuCameras(null);
+            // A menu over a paused game (the Watcher's fast-travel screen) arrives without
+            // a shutdown, so nothing had pointed the second display at the main screen:
+            // it kept the game's last frame while the menu was on display 1.
+            if (corrections.Count > 0 && dualDisplays && DualDisplaySupported()) MirrorSecondaryDisplays();
             bool switched = process != lastObservedProcess;
             lastObservedProcess = process;
             if (switched || (corrections.Count > 0 && Time.frameCount - lastMenuCorrectionLogFrame > 120))
@@ -316,11 +418,13 @@ namespace SplitScreenCoop
         /// <summary>
         /// Put the Unity cameras into the one configuration a menu can draw with:
         /// camera 0 enabled, rendering Futile's screen texture with the root stage in
-        /// its mask, everything else off. Returns what had to change.
+        /// its mask, everything else off. Returns what had to change, in a list that is
+        /// reused (this runs every frame in every menu): read it before the next call.
         /// </summary>
         internal List<string> RestoreMenuCameras(string reason)
         {
-            var corrections = new List<string>(4);
+            List<string> corrections = menuCorrections;
+            corrections.Clear();
             if (fcameras[0] == null || Futile.screen?.renderTexture == null) return corrections;
             // SetSplitMode(NoSplit) at shutdown makes only the camera that was
             // rendering direct. When that was not camera 0 (its player dead, another
@@ -362,6 +466,52 @@ namespace SplitScreenCoop
         {
             orig(self, ID);
             EnforceMenuCameraState();
+            // The decoded level images (about 54 MB) help the next cycle, which usually
+            // starts in the same shelter; back at the main menu nothing is coming.
+            if (ID == ProcessManager.ProcessID.MainMenu) ClearLevelTextureCache();
+        }
+
+        /// <summary>
+        /// A paused game is the main process again. The Watcher's ripple-egg warp runs
+        /// the fast-travel screen as the main process while the game waits behind it
+        /// (RainWorldGame.PauseProcess, ProcessManager.pendingProcess). That menu drew
+        /// with camera 0 alone, as every menu must (EnforceMenuCameraState), and nothing
+        /// of the game drew, rendered or composited for the whole visit, so every "last
+        /// done" frame the health checks measure from was from before it. The first scan
+        /// after the menu found every camera, HUD camera and the compositor stalled at
+        /// once and rebuilt all their textures (a hitch, a screen of false warnings and a
+        /// strike towards the Classic fallback), the draw check switched the mod's draw
+        /// path to pass-through, and Classic and dual displays kept the menu's one camera
+        /// until those recoveries enabled theirs. Measure from now, and put the split
+        /// back before the first frame renders.
+        /// </summary>
+        private void RainWorldGame_ResumeProcess(On.RainWorldGame.orig_ResumeProcess orig, RainWorldGame self)
+        {
+            orig(self);
+            try
+            {
+                for (int i = 0; i < lastRoomCameraDrawFrames.Length; i++)
+                {
+                    lastRoomCameraDrawFrames[i] = -1;
+                    roomMismatchSinceFrames[i] = -1;
+                    lastCameraStateSignatures[i] = long.MinValue;
+                }
+                drawStallSince = -1;
+                foreach (CameraListener listener in cameraListeners) listener?.MarkRenderingExpected(false);
+                compositorExpectedSinceFrame = -1;
+                for (int i = 0; i < hudExpectedSinceFrames.Length; i++) hudExpectedSinceFrames[i] = -1;
+                globalHudExpectedSinceFrame = -1;
+                if (self.cameras == null || self.cameras.Length < 2) return;
+                bool dynamicPipeline = dynamicStyle && !dualDisplays;
+                Logger.LogInfo($"[CameraMode] frame={Time.frameCount} game resumed after {self.manager?.oldProcess?.ID?.ToString() ?? "a menu"}; health checks restart and the {(dynamicPipeline ? "dynamic" : "classic")} split is re-applied");
+                if (dynamicPipeline)
+                {
+                    // The layout is the one from before the menu; only the cameras went.
+                    if (dynamicLayout != null) ApplyDynamicCameraRendering(self);
+                }
+                else SetSplitMode(CurrentSplitMode, self, "game resumed after a menu");
+            }
+            catch (Exception error) { LogHookError("RainWorldGame_ResumeProcess", error); }
         }
 
         private void AbstractRoom_RealizeRoom(On.AbstractRoom.orig_RealizeRoom orig, AbstractRoom self, World world, RainWorldGame game)
@@ -383,6 +533,8 @@ namespace SplitScreenCoop
             lastCameraHeartbeatTime = -1000f;
             heartbeatsSinceTextureCensus = 1000;
             ResetFrameRenderingDecision();
+            ResetPerfWindow();
+            typicalFrameSeconds = 1f / 60f;
             renderedCameraNumbers.Clear();
             for (int i = 0; i < lastRoomCameraUpdateFrames.Length; i++)
             {
@@ -390,7 +542,7 @@ namespace SplitScreenCoop
                 lastRoomCameraDrawFrames[i] = -1;
                 roomMismatchSinceFrames[i] = -1;
                 cameraRoomResyncInProgress[i] = false;
-                lastCameraStateKeys[i] = null;
+                lastCameraStateSignatures[i] = long.MinValue;
                 cameraListeners[i]?.MarkRenderingExpected(false);
             }
         }
@@ -425,7 +577,7 @@ namespace SplitScreenCoop
             if (!ValidCameraNumber(camera)) return;
             Logger.LogInfo($"[CameraMove] frame={Time.frameCount} source={source} cam={camera.cameraNumber} room={RoomName(camera.room)} loading={RoomName(camera.loadingRoom)} position={camera.currentCameraPosition} follow={PlayerNumber(camera.followAbstractCreature)}");
             NoteFrameEvent(source + " cam=" + camera.cameraNumber);
-            lastCameraStateKeys[camera.cameraNumber] = null;
+            lastCameraStateSignatures[camera.cameraNumber] = long.MinValue;
         }
 
         private static bool ValidCameraNumber(RoomCamera camera)
@@ -478,8 +630,13 @@ namespace SplitScreenCoop
                 LogPerformance(game);
             }
 
-            foreach (int i in renderedCameraNumbers.ToArray())
+            // A copy: recovery below re-enables cameras, which must not disturb the loop.
+            int monitored = 0;
+            for (int n = 0; n < renderedCameraNumbers.Count && monitored < healthScanCameras.Length; n++)
+                healthScanCameras[monitored++] = renderedCameraNumbers[n];
+            for (int n = 0; n < monitored; n++)
             {
+                int i = healthScanCameras[n];
                 if (i < 0 || i >= cameraListeners.Length) continue;
                 CameraListener listener = cameraListeners[i];
                 Camera unityCamera = i < fcameras.Length ? fcameras[i] : null;
@@ -495,13 +652,14 @@ namespace SplitScreenCoop
                 Logger.LogWarning($"[CameraHealth] frame={Time.frameCount} cam={i} stopped rendering/compositing for {renderAge} frames; enabled={unityCamera.enabled}; active={unityCamera.gameObject.activeInHierarchy}; direct={listener.direct}; target={RenderTargetState(listener)}; roomUpdateAge={FrameAge(lastRoomCameraUpdateFrames[i])}; roomDrawAge={FrameAge(lastRoomCameraDrawFrames[i])}; preRenderAge={FrameAge(listener.lastPreRenderFrame)}; postRenderAge={FrameAge(listener.lastPostRenderFrame)}; compositeAge={FrameAge(listener.lastCompositeFrame)}; attempting render-target recovery");
                 listener.RecoverRendering();
                 unityCamera.enabled = true;
-                lastCameraStateKeys[i] = null;
+                lastCameraStateSignatures[i] = long.MinValue;
             }
 
             if (dynamicActive && dynamicCompositorCamera != null && dynamicCompositorCamera.enabled &&
                 dynamicCompositor != null && compositorExpectedSinceFrame >= 0 &&
                 Time.frameCount - Math.Max(compositorExpectedSinceFrame,
-                    dynamicCompositor.lastCompositeFrame) > RenderStallFrames)
+                    dynamicCompositor.lastCompositeFrame) > RenderStallFrames &&
+                OtherCamerasRenderedSince(Math.Max(compositorExpectedSinceFrame, dynamicCompositor.lastCompositeFrame)))
             {
                 Logger.LogWarning($"[CameraHealth] frame={Time.frameCount} final polygon compositor has not completed for {Time.frameCount - dynamicCompositor.lastCompositeFrame} frames; enabled={dynamicCompositorCamera.enabled}; target={dynamicCompositorCamera.targetTexture?.name ?? "null"}; resetting compositor camera");
                 dynamicCompositorCamera.enabled = false;
@@ -544,19 +702,43 @@ namespace SplitScreenCoop
             }
         }
 
+        private readonly int[] healthScanCameras = new int[4];
+
+        /// <summary>
+        /// Whether a world camera finished a render after <paramref name="frame"/>. The
+        /// compositor draws after them, so it has stalled on its own only while they
+        /// still render; with nothing rendering at all (a minimized window, a driver
+        /// reset) there was nothing to composite, and two such stretches in a row
+        /// switched the session to Classic for good.
+        /// </summary>
+        private bool OtherCamerasRenderedSince(int frame)
+        {
+            for (int n = 0; n < renderedCameraNumbers.Count; n++)
+            {
+                int i = renderedCameraNumbers[n];
+                if (i >= 0 && i < cameraListeners.Length && cameraListeners[i] != null &&
+                    cameraListeners[i].lastPostRenderFrame > frame) return true;
+            }
+            return false;
+        }
+
         private void LogCameraSnapshot(RainWorldGame game, string reason, bool force)
         {
             if (game?.cameras == null) return;
-            for (int i = 0; i < game.cameras.Length && i < lastCameraStateKeys.Length; i++)
+            for (int i = 0; i < game.cameras.Length && i < lastCameraStateSignatures.Length; i++)
             {
                 RoomCamera roomCamera = game.cameras[i];
                 Camera unityCamera = i < fcameras.Length ? fcameras[i] : null;
                 CameraListener listener = i < cameraListeners.Length ? cameraListeners[i] : null;
                 Creature followedCreature = roomCamera?.followAbstractCreature?.realizedCreature;
+                bool turns = frameRenderCamera >= 0 && renderedCameraNumbers.Contains(i);
+                // Compared every scan, so a number: the text below is built only when
+                // something changed (it was ~1 KB of garbage per camera per scan).
+                long signature = CameraStateSignature(game, roomCamera, followedCreature, unityCamera, listener, turns, cameraZoomed[i]);
+                if (!force && lastCameraStateSignatures[i] == signature) continue;
+                lastCameraStateSignatures[i] = signature;
                 string realizedRoom = RoomName(followedCreature?.room);
-                string key = $"mode={CurrentSplitMode}|world={game.world?.name}|room={RoomName(roomCamera?.room)}|loading={RoomName(roomCamera?.loadingRoom)}|position={roomCamera?.currentCameraPosition}|follow={PlayerNumber(roomCamera?.followAbstractCreature)}|realizedRoom={realizedRoom}|enabled={(frameRenderCamera >= 0 && renderedCameraNumbers.Contains(i) ? "turns" : unityCamera?.enabled.ToString())}|direct={listener?.direct}|target={RenderTargetState(listener)}|zoom={cameraZoomed[i]}";
-                if (!force && lastCameraStateKeys[i] == key) continue;
-                lastCameraStateKeys[i] = key;
+                string key = $"mode={CurrentSplitMode}|world={game.world?.name}|room={RoomName(roomCamera?.room)}|loading={RoomName(roomCamera?.loadingRoom)}|position={roomCamera?.currentCameraPosition}|follow={PlayerNumber(roomCamera?.followAbstractCreature)}|realizedRoom={realizedRoom}|enabled={(turns ? "turns" : unityCamera?.enabled.ToString())}|direct={listener?.direct}|target={RenderTargetState(listener)}|zoom={cameraZoomed[i]}";
                 // Palette state rides along on the heartbeat so two views that render
                 // the same room with different colours can be compared in the log.
                 string palette = "";
@@ -690,6 +872,7 @@ namespace SplitScreenCoop
 
         private void RainWorld_Update(On.RainWorld.orig_Update orig, RainWorld self)
         {
+            NoteFrameStart();
             long start = phaseWatch.ElapsedTicks;
             try { orig(self); }
             finally { frameRainWorldMs = (phaseWatch.ElapsedTicks - start) * 1000.0 / System.Diagnostics.Stopwatch.Frequency; }
@@ -928,25 +1111,34 @@ namespace SplitScreenCoop
         }
 
         /// <summary>
-        /// One line per heartbeat with the numbers behind "it lags": frame time
-        /// average, 95th percentile and worst over the last 600 frames, which
-        /// cameras rendered, how many rooms are realized (every one of them updates
-        /// every tick) against the realizer budget, and each camera's sprite leaser
-        /// count (a room's object count; growing without bound means a leak).
+        /// One line per heartbeat with the numbers behind "it lags": the median, average,
+        /// 95th and 99th percentile and worst of every unpaused frame since the last
+        /// heartbeat, the garbage collections in that time and the managed allocation
+        /// rate that causes them (each collection stops the game), which cameras
+        /// rendered, how many rooms are realized (every one of them updates every tick)
+        /// against the realizer budget, and each camera's sprite leaser count (a room's
+        /// object count; growing without bound means a leak).
         /// </summary>
         private void LogPerformance(RainWorldGame game)
         {
-            if (recentFrameCount == 0) return;
-            float[] sorted = new float[recentFrameCount];
-            Array.Copy(recentFrameSeconds, sorted, recentFrameCount);
-            Array.Sort(sorted);
-            float total = 0f;
-            for (int i = 0; i < sorted.Length; i++) total += sorted[i];
-            float average = total / sorted.Length;
-            float p95 = sorted[Mathf.Clamp(Mathf.FloorToInt(sorted.Length * 0.95f), 0, sorted.Length - 1)];
-            float p99 = sorted[Mathf.Clamp(Mathf.FloorToInt(sorted.Length * 0.99f), 0, sorted.Length - 1)];
+            float windowSeconds = Mathf.Max(0.001f, Time.realtimeSinceStartup - perfWindowStart);
+            float megabytes = 1024f * 1024f;
+            string memory = $"windowS={windowSeconds:0.0} gcCollections={perfGcCollections} gcPerMin={perfGcCollections * 60f / windowSeconds:0.0} " +
+                $"allocMBps={allocationMeter.Bytes / megabytes / windowSeconds:0.00} heapMB={GC.GetTotalMemory(false) / megabytes:0} " +
+                $"pausedFrames={perfPausedFrames} pausedMaxMs={perfPausedMaxSeconds * 1000f:0}";
+            if (perfWindow.Frames == 0)
+            {
+                Logger.LogInfo($"[Perf] frame={Time.frameCount} paused for the whole window; {memory}");
+                ResetPerfWindow();
+                return;
+            }
+            float average = perfWindow.Average;
+            float median = perfWindow.Percentile(0.5f);
+            float p95 = perfWindow.Percentile(0.95f);
+            float p99 = perfWindow.Percentile(0.99f);
+            float worst = perfWindow.Max;
+            typicalFrameSeconds = Mathf.Clamp(median, 1f / 1000f, 0.1f);
             int turns = frameRenderCamera >= 0 ? Mathf.Max(1, renderedCameraNumbers.Count) : 1;
-            float worst = sorted[sorted.Length - 1];
             int realized = 0;
             var names = new List<string>(8);
             if (game?.world?.activeRooms != null)
@@ -961,9 +1153,8 @@ namespace SplitScreenCoop
                 foreach (RoomCamera camera in game.cameras)
                     leasers.Add((camera?.spriteLeasers?.Count ?? -1).ToString());
             float budget = game?.roomRealizer?.performanceBudget ?? 0f;
-            Logger.LogInfo($"[Perf] frame={Time.frameCount} avgMs={average * 1000f:0.0} p95Ms={p95 * 1000f:0.0} p99Ms={p99 * 1000f:0.0} maxMs={worst * 1000f:0} fps={1f / Mathf.Max(0.0001f, average):0} fpsPerView={1f / Mathf.Max(0.0001f, average) / turns:0} frameLimit={Application.targetFrameRate} vsync={QualitySettings.vSyncCount} rendered=[{string.Join(",", renderedCameraNumbers)}] alternate={alternateFrames} realizedRooms={realized} [{string.Join(",", names)}] budget={budget:0} tickMs={(perfTickSum > 0 ? perfUpdateMsSum / perfTickSum : 0):0.0} ticksPerFrame={(perfFrameSum > 0 ? (double)perfTickSum / perfFrameSum : 0):0.00} modTickMs={(perfFrameSum > 0 ? perfModTickMsSum / perfFrameSum : 0):0.0} grafMs={(perfFrameSum > 0 ? perfGrafMsSum / perfFrameSum : 0):0.0} rainWorldMs={(perfFrameSum > 0 ? perfRainWorldMsSum / perfFrameSum : 0):0.0} futileMs={(perfFrameSum > 0 ? perfFutileMsSum / perfFrameSum : 0):0.0} renderMs={(perfFrameSum > 0 ? perfRenderMsSum / perfFrameSum : 0):0.0} leasers=[{string.Join(",", leasers)}] maskSources={placedMaskSources.Count}");
-            perfUpdateMsSum = 0; perfModTickMsSum = 0; perfGrafMsSum = 0; perfTickSum = 0; perfFrameSum = 0;
-            perfRainWorldMsSum = 0; perfFutileMsSum = 0; perfRenderMsSum = 0;
+            Logger.LogInfo($"[Perf] frame={Time.frameCount} frames={perfWindow.Frames} medianMs={median * 1000f:0.0} avgMs={average * 1000f:0.0} p95Ms={p95 * 1000f:0.0} p99Ms={p99 * 1000f:0.0} maxMs={worst * 1000f:0} fps={1f / Mathf.Max(0.0001f, average):0} fpsPerView={1f / Mathf.Max(0.0001f, average) / turns:0} frameLimit={Application.targetFrameRate} vsync={QualitySettings.vSyncCount} {memory} rendered=[{string.Join(",", renderedCameraNumbers)}] alternate={alternateFrames} realizedRooms={realized} [{string.Join(",", names)}] budget={budget:0} tickMs={(perfTickSum > 0 ? perfUpdateMsSum / perfTickSum : 0):0.0} ticksPerFrame={(perfFrameSum > 0 ? (double)perfTickSum / perfFrameSum : 0):0.00} modTickMs={(perfFrameSum > 0 ? perfModTickMsSum / perfFrameSum : 0):0.0} grafMs={(perfFrameSum > 0 ? perfGrafMsSum / perfFrameSum : 0):0.0} rainWorldMs={(perfFrameSum > 0 ? perfRainWorldMsSum / perfFrameSum : 0):0.0} futileMs={(perfFrameSum > 0 ? perfFutileMsSum / perfFrameSum : 0):0.0} renderMs={(perfFrameSum > 0 ? perfRenderMsSum / perfFrameSum : 0):0.0} replayMs={(perfFrameSum > 0 ? perfReplayMsSum / perfFrameSum : 0):0.00} replaysPerFrame={(perfFrameSum > 0 ? (double)perfReplaySum / perfFrameSum : 0):0.0} leasers=[{string.Join(",", leasers)}] maskSources={placedMaskSources.Count}");
+            ResetPerfWindow();
             // Resources.FindObjectsOfTypeAll walks every loaded object: once a minute, not every heartbeat.
             if (++heartbeatsSinceTextureCensus >= 6)
             {
@@ -1010,6 +1201,36 @@ namespace SplitScreenCoop
             return $"{texture.name}:{texture.width}x{texture.height}:created={texture.IsCreated()}";
         }
 
+        /// <summary>Everything the [CameraState] key says, hashed without allocating.</summary>
+        private static long CameraStateSignature(RainWorldGame game, RoomCamera roomCamera, Creature followed,
+            Camera unityCamera, CameraListener listener, bool turns, bool zoomed)
+        {
+            unchecked
+            {
+                long h = (long)CurrentSplitMode;
+                h = h * 31 + (game.world?.name?.GetHashCode() ?? 0);
+                h = h * 31 + RoomSignature(roomCamera?.room);
+                h = h * 31 + RoomSignature(roomCamera?.loadingRoom);
+                h = h * 31 + (roomCamera?.currentCameraPosition ?? -2);
+                h = h * 31 + PlayerNumber(roomCamera?.followAbstractCreature);
+                h = h * 31 + RoomSignature(followed?.room);
+                h = h * 31 + (turns ? 2 : unityCamera == null ? 3 : unityCamera.enabled ? 1 : 0);
+                h = h * 31 + (listener == null ? 3 : listener.direct ? 1 : 0);
+                RenderTexture target = listener?.fcamera?.targetTexture;
+                h = h * 31 + (target == null ? 0 : target.GetInstanceID());
+                h = h * 31 + (target == null ? 0 : target.width * 8191 + target.height);
+                h = h * 31 + (target != null && target.IsCreated() ? 1 : 0);
+                h = h * 31 + (zoomed ? 1 : 0);
+                return h;
+            }
+        }
+
+        private static int RoomSignature(Room room)
+        {
+            if (room == null) return -1;
+            unchecked { return (room.world?.name?.GetHashCode() ?? 0) * 997 + (room.abstractRoom?.index ?? -1); }
+        }
+
         private void ReconcileCameraRoom(RoomCamera camera, AbstractCreature player, bool immediate, string reason)
         {
             if (!ValidCameraNumber(camera) || player == null) return;
@@ -1052,7 +1273,7 @@ namespace SplitScreenCoop
                 camera.MoveCamera(desiredRoom, viewingNode);
                 cameraListeners[cameraNumber]?.PrepareForRendering();
                 roomMismatchSinceFrames[cameraNumber] = -1;
-                lastCameraStateKeys[cameraNumber] = null;
+                lastCameraStateSignatures[cameraNumber] = long.MinValue;
             }
             catch (Exception exception)
             {

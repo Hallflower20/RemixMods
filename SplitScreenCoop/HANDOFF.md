@@ -35,10 +35,10 @@ private game members (`RoomCamera.paletteTexture`, `RoomRealizer.realizedRooms`,
 Unity math in `Tests/UnityMathStub.cs`.
 
 ```powershell
-& "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\MSBuild\Current\Bin\Roslyn\csc.exe" /target:exe /out:Tests.exe SplitLayoutSolver.cs Tests\UnityMathStub.cs Tests\Program.cs; .\Tests.exe
+& "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\MSBuild\Current\Bin\Roslyn\csc.exe" /target:exe /out:Tests.exe SplitLayoutSolver.cs AdaptiveLayout.cs FrameStats.cs Tests\UnityMathStub.cs Tests\Program.cs Tests\AdaptiveTests.cs Tests\FrameStatsTests.cs; .\Tests.exe
 ```
 
-Expect `PASS: 10328 layout checks` (the pan-budget test samples an 11x11 grid per cell,
+Expect `PASS: 26538 layout checks` (the pan-budget test samples an 11x11 grid per cell,
 which is where most of that count comes from). `SplitLayoutSolver.cs` is deliberately
 pure and Unity-free so it stays testable — **keep it that way.** Anything needing a
 `RoomCamera`, a `Room` or a `RenderTexture` belongs in `SplitScreenCoop.Dynamic.cs`.
@@ -63,7 +63,10 @@ reference crept in.
 |---|---|
 | `SplitScreenCoop.cs` | Hook registration, Futile camera creation, `SetSplitMode`, classic split layouts, camera↔player ownership |
 | `SplitScreenCoop.Dynamic.cs` | The dynamic pipeline: layers, stages, HUD routing, compositor, per-frame view panning |
-| `SplitLayoutSolver.cs` | **Pure** rectangle layout solver with hysteresis. Unity-free, unit-tested |
+| `SplitLayoutSolver.cs` | **Pure** rectangle layout solver with hysteresis (Dynamic and Static). Unity-free, unit-tested |
+| `AdaptiveLayout.cs` | **Pure** state machine and animation of the Adaptive style. Unity-free, unit-tested (`Tests/AdaptiveTests.cs`) |
+| `SplitScreenCoop.Adaptive.cs` | Adaptive style: per-tick keys and picture sharing, per-frame framing, compositing, spare quarter (meters, group map) |
+| `FrameStats.cs` | **Pure** frame-time window and allocation meter behind `[Perf]` and `[FrameHitch]`. Unity-free, unit-tested (`Tests/FrameStatsTests.cs`) |
 | `SplitScreenCoop.Multicamera.cs` | Pause menu, water, culling, shortcut IL hooks, `RoomCamera.Update` IL |
 | `SplitScreenCoop.LevelTextures.cs` | Level-image sharing between cameras (skips redundant PNG decodes) |
 | `SplitScreenCoop.Realizer2.cs` | Per-player `RoomRealizer` instances, their guards and the shared budget |
@@ -1170,6 +1173,433 @@ their split offset for the length of the pause.
 Verified without the game: build, solver tests, reflection over the real assembly for the
 new hook targets. **None of it in game.**
 
+### Playtest report of 2026-09-22 (no log): snow on the wrong view; warp effect lingering
+
+**"Snow appears on cameras with no snow if one person is in snow."** Same room, different
+screens. `CaptureRoomCameraShaderKeywords` built each camera's `SNOW_ON` from
+`room.snowObject.visibleSnow`, the one field the last `UpdateSnowLight` wrote. Cameras draw
+in order and blit only when their snow changed, so camera 1 was captured with camera 0's
+count on nearly every frame. The per-camera count (`RememberVisibleSnow`) already existed
+for the snow sprite; the keyword now uses it (`CameraSeesSnow`). Why it shows although the
+sprite was already per camera: `SNOW_ON` switches 14 shaders (`Fog`, `LightSource`,
+`LightBeam`, `LightBloom`, `WallLight`, `FlareBomb`, the blizzard and snowfall ones and
+`DisplaySnowShader`), which then sample the camera's own `_SnowTex`. Traced through
+`LevelSnowShader`: with zero sources coverage is 0 but the noise term can still lengthen the
+depth scan, so the snow flag lands along terrain edges; vanilla hides that by turning the
+keyword off. Ruled out: a leak into a *different* room (`SNOW_ON` false without a
+`snowObject`; each camera keeps its own `_SnowTex`, bound once in the constructor and only
+cleared in `OnDestroy`); `_snowStrength` (only `WaterSlush` reads it; vanilla leaves it
+stale across rooms too). `Tools`-style scans used: `scratchpad/globalreaders.py`.
+
+**"Gate warp special effects sometimes linger after going through the gate, no matter where
+you are."** Mechanism established from the code, the trigger in the session was not:
+- The warp's `WarpPointTimer` always lives on `cameras[0]`, whoever warped. `Progress()`
+  holds at exactly the halfway point (the peak) until `MovePastHalfPoint()`, which vanilla
+  calls only from `cameras[0].MoveCamera(Room)` and `WarpMoveCameraActual`. A move in the
+  first half only adds one tick. So if camera 0 arrives early, or never changes room (its
+  player already in the destination, dead, or a warp inside one room), it holds for ever.
+- A held timer is global in effect: every `WarpPoint` computes `warpSequenceInProgress` as
+  `cameras[0].warpPointTimer != null`; camera 0's microphone stays at `globalSoundMuffle 1,
+  warpTransition 4`; `_playerWarpPointTime` stays 0.5 and `GetCameraBestIndex` refuses to
+  change screens while `WarpInProgress` (that global >= 0).
+- `WarpPoint.ChangeState(EnterWarp)` also puts `cameras[0]` in a Standard cutscene for the
+  triggering player, and Jolly's block makes a camera follow its cutscene player: when player
+  2 warped, player 1's view was dragged along and `EnsureStableCameraAssignments` dragged it
+  back every tick, spending `MovePastHalfPoint` in the first half.
+Fixes: `RoomCamera_Update` lets a Standard/HideJollyHud cutscene stand (so `InCutscene` and
+its readers are unchanged) but has the camera follow its own player while vanilla evaluates
+it, when each player has a camera. `WatchWarpTimer` (per tick): once the origin warp point
+has left `EnterWarp` (where it waits for the destination to load) and the timer has sat at
+its hold for 80 ticks, it does what vanilla does on arrival: hold frame (camera 0's globals
+replayed first), `MovePastHalfPoint`. `[Warp]` lines log every timer's start (origin,
+destination, whom cam0 follows), any forced release, and its end.
+Found and left alone: the three warp floats are read by no shader in `resources.assets`, only
+by C# (`WarpInProgress`, `WarpIsBeingActivated`), so their per-camera replay makes that read
+depend on which camera rendered last. Harmless once the timer cannot stick.
+Verified: build; reflection over the real assembly finds every private member used
+(`WarpPointTimer.progress/duration/finished/origin_warpPoint`, `WarpPoint.currentState/
+overrideData`, `RoomCamera.WarpPointHoldFrame`, the cutscene setters, the three cutscene
+types). **Not verified in game.**
+
+### Adaptive split style (2026-09-22): the rework of the dynamic split
+
+**Why.** Playtesters found the Dynamic style "jarring... disorienting and nauseating",
+three and four players worst. The diagnosis, from the code: Dynamic treats Rain World as a
+scrolling game. Every cell chases its player every frame (`RefreshDynamicViewShifts`, a
+0.12 s `SmoothDamp`). At the default zoom exponent 0 a quarter cell shows a quarter of the
+screen and never stops sliding. Players on the same screen split by distance (under 600 px
+merged, over 850 px split, on a screen 1400 px wide). With 3-4 players every change of
+pairing restructures the layout tree, so a view moves because somebody else moved: the
+classic motion-sickness trigger. Rain World is flip-screen: prebaked screens that stay
+still while you move and cut when you leave.
+
+**The design** (brainstormed with the user; their decisions in brackets):
+- Merge by screen, not by distance. Players on one prebaked screen already see one
+  picture; players on different screens never can. One full view while every living
+  player is on one screen (room + camera position, or heading into the same room).
+- The split depends only on the number of living players: two halves side by side
+  [full height], or a 2x2 grid of quarters for 3-4. Slots by rank among the living, so a
+  death or a revival reflows them [reflow, like Static]. Partial groups change nothing:
+  two quarters simply show the same picture (and share one camera's render).
+- A quarter has exactly the render's aspect (683x384 of 1366x768), so it shows its
+  player's whole screen at half size and never moves. A half cannot, so it shows a
+  window of the screen at native scale in one of three steps (left, centre, right) and
+  steps only when its own player comes within 22% of its width of an edge
+  (`AdaptiveLayout.StepFraming`, hysteresis built in: after a step the player is an
+  eighth of the screen from the window's centre).
+- Between one view and the split: a zoom [zoom, not a cut]. The quarter grows out of its
+  own corner to the full screen, a pure scale that shows the whole render at every frame.
+  A half widens (still, if its window was in place) and covers the other. The growing
+  view is drawn last and carries its own border.
+- Timing: merge only after everyone has been together for 1 s; split after 0.5 s apart,
+  so a group crossing a screen boundary within half a second never splits (the full view
+  stays on the screen most players are on and is handed to a camera there if its owner
+  left); no merge for 2 s after a split.
+- Three players: the fourth quarter is the spare [grid with the map quarter]. It shows
+  the shared meters, moved there with a container offset, and a group map: every visited
+  room at its map position, the rooms players are in now, shelters and gates picked out,
+  one marker per player in their Jolly colour. It frames the living players with a
+  margin and glides after them. Drawn with GL from `HUD.Map.MapData` and the save's
+  `roomsVisited`, deliberately not with the vanilla map, which is one shader-driven HUD
+  per player, tied to that player's map button and to shared `_mapPan` state. Setting
+  "Spare quarter": Map and meters / Meters only / Black.
+
+**Code.** `AdaptiveLayout.cs` is the whole state machine and animation, Unity-free, in the
+layout tests. `SplitScreenCoop.Adaptive.cs` feeds it once per tick (screen keys, image
+sharing), animates it once per frame (framing, meters, map), and composites it. Each view
+maps a window onto its cell with `texcoord = window + (p - cell.min) / zoom`, one zoom for
+both axes, through the existing `DrawDynamicPolygon`. Per view, in draw order: picture,
+border, its own HUD with the same mapping, so a view covering another covers its HUD too.
+With one view at rest every player's HUD is drawn full screen, as merged Dynamic did. It
+fills `dynamicLayout` and `baseCameraNumbers`, so audio, camera and HUD enabling, and the
+debug overlay work unchanged; `ApplyDynamicCameraRendering` asks
+`FillAdaptiveRenderedCameras` which cameras render (one while the full view rests,
+otherwise every drawn view's picture). The shared meters and the text prompt now live in
+two containers of the global HUD stage (prompt under meters, the pause menu above both);
+Dynamic uses them too, with the offset at zero. Jolly's off-screen pointers keep vanilla
+placement (their Dynamic repositioning needs the old solver's anchors).
+"Permanent split" gives every player their own key, so Adaptive never merges.
+
+**Tests.** 12 new test functions (54 checks) in `Tests/AdaptiveTests.cs`: starting state;
+merge delay; split grace and group crossing; cooldown; grid slots and the spare; partial
+groups never moving anything; the grid zoom being a pure scale from the corner; an
+in-place half widening without moving its picture; no cell edge jumping in a frame
+through merges, splits, deaths and revivals; reflow 4->3->2->1 and revival; the full view
+staying with the group; framing steps and their easing. Mutation-checked: ignoring the
+merge delay, ignoring the split grace, merging partial groups and quarters that are not
+the whole screen each fail their test.
+
+**Not verified in game.** Things to watch:
+- Crossing a boundary with a gap of 0.5-3 s between players splits for up to ~2 s. If
+  that feels busy, `splitGrace` is the knob.
+- The first frames of a split show a revealed view's last picture until its camera has
+  rendered (1-4 frames with the cameras taking turns), mostly still under the shrinking
+  view.
+- The shared meters sit over player 3's quarter in the 4-player grid (vanilla corner).
+- Per-player HUD in a half is windowed like the world: the hypothermia meter is moved to
+  the half's corner (`AdaptiveHudOffset`), other screen-edge HUD may be cut off.
+- Two cameras sharing a picture differ by up to 20 px of vanilla follow slack; a view that
+  starts or stops sharing moves by that much.
+
+### Code audit, phase 1 (2026-09-22): garbage, wasted room loads, map icons
+
+A read-only audit of every source file (each finding checked against the code and the
+decompiled game) listed bugs and performance spots; the user approved a four-phase plan
+(phase 2: per-frame work at the raised frame cap; 3: picture correctness; 4: robustness
+and Jolly-off co-op). Phase 1 goes after the likeliest stutter causes. The logs could not
+show them: `[FrameHitch]` fired only at 50 ms, `[Perf]` had no GC count, and the log of
+2026-09-19 has 33-42 ms frames that no hitch line explains.
+
+**Garbage.** Mono's collector stops the game for every collection.
+- The cameras[0] stand-in wrapped every LightSource, LightBeam, GoldFlake(s),
+  FairyParticle, GenericZeroGSpeck (BlinkSpeck, CorruptionSpore), EnergySwirl and
+  AboveCloudsView update in `() => orig(self, eu)` and found the camera with a capturing
+  `Array.FindIndex`: about four heap objects per object per tick, in every realized room,
+  solo play included. Vanilla spawns up to 1000 zero-g specks and 500 fairy particles per
+  room: roughly 10 MB/s in such a room (estimated from spawn counts). Now
+  `PrimaryCameraSwap`, a struct (Begin; try orig; finally End), allocation-free in the
+  built IL. It no longer sets `curCamera`: AboveCloudsView's per-tick sky colours were
+  recorded for the first camera in the room only; in room scope they reach every camera
+  showing it. The other wrapped objects write no globals. `RippleFlow_Update` keeps the
+  viewing camera's scope by hand (its ripple data is per camera).
+- `GetPlayerForCamera` is a loop (was LINQ with a closure, per player per frame in Adaptive).
+- Vector-array globals are copied into the array kept for that id (`KeepVectorArray`,
+  `KeepVectorList`) instead of a new one per write and per camera. Every owner keeps its
+  own copy; `RoomCamera_ChangeRoom` copies out of the room record rather than sharing it.
+- Level cache: the least recently used entry and its 4.5 MB buffer take the next image
+  (`NativeArray.CopyTo`); the whole cache (~54 MB) is freed at the main menu.
+- `[CameraState]` compares a numeric signature; the text is built only on a change.
+- Small: tile correction without closures; `Region.IsRubiconRegion` (a lowercased string
+  per camera per frame) replaced; `_terrainPalette` id cached; the string overloads call
+  `PropertyToID` once; the co-op rules and the Classic/dual-display split check are loops;
+  no per-tick `ToArray` copies; reused lists (menu corrections, gate players, snow
+  visibility); no `AddRange` in the Adaptive compositor. `GetAliveCameraNumbers` still
+  returned a new list per tick here (phase 4 gave the tick hook a kept one).
+
+**Wasted room loads.**
+- Cutscenes. Vanilla's Jolly block points a camera at the cutscene player for Standard,
+  HideJollyHud, HideJollyHudAndArrows, Oracle, VoidSea and EndingOE; the borrow in
+  `RoomCamera_Update` covered the first three. `OracleBehavior.FindPlayer` enters an Oracle
+  cutscene on cameras[0] every tick, so with player 2 alone at Moon or Pebbles camera 0 went
+  there and `EnsureStableCameraAssignments` brought it back: two room moves and three log
+  lines per tick. All six are borrowed now (`CutsceneFollowsItsPlayer`). HunterStart and
+  HideHudAndFollowNoone follow nobody; `EnsureStableCameraAssignments` leaves a camera in
+  them alone instead of reassigning it every tick.
+- Dead players. `DeadPlayerCameraStaysPut`: with a camera per player, a dead player's
+  camera does not change room or screen (both MoveCamera hooks), except out of a world
+  that is gone or into another one (gates, warps). It had been moved after the corpse
+  through every pipe a predator dragged it through (the pipe hook counts anything carrying
+  it as followed) and, once the corpse was abstracted, to the first living player
+  (vanilla's Jolly fallback), whom it then shadowed through every room change. The pipe
+  hook no longer realizes a room for a corpse's carrier (`FollowedByLivingPlayersCamera`);
+  a dead player's realizer, the main one included, follows a living player
+  (`RoomRealizer_Update`, owners in `realizerOwners`); corpses no longer pin rooms
+  (`RoomIsInUseByAnyPlayer`). The dead camera's own room stays realized (the camera pins
+  it); freeing it would need a parked-camera state. One camera: vanilla behaviour. At game
+  over the last camera no longer follows a corpse that is dragged out of the room.
+- Watcher level pass: one 1x1 source and one material per camera, kept. Vanilla allocates
+  both on every screen change and never frees them; the mod did it per camera and again
+  on every Auto switch (log of 2026-09-19: 12 -> 124 "(unnamed)" render textures).
+
+**Map icons after gates and warps (bug).** `HUD.ResetMap`, on every camera at every region
+change, builds a new Map whose constructor puts its icon container (and the Watcher warp
+map's) on Futile's root stage, which only the overlay camera draws, at camera 0's
+position: from the first gate on, player 1's icons were drawn over the whole screen and
+everyone else's were invisible. `HudMap_ctor` moves them to the camera's HUD stage,
+`OffsetHud` offsets the warp map's container too, `RestoreClassicHud` moves both back.
+
+**Map throw (bug).** `HudMap_Draw` redirected the loop bound and the first element read of
+the owner's creature list to a merged list, but not the box worm / fire sprite colour read,
+which indexed the owner's room with the merged index: ArgumentOutOfRangeException inside
+`hud.Draw`, the first call of `RoomCamera.DrawUpdate` (Watcher, map open, such a creature
+in another player's room). All three reads go through `MapCreatures` now, built once per
+map per frame and only when the block runs (it was rebuilt with LINQ every frame, for
+every camera, map open or not). The IL has exactly three reads; the hook warns otherwise.
+
+**Diagnostics.**
+- `[FrameHitch]` reports the frame it measures: that frame's events (double-buffered;
+  Dynamic's per-tick "solve layout" used to wipe them) and GC collections counted from one
+  frame start (`RainWorld.Update`) to the next, so the first line of a session no longer
+  shows every collection since startup. It fires at 50 ms, or at 25 ms and twice the
+  typical frame (`typicalMs`, the last window's median): a missed vsync at 60 Hz and a
+  20-40 ms collection now show.
+- `[Perf]` covers every unpaused frame since the last heartbeat (`FrameTimeWindow`, up to
+  8192 stored; the old 600-frame ring was 2.5 s at 240 fps) and adds `frames`, `medianMs`,
+  `windowS`, `gcCollections`, `gcPerMin`, `allocMBps`, `heapMB`, `pausedFrames`,
+  `pausedMaxMs`. `allocMBps` sums the heap's rises between frame starts and skips frames
+  with a collection: a slight underestimate, meant for before/after comparisons.
+- The hang marker is restored after level-image loads and `KillRoom`.
+- `FrameStats.cs` is pure; `Tests/FrameStatsTests.cs` covers percentiles, the storage cap,
+  the hitch rule and the allocation meter.
+
+**Not verified in game.** In the next log: `allocMBps` and `gcPerMin` in a particle-heavy
+room; no `[CameraMove]` for a dead player's camera; no per-tick `AssignCameraToPlayer` at an
+iterator; map icons inside each view after a gate; no `HudMap_Draw` warning at startup.
+
+### Code audit, phase 2 (2026-09-22): less work per frame at the raised frame limit
+
+While N views take turns, `ApplyRotationFrameCap` raises the frame limit N-fold, so
+everything that runs per frame rather than per picture runs N times as often.
+
+- **HUD cameras take turns** (`ApplyHudTurns`, from `SelectFrameCamera`, Remix "HUD redraws
+  with its view", default on). A view's HUD camera draws on the frame its picture's camera
+  draws (`HudPictureCamera`: the Adaptive image camera or the Dynamic base camera); its
+  texture keeps the last HUD in between. It drew every frame: with four players at 240 fps,
+  960 HUD renders a second for pictures refreshed 60 times a second, each a full-screen
+  clear plus a replay of the world camera's whole shader state. A picture that is not in
+  the rotation keeps drawing every frame; the global HUD camera (meters, pause menu,
+  pointer) and the compositor always draw. `hudCameraExpected` (per tick, from
+  `ApplyDynamicCameraRendering`) is what the rotation starts from.
+- **Mask placement writes only what changed.** `placedMaskSources` holds the placement
+  next to its source (no ConditionalWeakTable lookup per source per camera per frame).
+  `MaskPlacement.appliedCamera/Position/Rotation/Scale/Layer` record what the mesh holds:
+  the position setter during a camera's draw leaves that camera's pose (`Applied`), a
+  rotation or scale setter keeps it only if it was already that camera's, anything outside
+  a camera's scope and a new GameObject invalidate it. `PlaceMaskSourcesFor` writes the
+  transform only if the pose differs, the layer only if it differs, and the renderer's
+  enabled flag only if it differs. With the cameras taking turns the rendering camera's own
+  draw has usually just placed its meshes, so most sources cost a compare. Vanilla never
+  writes a mask mesh's layer.
+- **Previous-frame capture only with several cameras.** `CaptureLastFrame` (a full-screen
+  copy plus a blend) and `BindOwnGrab` run only when the game has more than one camera. The
+  audit suggested snow rooms only; that premise is wrong: besides the snow, Aurora,
+  BackgroundJaggedCircle and CustomDepth draw before a camera's first grab (fourteenth-log
+  correction), so co-op keeps it everywhere. Alone, a camera draws after its own last
+  grab, as in vanilla.
+- **OnGUI only for the debug overlay.** `DynamicDebugLabels` is its own component, enabled
+  only while the overlay is on: any enabled MonoBehaviour with `OnGUI` makes Unity run its
+  immediate-mode GUI every frame, menus included.
+- **Camera state written only on change** in `ApplyDynamicCameraRendering` (filter mode,
+  culling mask, enabled, compositor target and enabled, overlay mask) and in
+  `CameraListener.Retarget`. The meter routing that runs per camera per frame was checked
+  and left: about a hundred reference compares, no engine calls, and new HUD sprites (fade
+  circles, prompt symbols) must be routed the frame they appear.
+- **Realizer budget follows the rooms in play** (`UpdateRealizerBudget`, per tick): 1500
+  plus the "Extra rooms per player" slider for every other room the living players are in,
+  instead of per player, dead ones included. It grows at once and shrinks after 30 s
+  together, so a player stepping through a door and back does not make the realizers drop
+  rooms and reload them. Changes are logged: `[RoomRealizer] ... shared budget A -> B`.
+- **Thresholds in seconds** (`FramesFor`): health scan every 0.25 s, stall after 1.33 s,
+  recovery cooldown 4 s, room-mismatch resync after 1 s (4 s while a switch is pending),
+  draw-stall checks 0.5/5/10 s, error log limits 10 s. Converted at the current frame rate
+  (`typicalFrameSeconds`, the last `[Perf]` median) and never fewer frames than at 60 fps,
+  so nothing changes at 60 fps or below.
+- **Replay cost measured**, not yet optimised: `[Perf] replayMs= replaysPerFrame=` time every
+  shader-state replay (world, HUD and overlay cameras, snow blits). Skipping unchanged
+  values waits for those numbers; textures and keywords would have to be replayed anyway,
+  because command buffers set some of them behind the hooks.
+- Left for later, as planned: the pause-menu readback and the texture census stay until
+  the dual-display pause fix is confirmed.
+
+**Not verified in game.** With two or more views taking turns: each HUD updates smoothly,
+nothing flickers (Remix "HUD redraws with its view" off is the switch back);
+`[Perf] replayMs` and `replaysPerFrame` lower than with the switch off; Watcher grass,
+candles and terrain masks unchanged; no `[CameraHealth]` HUD stall lines.
+
+### Code audit, phase 3 (2026-09-22): picture correctness
+
+- **HUD drawn onto its view** (Adaptive; Remix "HUD drawn onto its view", default on).
+  Each per-player HUD camera drew into a texture cleared to transparent, and the compositor
+  blended that texture over the picture. Every see-through HUD sprite was blended twice
+  and came out dark (the reason the shared meters got a camera of their own), and in
+  quarters the texture was point-sampled at half size, dropping every other texel of text
+  and thin lines. Now, while the views are split, the HUD camera copies its view's
+  picture into its texture (`HudShaderRouter.OnPreRender` -> `CopyPictureIntoHud`, the same
+  listener choice as the compositor's, `AdaptivePictureListener`) and draws the HUD over
+  it, clearing depth only. The compositor draws that one texture per view, opaque, with
+  Unity's `Hidden/BlitCopy` (no blend, no depth test, no culling; `Futile/Solid` is opaque
+  too but writes depth and culls back faces). Opaque matters: the HUD pass leaves the
+  alpha channel below 1 under see-through sprites. The texture is filtered like the
+  picture when the view is zoomed. While one view rests, the HUD cameras draw straight
+  onto the screen at depth 205+ (after the compositor at 200, before the overlay at 220)
+  instead of through textures. `ApplyAdaptiveHudMode` sets each camera's target, clear
+  and depth every frame from the state the compositor draws that frame; a camera just
+  switched to drawing onto its picture draws that frame even without a turn
+  (`hudCombinedSince`), and until it has, the view is drawn the old way. Switch off, no
+  BlitCopy, or the Dynamic and Static styles: the old path, now filtered in quarters.
+- **No flash of another player's screen.** When two views stop sharing a picture, the one
+  whose own camera was off drew the last picture it had drawn, the other camera's,
+  already showing that camera's new screen, for the one to three frames until its own
+  camera got a turn. `SelectFrameWorldCamera` gives a camera switched on for a view that
+  has not drawn since the next turn, for one round at most.
+- **Game over (Adaptive).** With nobody alive `UpdateDynamicLayout` passed camera 0 in as
+  the survivor: the last survivor's view was dropped and player 1's zoomed in from the
+  screen centre for the whole death sequence. Adaptive now gets the empty list and
+  `AdaptiveLayout.Update` returns without a change (it always did), so the last death
+  stays on screen; `RefreshAdaptiveLayout` still animates, so a slide in progress ends.
+  Test: `AdaptiveNobodyAliveKeepsTheLayout` (mutation: dropping the empty-list guard fails
+  the suite).
+- **No black gaps while views slide.** A death or revival removes or adds a view at once
+  and the others slide for 0.5 s; the compositor draws each view at its target cell first
+  (`AdaptiveViewsSliding`), so the ground under the slide is the layout it becomes.
+- **Warmth meter and framing in the same frame.** `RefreshAdaptiveLayout` runs before the
+  game draws (the HUD parts read the view's window while they draw); it ran after, so the
+  meter trailed the picture by one frame through every framing step and zoom. It reads
+  only tick state (`lastPos`/`pos`, body chunks), so before or after the draw is the same
+  for everything else. A screen cut is remembered only once the framing was applied, so a
+  cut on a frame without a position (the player in a pipe) still snaps next frame.
+- **Decals on every view.** `CustomDecal_Update` copied the last-drawn camera's cleared
+  "mesh dirty" flag to all four cameras every tick; a camera that was not drawing (the
+  merged view draws one) never built its decal mesh and its decals stayed missing after a
+  split. Flags are only ever set for all cameras now, and cleared by each camera's own
+  draw; `UpdateAsset` sets the element flag (it copied the mesh flag).
+- **Room entry globals reach every camera.** `Room.NowViewed` runs only for the first
+  camera into a room, in its scope; its `_rimFix` and `_boxWormColor` never reached the
+  room record a later camera copies. `Room_NowViewed` runs it in room scope.
+- **Menus do not replay the game's globals.** `CameraListener.OnPreRender` replays only
+  while a game is the main process, and every listener forgets its recorded state at game
+  start (before the cameras are built) and at shutdown. The four map special cases that
+  patched listener 0 in menus (`_mapCol`, `_mapWaterCol`, `_mapPan`, `_mapFogTexture`) are
+  gone; `_mapSize` had been missed and gave the fast-travel map the in-game region's size.
+
+**Not verified in game.** Quarters: HUD text as sharp as the picture, see-through HUD parts
+(map, fades) no darker than in single player; the merge and split zooms carry their HUD;
+Remix "HUD drawn onto its view" off gives the old look back. Startup must not log
+"Hidden/BlitCopy not found". Splits with the cameras taking turns: no single-frame flash of
+another player's screen. A 3-4 player death: no black while the views slide; the last
+death stays on screen at game over. Decal rooms after a split; two cameras entering a sky
+room one after the other; the sleep and fast-travel maps.
+
+### Code audit, phase 4 (2026-09-22): robustness, Jolly-off co-op, Classic, second display
+
+- **Gates after a death (Jolly off).** Without Jolly the gate asks every player, corpses
+  included, in `PlayersInZone`, `PlayersStandingStill` and `AllPlayersThroughToOtherSide`
+  (Jolly asks `PlayersToProgressOrWin`). The mod's zone hook refused a living player
+  outside the gate room and otherwise called vanilla, which still counted corpses: a dead
+  player in another room listed after a living one made the zone -1, an abstracted corpse
+  (no realized creature) never stands still, and a corpse in the airlock never gets through
+  (that one shut the living players into the airlock). Each held the gate shut for the rest
+  of the cycle. All three hooks now ask only the players in play (`PlayerDeadOrMissing`
+  false), with vanilla's rules.
+- **Grabs (Jolly off).** `AllPlayersDown` counted any predator grasp, so the first tick of a
+  grab on the last player standing ended the game (music, prompt, karma flower) even when
+  they shook it off. It waits for vanilla's 60 ticks (`dangerGraspTime`: the escape window
+  closes at 30, vanilla's own GameOver comes at 60; the co-op check runs after the players'
+  update in the same tick).
+- **Shared food keeps its costs (Jolly off).** `UpdatePlayerFood` set every player to the
+  fullest stomach each tick, so an Artificer's craft or a Gourmand's regurgitation came
+  back on the next tick from a player who had not paid it. It is now one pool in quarter
+  pips: each tick it takes the sum of every player's change since the tick before (eaten or
+  spent) and sets everyone to it, clamped to the smallest stomach (a full stomach has no
+  quarter pips, as vanilla keeps it). It starts from the fullest stomach on a session's
+  first tick and when the player count changes, and is reset per session. Two players
+  eating in one tick both count. The plan made this a pure helper with tests; the user
+  asked for the pool to stay in the co-op code instead, so it is in `UpdatePlayerFood` and
+  has no unit test.
+- **Watcher fast travel (ripple-egg warp).** The fast-travel screen runs as the main process
+  while the paused game waits behind it (`RainWorldGame.PauseProcess`,
+  `ProcessManager.pendingProcess`). The menu watchdog gives it camera 0 alone, as every
+  menu; that stays (in Classic camera 0 would otherwise draw the menu into its own region).
+  Nothing of the game drew for the whole visit, so the first health scan after it measured
+  every camera, HUD camera and the compositor from before the menu: all their textures were
+  rebuilt at once (a hitch, false warnings, a strike towards the Classic fallback), the draw
+  check switched the draw path to pass-through, and Classic and dual displays kept one
+  camera until those recoveries enabled theirs. `RainWorldGame_ResumeProcess` restarts the
+  checks from the resume frame and re-applies the split (`ApplyDynamicCameraRendering`, or
+  `SetSplitMode` for Classic and dual displays) before the first frame renders. While the
+  menu is up, dual displays mirror the main screen on display 2 (it kept the game's last
+  frame).
+- **Tick guard.** `EnsureStableCameraAssignments` runs before vanilla's tick; a throw there
+  skipped the whole tick, every tick it threw. Contained and logged as `[HookError]`.
+- **Compositor fallback.** Two compositor stalls without a composite between them switch
+  the session to Classic for good, and a stretch with nothing rendering at all (a minimized
+  window, a driver reset) counted as one. A stall counts only while a world camera still
+  finished a render after the compositor's last composite (`OtherCamerasRenderedSince`).
+- **Classic views are straight copies.** The separator inset only the target rectangle, so
+  every view was rescaled by 2 px every frame (a scaled blit into a scratch texture, then a
+  copy). The source is inset alike, the sizes match, and each view is one `CopyTexture`. A
+  rebuilt camera texture keeps Classic's filter: a new RenderTexture filters bilinear
+  whatever texture it copies, so Classic views went soft after every rebuild.
+- **Second display texture.** The display-2 texture replaced on a screen-size change was
+  released but never destroyed.
+- **Unity error log.** A key drops the numbers in the message (an index, a size or an
+  instance id made a new bucket, logged at once and kept all session); past 256 distinct
+  keys, new kinds share one bucket per type, still rate limited.
+- **Dynamic and Static per-tick garbage.** `UpdateDynamicLayout` keeps its working arrays
+  (the inputs one array per count, since the solver reads their Count; `ownScreenPositions`
+  and `baseCameraNumbers` reused while the count holds, as Adaptive does), and the tick hook
+  fills one kept list of living cameras (`FillAliveCameraNumbers`; `SetSplitMode` and the
+  rest still get a new one). `SplitLayoutSolver.Solve` keeps what never leaves the call:
+  flags, weights, the union-find, the items (a pool), the partition pairs and a comparer
+  instance (`Sort` with a lambda wraps it in a new comparer per call). Everything in the
+  returned `Layout` is still new on every call, because callers and the slide memory keep
+  earlier layouts. Checked with a side-by-side run of the phase 3 solver and this one: over
+  a million random layouts identical bit for bit, and layouts kept from earlier calls
+  unchanged afterwards; the run caught both deliberate pooling bugs it was given (a flag
+  array not cleared, an item's weight not reset). The rule has a test of its own,
+  `KeptLayoutsDoNotChange` (layouts from two to four players, merges and a death must
+  read the same after later calls; mutation: pooling the returned split amounts fails
+  it). The built IL of the changed per-tick methods allocates only in log branches and
+  in the solver's returned layout.
+
+**Not verified in game.** Jolly off: after a death the gate still opens for the others,
+wherever the corpse is (another room, the airlock); a grab shaken off in time does not end
+the game; an Artificer's craft or a Gourmand's regurgitation costs the shared meter. The
+Watcher's ripple-egg warp with two or more players: the split is back at once after the
+fast-travel screen, `[CameraMode] ... game resumed after` is logged and no `[CameraHealth]`
+line or "draw loop stalled" follows; with dual displays display 2 shows the menu. Classic:
+views as sharp as before, after a resolution change too.
+
 ### Static split style (2026-09-18)
 
 A third value of the "Split-screen style" option, next to Dynamic and Classic. It is the
@@ -1205,6 +1635,18 @@ per-camera shader fix) with cells that never merge:
 
 Ordered by confidence that something is still wrong or unknown.
 
+0. **Stutter, after the audit** (see §5 "Code audit, phase 1" to "phase 4"): the largest
+   garbage sources and the wasted room loads are gone, unverified. The next log decides
+   whether collections were the stutter: `[Perf] gcPerMin` and `allocMBps` in a
+   particle-heavy room, and `[FrameHitch]` lines of 25-50 ms with `gcCollections=1`.
+   All four phases were built without a playtest in between, at the user's request. Each
+   phase's DLL is kept in `C:\Users\vshah\code\SplitScreenCoop-checkpoints\phase1` to
+   `phase4` (phase 4 is the one in `Mod/plugins`): if something broke, try phase 3's, then
+   2's, then 1's to find the phase. The two riskiest rendering changes can be switched off
+   in Remix instead ("HUD redraws with its view", "HUD drawn onto its view"). Held back
+   until a log shows they matter: skipping unchanged shader replays (`[Perf] replayMs`
+   decides), freeing a dead player's camera room (a parked-camera state), and the 67 ms
+   paused frames (8d).
 1. **Stutter.** The second playtest log has 19 `[FrameHitch]` lines over ~190k frames.
    The big ones are room loads (633 ms at spawn, 425 ms `realize CC_C03`, 329 ms with no
    event) and region/gate transitions; texture sharing fired 80 times and every camera
@@ -1275,7 +1717,7 @@ Ordered by confidence that something is still wrong or unknown.
 
 | Tag | Meaning |
 |---|---|
-| `[FrameHitch]` | A rendered frame over 50 ms, with what happened in it and where the main thread spent it: `updateMs` (game ticks), `grafMs` (`RainWorldGame.GrafUpdate`), `rainWorldMs` (all of `RainWorld.Update`, so menus and side processes too), `futileMs` (`Futile.LateUpdate`), `renderMs` (world cameras, cull to `OnPostRender`), `paused=`. Time not covered by those is the GPU, the present or another plugin. **Start here for stutter** |
+| `[FrameHitch]` | A rendered frame of 50 ms, or of 25 ms and twice the typical frame (`typicalMs`), with what happened in it (`events`, `gcCollections` of that frame) and where the main thread spent it: `updateMs` (game ticks), `grafMs` (`RainWorldGame.GrafUpdate`), `rainWorldMs` (all of `RainWorld.Update`, so menus and side processes too), `futileMs` (`Futile.LateUpdate`), `renderMs` (world cameras, cull to `OnPostRender`), `paused=`. Time not covered by those is the GPU, the present or another plugin. **Start here for stutter** |
 | `[Coop]` | Game-over decision, which camera's prompt entered game-over mode, `GoToDeathScreen` |
 | `[Hang]` | Main thread stalled 4 s / 30 s; `last marker` names the mod path (or vanilla `orig`) it was in. **Start here for a freeze** |
 | `[UnityLog]` | A Unity exception/error mirrored into this log with its stack trace (the playtest config does not write Unity's log). **Start here for a black screen with audio** |
@@ -1284,16 +1726,17 @@ Ordered by confidence that something is still wrong or unknown.
 | `[MenuCamera]` | Watchdog corrections and a camera snapshot after every process switch. **Start here for a black menu** |
 | `[CameraLayout]` | Layer allocation at startup; then every structural layout change as `groups=[cam:sharesImageWith,...]\|sources=[...]\|rendering=[...]\|direct=bool`; `restructured; cells=[…]` each time the layout tree changed shape (a slide) |
 | `[CameraState]` | Per-camera snapshot on change + every 600 frames |
-| `[CameraMode]` | Split-mode transitions and world-direction fallbacks |
+| `[CameraMode]` | Split-mode transitions, world-direction fallbacks, and `game resumed after <menu>` when a paused game comes back (the Watcher's fast-travel screen) |
 | `[CameraMove]` | `RoomCamera.MoveCamera` calls |
 | `[CameraHealth]` | Stall detection and recovery. **Any of these is a red flag** |
 | `[CameraPreload]` | Shortcut destination tracking |
-| `[RoomRealizer]` | Refused abstractization |
-| `[LevelTexture]` | Level-image copy fell back to decoding (warning) |
-| `[Perf]` | Every 10 s: avg/p95/p99/max frame ms, `fps`, `fpsPerView` (what each view gets while they take turns), `frameLimit` and `vsync`, rendered cameras, `alternate=` (one camera per frame), realized rooms, realizer budget, the phase averages of `[FrameHitch]`, sprite leasers per camera, mask sources; once a minute the render texture census. A flat 16.7 ms with `fpsPerView=30` IS the lag. **Start here for "it lags"** |
+| `[RoomRealizer]` | Refused abstractization; `shared budget A -> B` when the rooms the living players are in change (after 30 s together for a decrease) |
+| `[LevelTexture]` | Level-image copy fell back to decoding (warning); `freed N cached level images` on the way to the main menu |
+| `[Perf]` | Every 10 s, over every unpaused frame since the last one: median/avg/p95/p99/max frame ms, `gcCollections`, `gcPerMin`, `allocMBps` (managed allocation rate: the garbage behind every collection), `heapMB`, paused frames, `fps`, `fpsPerView` (what each view gets while they take turns), `frameLimit` and `vsync`, rendered cameras, `alternate=` (one camera per frame), realized rooms, realizer budget, the phase averages of `[FrameHitch]`, `replayMs`/`replaysPerFrame` (shader-state replays), sprite leasers per camera, mask sources; once a minute the render texture census. A flat 16.7 ms with `fpsPerView=30` IS the lag. **Start here for "it lags"** |
 | `[ShaderAudit]` | First write of a shader global outside camera scope, with the vanilla method that wrote it. **Start here for "effect X looks different on the other cameras"** |
 | `[Pause]` | Dual display only: pointer positions (Unity, Futile, `Display.RelativeMouseAt`), mouse mode, cursor container parent, menu position and each enabled camera's mask/position/display when a pause menu opens and closes. **Start here for the missing pause pointer** |
 | `[Pause] overlay check` | Classic and dual: 0.8 s after a pause menu opens, whether each rendered view really got darker (the menu's 25% black overlay is drawn over it) and every stage's render queue range. **Start here for "the pause menu does not show"** |
+| `[Warp]` | Each warp effect's start (origin, destination, whom cam0 follows), a forced release of one stuck at its peak (warning: vanilla only releases it when cam0 changes room), and its end. **Start here for "the warp effect never went away"** |
 | `[MaskAudit]` | A raw Watcher mask mesh was about to be drawn by the overlay camera and was hidden. Should never appear; it is the lime/red hill of 2026-09-17..19 trying to come back |
 | `[Input]` | Each player's control setup at game start: active flag, preference, pad number/guid, preset, devices, plus whether the game counts as multiplayer. **Start here for "player 2 cannot move"** |
 

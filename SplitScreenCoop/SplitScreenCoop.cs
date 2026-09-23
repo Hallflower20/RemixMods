@@ -185,6 +185,8 @@ namespace SplitScreenCoop
                 IL.RainWorldGame.ctor += RainWorldGame_ctor2; // food math
                 IL.RainWorldGame.GameOver += RainWorldGame_GameOver; // custom gameover detection
                 On.RegionGate.PlayersInZone += RegionGate_PlayersInZone; // joar please TEST your own code
+                On.RegionGate.PlayersStandingStill += RegionGate_PlayersStandingStill; // and these two asked corpses too
+                On.RegionGate.AllPlayersThroughToOtherSide += RegionGate_AllPlayersThroughToOtherSide;
                 On.Creature.FlyAwayFromRoom += Creature_FlyAwayFromRoom; // Player taken by vulture? die quicker please
                 HookEndpointManager.Modify(typeof(RegionGate).GetProperty("MeetRequirement").GetGetMethod(), // don't assume player[0].realizedcreature
                     new ILContext.Manipulator(RegionGate_get_MeetRequirement));
@@ -208,6 +210,7 @@ namespace SplitScreenCoop
                 IL.JollyCoop.JollyHUD.JollyPlayerSpecificHud.JollyOffRoom.Update += JollyOffRoom_Update1;
                 On.JollyCoop.JollyHUD.JollyPlayerSpecificHud.JollyOffRoom.Update += JollyOffRoom_Update;
                 IL.HUD.Map.Draw += HudMap_Draw;
+                On.HUD.Map.ctor += HudMap_ctor; // every region change builds a new map on the root stage
                 On.HUD.KarmaMeter.Draw += KarmaMeter_Draw;
                 On.HUD.FoodMeter.Draw += FoodMeter_Draw;
                 On.RoomPreparer.Update += RoomPreparer_Update; // name slow room-loading slices in [FrameHitch]
@@ -267,9 +270,11 @@ namespace SplitScreenCoop
                 On.RoomCamera.UpdateGhostMode += RoomCamera_UpdateGhostMode; // Room.cs only updates cameras[0]
                 On.RoomCamera.UpdateRotMode += RoomCamera_UpdateRotMode; // and rot colours only ever hit cameras[0]
                 On.Room.Loaded += Room_Loaded; // load-time globals go to the room's record
+                On.Room.NowViewed += Room_NowViewed; // so do the first camera's entry globals
                 On.RoomCamera.ChangeRoom += RoomCamera_ChangeRoom; // and reach a camera when it arrives
                 On.HUD.HUD.Update += HUD_Update; // any player's map button reveals the shared meters
                 On.ProcessManager.PostSwitchMainProcess += ProcessManager_PostSwitchMainProcess; // menu camera watchdog
+                On.RainWorldGame.ResumeProcess += RainWorldGame_ResumeProcess; // back from the fast-travel screen
                 On.RainWorldGame.GoToDeathScreen += RainWorldGame_GoToDeathScreen; // diagnostics
                 On.HUD.TextPrompt.EnterGameOverMode += TextPrompt_EnterGameOverMode; // diagnostics
                 // Cameras showing the same screen copy the decoded level image from
@@ -389,6 +394,8 @@ namespace SplitScreenCoop
             dualDisplays = Options.DualDisplays.Value;
             alwaysSplit = Options.AlwaysSplit.Value;
             staticStyle = Options.SplitStyle.Value == "Static";
+            adaptiveStyle = Options.SplitStyle.Value == "Adaptive";
+            spareQuarterMode = Options.SpareQuarter.Value;
             dynamicStyle = Options.SplitStyle.Value != "Classic" && dynamicPipelineAvailable &&
                 !dynamicPipelineFailed;
             // Existing installs may still hold the old eager default in their
@@ -403,6 +410,9 @@ namespace SplitScreenCoop
             dynamicSettings.smoothingTime = Options.SmoothingTime.Value;
             cameraRenderingMode = Options.CameraRendering.Value;
             dynamicDebugOverlay = Options.DebugOverlay.Value;
+            if (debugLabels != null) debugLabels.enabled = dynamicDebugOverlay;
+            hudTakesTurns = Options.HudTakesTurns.Value;
+            hudOntoPicture = Options.HudOntoPicture.Value;
             FilterMode zoomFilter = Options.ZoomedFilter.Value == "Point"
                 ? FilterMode.Point : FilterMode.Bilinear;
             foreach (CameraListener listener in cameraListeners)
@@ -638,13 +648,19 @@ namespace SplitScreenCoop
 
             realizer2 = null;
             additionalRealizers.Clear();
+            realizerBudgetRooms = 1;
+            realizerBudgetShrinkTicks = 0;
             ForgetLevelTextures();
             drawPathSafeMode = false;
             pendingKarmaFlowerPosition = null;
+            ResetSharedFood();
             CurrentSplitMode = SplitMode.NoSplit;
             ResetCameraDiagnostics();
             inputLoggedAfterStart = false;
+            trackedWarpTimer = null;
             ResetDynamicLayout();
+            // Before orig: the new cameras record their globals while they are built.
+            foreach (CameraListener listener in cameraListeners) listener?.ClearRecordedShaderState();
 
             orig(self, manager);
 
@@ -679,7 +695,7 @@ namespace SplitScreenCoop
             }
             EnsurePlayerControllers(self);
             LogInputSetups(self, "game start");
-            Logger.LogInfo($"[CameraLayout] frame={Time.frameCount} split style={Options?.SplitStyle.Value}; dynamicPipeline={dynamicStyle}; static={staticStyle}; neverMerge={NeverMerge}; dualDisplays={dualDisplays}");
+            Logger.LogInfo($"[CameraLayout] frame={Time.frameCount} split style={Options?.SplitStyle.Value}; dynamicPipeline={dynamicStyle}; adaptive={adaptiveStyle}; spareQuarter={spareQuarterMode}; static={staticStyle}; neverMerge={NeverMerge}; dualDisplays={dualDisplays}");
             Logger.LogInfo("RainWorldGame_ctor done");
         }
 
@@ -738,6 +754,8 @@ namespace SplitScreenCoop
                 realizer2 = null;
                 additionalRealizers.Clear();
                 ForgetLevelTextures();
+                ResetSharedFood();
+                foreach (CameraListener listener in cameraListeners) listener?.ClearRecordedShaderState();
             }
             catch (Exception error) { LogHookError("RainWorldGame_ShutDownProcess.pre", error); }
             try { orig(self); }
@@ -794,7 +812,12 @@ namespace SplitScreenCoop
         {
             StartHangWatchdog();
             HangMarker = "EnsureStableCameraAssignments";
-            if (self.IsStorySession && self.cameras?.Length > 1) EnsureStableCameraAssignments(self);
+            // Before orig: a throw here skipped the whole game tick, every tick it threw.
+            if (self.IsStorySession && self.cameras?.Length > 1)
+            {
+                try { EnsureStableCameraAssignments(self); }
+                catch (Exception error) { LogHookError("EnsureStableCameraAssignments", error); }
+            }
             HangMarker = "RainWorldGame.Update(orig)";
             long tickStart = phaseWatch.ElapsedTicks;
             orig(self);
@@ -813,6 +836,8 @@ namespace SplitScreenCoop
         private void RainWorldGame_UpdatePost(RainWorldGame self)
         {
             if (!self.IsStorySession) return;
+            try { WatchWarpTimer(self); }
+            catch (Exception error) { LogHookError("WatchWarpTimer", error); }
             if (!inputLoggedAfterStart)
             {
                 // The constructor's [Input] line runs before the game is the current
@@ -836,7 +861,8 @@ namespace SplitScreenCoop
 
             if (self.cameras.Length > 1)
             {
-                List<int> aliveCameras = GetAliveCameraNumbers(self);
+                // Refilled every tick. SetSplitMode below builds a list of its own.
+                List<int> aliveCameras = FillAliveCameraNumbers(self, tickAliveCameras);
                 if (dynamicStyle && !dualDisplays)
                 {
                     UpdateDynamicLayout(self, aliveCameras);
@@ -848,21 +874,30 @@ namespace SplitScreenCoop
                 // and SetSplitMode, with its display rebinding and two log lines, runs
                 // forty times a second (84 times in the log of 2026-09-19).
                 if (aliveCameras.Count == 0 && self.cameras.Length > 0) aliveCameras.Add(self.cameras[0].cameraNumber);
-                bool splitTargets = aliveCameras
-                    .Select(cameraNumber => self.cameras.FirstOrDefault(camera => camera.cameraNumber == cameraNumber))
-                    .Where(camera => camera != null)
-                    .Select(camera => camera.room != null
+                // Every tick, dual displays included: loops, where a LINQ chain allocated
+                // closures, iterators and two lists per tick.
+                bool splitTargets = false, haveTarget = false;
+                RoomTarget firstTarget = default;
+                foreach (int cameraNumber in aliveCameras)
+                {
+                    RoomCamera camera = CameraByNumber(self, cameraNumber);
+                    if (camera == null) continue;
+                    RoomTarget target = camera.room != null
                         ? new RoomTarget(camera.room.abstractRoom.index, camera.currentCameraPosition)
-                        : new RoomTarget())
-                    .Distinct()
-                    .Count() > 1;
+                        : new RoomTarget();
+                    if (!haveTarget) { firstTarget = target; haveTarget = true; }
+                    else if (!target.Equals(firstTarget)) { splitTargets = true; break; }
+                }
                 SplitMode desiredMode = !dualDisplays && aliveCameras.Count > 1 && (NeverMerge || splitTargets)
                     ? ResolveSplitMode(aliveCameras.Count)
                     : SplitMode.NoSplit;
-                List<int> desiredRenderedCameras = dualDisplays
-                    ? aliveCameras.Take(2).ToList()
-                    : desiredMode == SplitMode.NoSplit ? aliveCameras.Take(1).ToList() : aliveCameras;
-                if (desiredMode != CurrentSplitMode || !renderedCameraNumbers.SequenceEqual(desiredRenderedCameras))
+                // SetSplitMode renders the first two living cameras on dual displays, the
+                // first one unsplit, all of them split.
+                int wanted = dualDisplays ? Math.Min(2, aliveCameras.Count)
+                    : desiredMode == SplitMode.NoSplit ? Math.Min(1, aliveCameras.Count) : aliveCameras.Count;
+                bool sameCameras = renderedCameraNumbers.Count == wanted;
+                for (int i = 0; sameCameras && i < wanted; i++) sameCameras = renderedCameraNumbers[i] == aliveCameras[i];
+                if (desiredMode != CurrentSplitMode || !sameCameras)
                 {
                     string reason = desiredMode != CurrentSplitMode
                         ? (desiredMode == SplitMode.NoSplit ? "camera targets converged or one survivor" : "camera targets diverged or survivor count changed")
@@ -879,11 +914,16 @@ namespace SplitScreenCoop
 
             if(self.Players.Count > 1)
             {
+                UpdateRealizerBudget(self);
                 if (additionalRealizers.Count > 0)
                 {
                     HangMarker = "additional RoomRealizer.Update";
-                    foreach (RoomRealizer realizer in additionalRealizers.ToArray())
+                    // By index, not a copy per tick; the list only changes on a world load.
+                    for (int r = 0; r < additionalRealizers.Count; r++)
+                    {
+                        RoomRealizer realizer = additionalRealizers[r];
                         if (realizer?.world == self.world) realizer.Update();
+                    }
                 }
                 else
                 {
@@ -966,7 +1006,7 @@ namespace SplitScreenCoop
                                 int cameraNumber = renderedCameraNumbers[slot];
                                 cameraListeners[cameraNumber].BindToDisplay(Display.main);
                                 cameraListeners[cameraNumber].direct = false;
-                                cameraListeners[cameraNumber].SetMap(horizontalSplitScreenPart, InsetForSeparator(horizontalSplitCameraTargetPos[slot]));
+                                cameraListeners[cameraNumber].SetMap(InsetForSeparator(horizontalSplitScreenPart), InsetForSeparator(horizontalSplitCameraTargetPos[slot]));
                                 fcameras[cameraNumber].enabled = true;
                             }
                             break;
@@ -977,7 +1017,7 @@ namespace SplitScreenCoop
                                 int cameraNumber = renderedCameraNumbers[slot];
                                 cameraListeners[cameraNumber].BindToDisplay(Display.main);
                                 cameraListeners[cameraNumber].direct = false;
-                                cameraListeners[cameraNumber].SetMap(verticalSplitScreenPart, InsetForSeparator(verticalSplitCameraTargetPos[slot]));
+                                cameraListeners[cameraNumber].SetMap(InsetForSeparator(verticalSplitScreenPart), InsetForSeparator(verticalSplitCameraTargetPos[slot]));
                                 fcameras[cameraNumber].enabled = true;
                             }
                             break;
@@ -988,7 +1028,7 @@ namespace SplitScreenCoop
                                 int cameraNumber = renderedCameraNumbers[slot];
                                 cameraListeners[cameraNumber].BindToDisplay(Display.main);
                                 cameraListeners[cameraNumber].direct = false;
-                                cameraListeners[cameraNumber].SetMap(fourSplitScreenPart, InsetForSeparator(threeSplitCameraTargetPos[slot]));
+                                cameraListeners[cameraNumber].SetMap(InsetForSeparator(fourSplitScreenPart), InsetForSeparator(threeSplitCameraTargetPos[slot]));
                                 fcameras[cameraNumber].enabled = true;
                             }
                             break;
@@ -999,7 +1039,7 @@ namespace SplitScreenCoop
                                 int cameraNumber = renderedCameraNumbers[slot];
                                 cameraListeners[cameraNumber].BindToDisplay(Display.main);
                                 cameraListeners[cameraNumber].direct = false;
-                                cameraListeners[cameraNumber].SetMap(fourSplitScreenPart, InsetForSeparator(fourSplitCameraTargetPos[slot]));
+                                cameraListeners[cameraNumber].SetMap(InsetForSeparator(fourSplitScreenPart), InsetForSeparator(fourSplitCameraTargetPos[slot]));
                                 fcameras[cameraNumber].enabled = true;
                             }
                             break;
@@ -1028,15 +1068,25 @@ namespace SplitScreenCoop
 
         private List<int> GetAliveCameraNumbers(RainWorldGame game)
         {
-            // Living players that own a camera, by player number, each once. This runs
-            // every tick and more; it was a seven-stage LINQ chain with a closure per
-            // player.
-            var alive = new List<int>(4);
+            return FillAliveCameraNumbers(game, new List<int>(4));
+        }
+
+        /// <summary>The list the tick hook fills every tick, instead of a new one per tick.</summary>
+        private readonly List<int> tickAliveCameras = new List<int>(4);
+
+        /// <summary>
+        /// Living players that own a camera, by player number, each once, into
+        /// <paramref name="alive"/> (cleared first). This runs every tick and more; it was
+        /// a seven-stage LINQ chain with a closure per player.
+        /// </summary>
+        private static List<int> FillAliveCameraNumbers(RainWorldGame game, List<int> alive)
+        {
+            alive.Clear();
             if (game?.session?.Players == null || game.cameras == null) return alive;
             for (int i = 0; i < game.session.Players.Count; i++)
             {
                 AbstractCreature player = game.session.Players[i];
-                if (IsCreatureDead(player)) continue;
+                if (CreatureIsDead(player)) continue;
                 int number = (player.state as PlayerState)?.playerNumber ?? i;
                 if (alive.Contains(number)) continue;
                 foreach (RoomCamera camera in game.cameras)
@@ -1049,7 +1099,17 @@ namespace SplitScreenCoop
         /// <summary>
         /// null or dead or deleted creature
         /// </summary>
-        public bool IsCreatureDead(AbstractCreature critter)
+        public bool IsCreatureDead(AbstractCreature critter) => CreatureIsDead(critter);
+
+        /// <summary>The player camera <paramref name="cameraNumber"/> belongs to is dead (with a camera per player).</summary>
+        internal static bool CameraOwnerDead(RainWorldGame game, int cameraNumber)
+        {
+            AbstractCreature owner = GetPlayerForCamera(game, cameraNumber);
+            return owner != null && CreatureIsDead(owner);
+        }
+
+        /// <summary>IsCreatureDead for static code.</summary>
+        internal static bool CreatureIsDead(AbstractCreature critter)
         {
             if (critter?.state == null || critter.state.dead) return true;
             if (critter.state is PlayerState playerState && playerState.permaDead) return true;
@@ -1107,10 +1167,22 @@ namespace SplitScreenCoop
             return Mathf.Lerp(current, target, 0.55f);
         }
 
+        /// <summary>Each player has a camera of their own: the case in which vanilla's "make cameras[0] follow player X" is wrong.</summary>
+        internal static bool EachPlayerHasOwnCamera(RainWorldGame game)
+        {
+            return game?.cameras != null && game.Players != null &&
+                game.cameras.Length > 1 && game.cameras.Length >= game.Players.Count;
+        }
+
         private static AbstractCreature GetPlayerForCamera(RainWorldGame game, int cameraNumber)
         {
-            return game?.session?.Players?.FirstOrDefault(p => (p.state as PlayerState)?.playerNumber == cameraNumber)
-                ?? (cameraNumber < (game?.session?.Players?.Count ?? 0) ? game.session.Players[cameraNumber] : null);
+            // Called per player per frame (Adaptive framing and map) and per camera per
+            // tick: a plain loop, the LINQ version allocated a closure every call.
+            List<AbstractCreature> players = game?.session?.Players;
+            if (players == null) return null;
+            for (int i = 0; i < players.Count; i++)
+                if ((players[i]?.state as PlayerState)?.playerNumber == cameraNumber) return players[i];
+            return cameraNumber >= 0 && cameraNumber < players.Count ? players[cameraNumber] : null;
         }
 
         private void EnsureStableCameraAssignments(RainWorldGame game)
@@ -1130,6 +1202,13 @@ namespace SplitScreenCoop
                         roomMismatchSinceFrames[camera.cameraNumber] = -1;
                     continue;
                 }
+                // HunterStart and HideHudAndFollowNoone cutscenes set the camera to follow
+                // nobody every tick; reassigning it every tick only fought vanilla (and
+                // logged each time). The camera stays put; the cutscene ends by itself.
+                if (camera.followAbstractCreature == null && camera.InCutscene &&
+                    (camera.cutsceneType == RoomCamera.CameraCutsceneType.HunterStart ||
+                     camera.cutsceneType == RoomCamera.CameraCutsceneType.HideHudAndFollowNoone))
+                    continue;
                 if (player.realizedCreature is Player realized && camera.followAbstractCreature != player)
                     AssignCameraToPlayer(camera, realized);
                 else
@@ -1165,6 +1244,7 @@ namespace SplitScreenCoop
         public void OffsetHud(RoomCamera self)
         {
             self.hud?.map?.inFrontContainer?.SetPosition(camOffsets[self.cameraNumber]); // map icons
+            self.hud?.warpMap?.inFrontContainer?.SetPosition(camOffsets[self.cameraNumber]); // Watcher warp map icons
         }
 
         /// <summary>
@@ -1349,6 +1429,7 @@ namespace SplitScreenCoop
             RoomCamera cam = CameraOfHud(self?.hud);
             if (cam == null) return Vector2.zero;
             if (!(dynamicStyle && !dualDisplays)) return GetGlobalHudOffset(cam);
+            if (adaptiveStyle) return AdaptiveHudOffset(cam);
             // Dynamic and Static: warmth is a reading per player, so unlike food, karma
             // and rain it stays in its own view's HUD. That HUD texture is drawn into
             // the view's cell shifted by DynamicHudShift (a point h of the texture lands
@@ -1486,7 +1567,7 @@ namespace SplitScreenCoop
                         return returnValue;
                     if (returnValue)
                     {
-                        if (dynamicStyle && !dualDisplays && TryProjectJollyPlayer(self, out Vector2 projected))
+                        if (dynamicStyle && !dualDisplays && !adaptiveStyle && TryProjectJollyPlayer(self, out Vector2 projected))
                             return PointInsideDynamicRegion(self.jollyHud.Camera.cameraNumber, projected);
                         if (followedCreature == null || followedCreature.realizedCreature == null || followedCreature.Room == null)
                         {
@@ -1521,123 +1602,87 @@ namespace SplitScreenCoop
         }
 
         /// <summary>
-        /// Show other slugcat icons on the map even when they are in different rooms
+        /// Show other slugcat icons on the map even when they are in different rooms.
+        /// Map.Draw's creature-sense block (map open, creature sense on) loops over
+        /// (hud.owner as Creature).room.abstractRoom.creatures and reads that list three
+        /// times: the loop bound, the element, and, for box worms and fire sprites, the
+        /// element again for its colour. Every one of those reads gets one list of the
+        /// creatures in every player's room. The old version redirected only the bound
+        /// and the first read, so the colour read indexed the owner's own room with an
+        /// index from the longer list: ArgumentOutOfRangeException inside hud.Draw, the
+        /// first call of RoomCamera.DrawUpdate, which skipped that camera's draw and every
+        /// later camera's. It also rebuilt the list (with LINQ) every frame for every
+        /// camera, map open or not; now it is built only when the block runs.
         /// </summary>
         public void HudMap_Draw(ILContext il)
         {
             try
             {
                 var c = new ILCursor(il);
-
-                // Make a list of creatures to show icons for (including other slugcat rooms)
-                List<AbstractCreature> creatures = new List<AbstractCreature>();
-                c.GotoNext(MoveType.After,
-                  i => i.MatchLdarg(0),
-                  i => i.MatchLdfld<HUD.HudPart>("hud"),
-                  i => i.MatchLdfld<HUD.HUD>("owner")
-                  );
-                c.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
-                c.EmitDelegate<Action<HUD.Map>>((self) =>
-                {
-                    List<AbstractCreature> tempCreatures = new List<AbstractCreature>();
-                    if(!(self.hud.rainWorld.processManager.currentMainLoop is RainWorldGame))
-                    {
-                        return;
-                    }
-                    for (int m = 0; m < ((RainWorldGame)self.hud.rainWorld.processManager.currentMainLoop).session.Players.Count; m++)
-                    {
-                        Creature cr = ((RainWorldGame)self.hud.rainWorld.processManager.currentMainLoop).session.Players[m].realizedCreature;
-
-                        if (cr == null || cr.room == null)
-                        {
-                            continue;
-                        }
-
-                        List<AbstractCreature> roomCreatures = cr.room.abstractRoom.creatures;
-                        for (int n = 0; n < roomCreatures.Count; n++)
-                        {
-                            tempCreatures.Add(roomCreatures[n]);
-                        }
-                    }
-                    creatures = tempCreatures.Distinct().ToList(); // remove duplicates
-                });
-
-                // saving the value of loop iterator
-                c.GotoNext(MoveType.After,
+                int redirected = 0;
+                while (c.TryGotoNext(MoveType.After,
                     i => i.MatchCallOrCallvirt<Room>("get_abstractRoom"),
-                    i => i.MatchLdfld<AbstractRoom>("creatures")
-                    );
-
-                c.Index++;
-                int counter = 0;
-                c.EmitDelegate<Func<int, int>>((stackVal) =>
+                    i => i.MatchLdfld<AbstractRoom>("creatures")))
                 {
-                    counter = stackVal;
-                    return 0; // replacing with 0 so original calls don't go oob
-                });
-
-                // accessing our assembled creature list
-                c.Index++;
-                c.EmitDelegate<Func<AbstractCreature, AbstractCreature>>((stackVal) =>
-                {
-                    return creatures[counter];
-                });
+                    c.Emit(OpCodes.Ldarg_0);
+                    c.EmitDelegate<Func<List<AbstractCreature>, HUD.Map, List<AbstractCreature>>>(MapCreatures);
+                    redirected++;
+                }
+                if (redirected != 3)
+                    Logger.LogWarning($"HudMap_Draw: redirected {redirected} reads of the owner's creature list, expected 3 (loop bound, element, box worm colour)");
 
                 // disable vanishing of slugcat icons because of distance
+                c.Index = 0;
                 c.GotoNext(MoveType.Before,
                    i => i.MatchCallOrCallvirt<AbstractWorldEntity>("get_Room"),
                    i => i.MatchLdfld<AbstractRoom>("index"),
                    i => i.MatchLdarg(1)
                    );
-
-                AbstractCreature cr = null;
-                c.EmitDelegate<Func<AbstractWorldEntity, AbstractWorldEntity>>((stackVal) =>
+                c.EmitDelegate<Func<AbstractWorldEntity, AbstractWorldEntity>>(entity =>
                 {
-                    cr = (AbstractCreature)stackVal;
-                    return stackVal;
+                    mapIconCreature = entity as AbstractCreature;
+                    return entity;
                 });
-
                 c.GotoNext(MoveType.After,
                    i => i.MatchCallOrCallvirt<UnityEngine.Mathf>("InverseLerp")
                    );
-
-                c.EmitDelegate<Func<float, float>>((stackVal) =>
-                {
-                    if (cr.creatureTemplate.type == CreatureTemplate.Type.Slugcat)
-                        return 1f;
-                    return stackVal;
-                });
-
-                // changing loop bounds
-                c.GotoNext(MoveType.After,
-                    i => i.MatchCallOrCallvirt<Room>("get_abstractRoom"),
-                    i => i.MatchLdfld<AbstractRoom>("creatures")
-                    );
-
-                c.Index += 1;
-                c.EmitDelegate<Func<int, int>>((stackVal) =>
-                {
-                    return creatures.Count;
-                });
-
-                // clearing creature list
-                c.GotoNext(MoveType.After,
-                    i => i.MatchLdarg(0),
-                    i => i.MatchLdfld<HUD.Map>("visible"),
-                    i => i.MatchBrtrue(out _)
-                    );
-
-                c.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_0);
-                c.EmitDelegate<Action<HUD.Map>>((self) =>
-               {
-                   creatures.Clear();
-               });
+                c.EmitDelegate<Func<float, float>>(fade =>
+                    mapIconCreature?.creatureTemplate?.type == CreatureTemplate.Type.Slugcat ? 1f : fade);
             }
             catch (Exception e)
             {
                 Logger.LogError(e);
                 throw;
             }
+        }
+
+        // The creature whose map icon Map.Draw is fading by distance (see HudMap_Draw).
+        private static AbstractCreature mapIconCreature;
+
+        // Every player's room's creatures for one Map.Draw, built once per map per frame.
+        private static readonly List<AbstractCreature> mapCreatures = new List<AbstractCreature>();
+        private static readonly HashSet<AbstractCreature> mapCreaturesSeen = new HashSet<AbstractCreature>();
+        private static HUD.Map mapCreaturesFor;
+        private static int mapCreaturesFrame = -1;
+
+        private static List<AbstractCreature> MapCreatures(List<AbstractCreature> ownerRoom, HUD.Map map)
+        {
+            RainWorldGame game = map?.hud?.rainWorld?.processManager?.currentMainLoop as RainWorldGame;
+            List<AbstractCreature> players = game?.session?.Players;
+            if (players == null || players.Count < 2) return ownerRoom;
+            if (map == mapCreaturesFor && mapCreaturesFrame == Time.frameCount) return mapCreatures;
+            mapCreaturesFor = map;
+            mapCreaturesFrame = Time.frameCount;
+            mapCreatures.Clear();
+            mapCreaturesSeen.Clear();
+            for (int p = 0; p < players.Count; p++)
+            {
+                List<AbstractCreature> creatures = players[p]?.realizedCreature?.room?.abstractRoom?.creatures;
+                if (creatures == null) continue;
+                for (int n = 0; n < creatures.Count; n++)
+                    if (mapCreaturesSeen.Add(creatures[n])) mapCreatures.Add(creatures[n]);
+            }
+            return mapCreatures;
         }
 
         public void ToggleCameraZoom(RoomCamera cam)
@@ -1678,16 +1723,16 @@ namespace SplitScreenCoop
                 switch (CurrentSplitMode)
                 {
                     case SplitMode.SplitHorizontal:
-                        cameraListeners[camNum].SetMap(horizontalSplitScreenPart, InsetForSeparator(horizontalSplitCameraTargetPos[layoutSlot]));
+                        cameraListeners[camNum].SetMap(InsetForSeparator(horizontalSplitScreenPart), InsetForSeparator(horizontalSplitCameraTargetPos[layoutSlot]));
                         break;
                     case SplitMode.SplitVertical:
-                        cameraListeners[camNum].SetMap(verticalSplitScreenPart, InsetForSeparator(verticalSplitCameraTargetPos[layoutSlot]));
+                        cameraListeners[camNum].SetMap(InsetForSeparator(verticalSplitScreenPart), InsetForSeparator(verticalSplitCameraTargetPos[layoutSlot]));
                         break;
                     case SplitMode.Split4Screen:
-                        cameraListeners[camNum].SetMap(fourSplitScreenPart, InsetForSeparator(fourSplitCameraTargetPos[layoutSlot]));
+                        cameraListeners[camNum].SetMap(InsetForSeparator(fourSplitScreenPart), InsetForSeparator(fourSplitCameraTargetPos[layoutSlot]));
                         break;
                     case SplitMode.Split3Screen:
-                        cameraListeners[camNum].SetMap(fourSplitScreenPart, InsetForSeparator(threeSplitCameraTargetPos[layoutSlot]));
+                        cameraListeners[camNum].SetMap(InsetForSeparator(fourSplitScreenPart), InsetForSeparator(threeSplitCameraTargetPos[layoutSlot]));
                         break;
                 }
             }
@@ -1757,25 +1802,32 @@ namespace SplitScreenCoop
             self.SetMeshDirty(rCam.cameraNumber, self.meshDirty);
         }
 
+        // Vanilla's dirty flags are one per decal; these give every camera its own. They
+        // are only ever SET for all cameras here, never cleared: copying the last-drawn
+        // camera's cleared flag to all four every tick meant a camera that was not
+        // drawing then (the merged Adaptive view draws one) never built its mesh, and its
+        // decals stayed missing after the split. Each camera clears its own flag when it
+        // draws (CustomDecal_DrawSprites).
         public static void CustomDecal_Update(On.CustomDecal.orig_Update orig, CustomDecal self, bool eu)
         {
             orig(self, eu);
-            for (int i = 0; i < 4; i++)
-                self.SetMeshDirty(i, self.meshDirty);
+            if (self.meshDirty)
+                for (int i = 0; i < 4; i++)
+                    self.SetMeshDirty(i, true);
         }
 
         public static void CustomDecal_UpdateMesh(On.CustomDecal.orig_UpdateMesh orig, CustomDecal self)
         {
             orig(self);
             for (int i = 0; i < 4; i++)
-                self.SetMeshDirty(i, self.meshDirty);
+                self.SetMeshDirty(i, true);
         }
 
         public static void CustomDecal_UpdateAsset(On.CustomDecal.orig_UpdateAsset orig, CustomDecal self)
         {
             orig(self);
             for (int i = 0; i < 4; i++)
-                self.SetElementDirty(i, self.meshDirty);
+                self.SetElementDirty(i, true);
         }
 
         public Vector4[] SnowSource_PackSnowData(On.MoreSlugcats.SnowSource.orig_PackSnowData orig, MoreSlugcats.SnowSource self)

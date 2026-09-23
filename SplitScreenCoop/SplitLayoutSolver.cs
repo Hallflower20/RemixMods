@@ -207,7 +207,56 @@ namespace SplitScreenCoop
             public Vector2[] Polygon() { return box.Polygon(); }
         }
 
+        private sealed class ItemOrder : IComparer<Item>
+        {
+            public static readonly ItemOrder Instance = new ItemOrder();
+            public int Compare(Item a, Item b) { return a.Order.CompareTo(b.Order); }
+        }
+
         private enum TransitionMode { None, Slide }
+
+        // Solve runs every game tick. What never leaves it is kept here (at most four
+        // players). Everything in the Layout it returns is new on every call: callers
+        // and the slide memory keep earlier layouts' arrays.
+        private readonly bool[] scratchAlive = new bool[4];
+        private readonly List<PlayerInput> scratchEffective = new List<PlayerInput>(4);
+        private readonly bool[] scratchGhosts = new bool[4];
+        private readonly Vector2[] scratchWorld = new Vector2[4];
+        private readonly float[] scratchTargetAreas = new float[4];
+        private readonly float[,] scratchLineAmounts = new float[4, 4];
+        private readonly bool[,] scratchJoined = new bool[4, 4];
+        private readonly int[] scratchLeaders = new int[4];
+        private readonly Item[] scratchItemOfPlayer = new Item[4];
+        private readonly Vector2[][] scratchCells = new Vector2[4][];
+        private readonly Vector2[][] scratchShown = new Vector2[4][];
+        private readonly List<Item> scratchItems = new List<Item>(4);
+        private readonly List<Item> scratchSlices = new List<Item>(4);
+        private readonly List<Item> partitionRest = new List<Item>(2);
+        private readonly List<Item> partitionTop = new List<Item>(2);
+        private readonly List<Item> partitionBottom = new List<Item>(2);
+        private readonly List<DividerSegment> scratchDividers = new List<DividerSegment>(6);
+        private readonly List<Item> itemPool = new List<Item>(8);
+        private int itemsRented;
+
+        /// <summary>A cleared item from the pool; the pool is handed out afresh by every Solve.</summary>
+        private Item RentItem()
+        {
+            Item item;
+            if (itemsRented < itemPool.Count) item = itemPool[itemsRented];
+            else
+            {
+                item = new Item();
+                itemPool.Add(item);
+            }
+            itemsRented++;
+            item.members.Clear();
+            item.mask = 0;
+            item.weight = 0f;
+            item.structuralWeight = 0f;
+            item.box = default(Box);
+            item.screenKey = 0;
+            return item;
+        }
 
         private readonly Dictionary<int, Memory> memory = new Dictionary<int, Memory>();
         private readonly Dictionary<long, PairMemory> pairs = new Dictionary<long, PairMemory>();
@@ -270,8 +319,11 @@ namespace SplitScreenCoop
                 lastTargets.Clear();
                 return Empty();
             }
-            bool[] aliveNumbers = new bool[4];
-            List<PlayerInput> effective = new List<PlayerInput>(4);
+            itemsRented = 0;
+            bool[] aliveNumbers = scratchAlive;
+            Array.Clear(aliveNumbers, 0, aliveNumbers.Length);
+            List<PlayerInput> effective = scratchEffective;
+            effective.Clear();
             for (int i = 0; i < aliveCount; i++)
             {
                 PlayerInput input = players[i];
@@ -298,14 +350,14 @@ namespace SplitScreenCoop
                     effective.Add(entry.Value.lastInput);
                 else entry.Value.wasPresent = false;
             }
-            players = effective.ToArray();
+            players = effective;
             int count = players.Count;
             if (count == 0) return Empty();
-            bool[] ghosts = new bool[count];
+            bool[] ghosts = scratchGhosts;
             for (int i = 0; i < count; i++) ghosts[i] = !aliveNumbers[players[i].playerIndex];
             float aspect = Mathf.Max(0.1f, settings.screenAspect);
 
-            Vector2[] world = new Vector2[count];
+            Vector2[] world = scratchWorld;
             for (int i = 0; i < count; i++)
             {
                 PlayerInput input = players[i];
@@ -329,7 +381,7 @@ namespace SplitScreenCoop
                 state.visibleFor += dt;
             }
 
-            float[] targetAreas = new float[count];
+            float[] targetAreas = scratchTargetAreas;
             float ghostTotal = 0f;
             for (int i = 0; i < count; i++)
                 if (ghosts[i])
@@ -345,9 +397,11 @@ namespace SplitScreenCoop
             for (int i = 0; i < count; i++)
                 if (!ghosts[i]) targetAreas[i] = (1f - ghostTotal) / Mathf.Max(1, aliveCount);
 
+            // Only amounts leaves (pairSplitAmounts); the other two are read for i != j,
+            // every one of which is written below.
             float[,] amounts = new float[count, count];
-            float[,] lineAmounts = new float[count, count];
-            bool[,] joined = new bool[count, count];
+            float[,] lineAmounts = scratchLineAmounts;
+            bool[,] joined = scratchJoined;
             for (int i = 0; i < count; i++)
             for (int j = i + 1; j < count; j++)
             {
@@ -400,7 +454,7 @@ namespace SplitScreenCoop
                 joined[i, j] = joined[j, i] = nowJoined;
             }
 
-            int[] leaders = new int[count];
+            int[] leaders = scratchLeaders;
             for (int i = 0; i < count; i++) leaders[i] = i;
             for (int i = 0; i < count; i++)
             for (int j = i + 1; j < count; j++)
@@ -408,8 +462,9 @@ namespace SplitScreenCoop
 
             // One layout item per image group. Ghosts are never joined, so they are
             // always their own item and fade out through their weight.
-            List<Item> items = new List<Item>(4);
-            Item[] itemOfPlayer = new Item[count];
+            List<Item> items = scratchItems;
+            items.Clear();
+            Item[] itemOfPlayer = scratchItemOfPlayer;
             for (int i = 0; i < count; i++)
             {
                 int leader = Find(leaders, i);
@@ -418,7 +473,7 @@ namespace SplitScreenCoop
                     if (Find(leaders, items[k].members[0]) == leader) { item = items[k]; break; }
                 if (item == null)
                 {
-                    item = new Item();
+                    item = RentItem();
                     items.Add(item);
                 }
                 item.members.Add(i);
@@ -433,7 +488,7 @@ namespace SplitScreenCoop
 
             // Members of one group tile the group's rectangle. They all draw the same
             // image, so only the HUD and the divider bookkeeping care about the slices.
-            Vector2[][] cells = new Vector2[count][];
+            Vector2[][] cells = scratchCells;
             foreach (Item item in items)
             {
                 if (item.members.Count == 1)
@@ -441,11 +496,12 @@ namespace SplitScreenCoop
                     cells[item.members[0]] = item.Polygon();
                     continue;
                 }
-                List<Item> slices = new List<Item>(item.members.Count);
+                List<Item> slices = scratchSlices;
+                slices.Clear();
                 for (int m = 0; m < item.members.Count; m++)
                 {
                     int p = item.members[m];
-                    Item slice = new Item();
+                    Item slice = RentItem();
                     slice.members.Add(p);
                     slice.mask = 1 << players[p].playerIndex;
                     slice.weight = targetAreas[p] * Mathf.Max(1, aliveCount);
@@ -462,7 +518,7 @@ namespace SplitScreenCoop
             // two rectangles where they are (only the pans change). Three or more
             // cells slide from their previous rectangles to their new ones when the
             // tree restructures.
-            Vector2[][] shown = new Vector2[count][];
+            Vector2[][] shown = scratchShown;
             for (int i = 0; i < count; i++) shown[i] = cells[i];
             // A slide starts only when the tree changed shape: an item joined or
             // parted, or a player came or went. Cells that merely move because a
@@ -599,7 +655,8 @@ namespace SplitScreenCoop
                 };
             }
 
-            List<DividerSegment> dividers = new List<DividerSegment>(6);
+            List<DividerSegment> dividers = scratchDividers;
+            dividers.Clear();
             for (int i = 0; i < count; i++)
             for (int j = i + 1; j < count; j++)
             {
@@ -650,7 +707,8 @@ namespace SplitScreenCoop
                 items[0].box = box;
                 return;
             }
-            items.Sort((a, b) => a.Order.CompareTo(b.Order));
+            // A kept comparer: Sort(Comparison) wraps the lambda in a new comparer per call.
+            items.Sort(ItemOrder.Instance);
             int mask = 0;
             long key = 0;
             for (int i = 0; i < items.Count; i++)
@@ -686,7 +744,10 @@ namespace SplitScreenCoop
                 int first = 0;
                 for (int i = 1; i < items.Count; i++)
                     if (items[i].structuralWeight > items[first].structuralWeight) first = i;
-                List<Item> rest = new List<Item>(2);
+                // The scratch pairs are safe to reuse: a call is only ever given two,
+                // three or four items and only three and four recurse, always with two.
+                List<Item> rest = partitionRest;
+                rest.Clear();
                 float restWeight = 0f;
                 for (int i = 0; i < items.Count; i++)
                 {
@@ -706,8 +767,14 @@ namespace SplitScreenCoop
             // Four items: two rows of two, so the result is a grid instead of one
             // column holding three stacked slivers.
             {
-                List<Item> top = new List<Item> { items[0], items[1] };
-                List<Item> bottom = new List<Item> { items[2], items[3] };
+                List<Item> top = partitionTop;
+                List<Item> bottom = partitionBottom;
+                top.Clear();
+                top.Add(items[0]);
+                top.Add(items[1]);
+                bottom.Clear();
+                bottom.Add(items[2]);
+                bottom.Add(items[3]);
                 Box bottomBox, topBox;
                 CutBox(box, 1, bottom[0].weight + bottom[1].weight, top[0].weight + top[1].weight, node, settings, dt, changed,
                     out bottomBox, out topBox);

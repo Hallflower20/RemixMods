@@ -47,20 +47,22 @@ namespace SplitScreenCoop
             if (key == null || texture == null) return;
             try
             {
+                Unity.Collections.NativeArray<byte> raw = texture.GetRawTextureData<byte>();
                 CachedLevelTexture entry = FindCachedLevelTexture(key);
-                if (entry == null)
+                if (entry != null) levelTextureCache.Remove(entry);
+                else if (levelTextureCache.Count >= LevelTextureCacheEntries)
                 {
-                    entry = new CachedLevelTexture { key = key };
-                    levelTextureCache.Add(entry);
-                    while (levelTextureCache.Count > LevelTextureCacheEntries) levelTextureCache.RemoveAt(0);
+                    // Full: the least recently used entry, buffer and all, takes the new
+                    // image. A fresh 4.5 MB array per decode was garbage the collector
+                    // then had to reclaim, on the frame of a screen change at that.
+                    entry = levelTextureCache[0];
+                    levelTextureCache.RemoveAt(0);
+                    entry.key = key;
                 }
-                else
-                {
-                    // Most recently used goes last.
-                    levelTextureCache.Remove(entry);
-                    levelTextureCache.Add(entry);
-                }
-                entry.pixels = texture.GetRawTextureData<byte>().ToArray();
+                else entry = new CachedLevelTexture { key = key };
+                levelTextureCache.Add(entry); // most recently used goes last
+                if (entry.pixels == null || entry.pixels.Length != raw.Length) entry.pixels = new byte[raw.Length];
+                raw.CopyTo(entry.pixels);
                 entry.width = texture.width;
                 entry.height = texture.height;
                 entry.mipmapCount = texture.mipmapCount;
@@ -81,6 +83,14 @@ namespace SplitScreenCoop
         private static void ForgetLevelTextures()
         {
             for (int i = 0; i < loadedLevelTextureKeys.Length; i++) loadedLevelTextureKeys[i] = null;
+        }
+
+        /// <summary>The decoded images themselves, about 54 MB when full; only when no game follows.</summary>
+        private static void ClearLevelTextureCache()
+        {
+            if (levelTextureCache.Count == 0) return;
+            sLogger?.LogInfo($"[LevelTexture] freed {levelTextureCache.Count} cached level images");
+            levelTextureCache.Clear();
         }
 
         /// <summary>
@@ -111,7 +121,16 @@ namespace SplitScreenCoop
 
         private static bool LoadLevelTexture(Texture2D texture, byte[] bytes, bool markNonReadable, RoomCamera self)
         {
+            // This runs inside vanilla's tick; left set, the marker blamed every later
+            // freeze of the tick on the level image.
+            string previousMarker = HangMarker;
             HangMarker = "LoadLevelTexture";
+            try { return LoadLevelTextureShared(texture, bytes, markNonReadable, self); }
+            finally { HangMarker = previousMarker; }
+        }
+
+        private static bool LoadLevelTextureShared(Texture2D texture, byte[] bytes, bool markNonReadable, RoomCamera self)
+        {
             int number = self?.cameraNumber ?? -1;
             bool tracked = number >= 0 && number < loadedLevelTextureKeys.Length;
             string key = null;

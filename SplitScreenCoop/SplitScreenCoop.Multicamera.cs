@@ -274,10 +274,7 @@ namespace SplitScreenCoop
                 // was A && !B
                 // becomes (A || A2) && !B
                 // b param here is A
-                c.EmitDelegate<Func<bool, ShortcutHandler, int, bool>>((b, sc, k) =>
-                {
-                    return b || sc.game.cameras.Any(c=> sc.betweenRoomsWaitingLobby[k].creature.abstractCreature.FollowedByCamera(c.cameraNumber));
-                });
+                c.EmitDelegate<Func<bool, ShortcutHandler, int, bool>>(FollowedByLivingPlayersCamera);
             }
             else Logger.LogError(new Exception("Couldn't IL-hook ShortcutHandler_Update part 1 FollowedByCamera from SplitScreenMod")); // deffendisve progrmanig
 
@@ -320,6 +317,28 @@ namespace SplitScreenCoop
                 });
             }
             else Logger.LogError(new Exception("Couldn't IL-hook ShortcutHandler_Update part 3 MoveCamera from SplitScreenMod")); // deffendisve progrmanig
+        }
+
+        /// <summary>
+        /// Whether a creature waiting to leave a pipe into an unrealized room is followed by
+        /// a camera, so the room is realized for it (vanilla asks camera 0 only). With a
+        /// camera per player, a dead player's camera does not count: it follows the corpse,
+        /// and "followed" includes whatever carries it, so a predator dragging the body
+        /// realized every room on its way for a view nobody sees.
+        /// </summary>
+        private static bool FollowedByLivingPlayersCamera(bool followedByCameraZero, ShortcutHandler handler, int index)
+        {
+            RainWorldGame game = handler?.game;
+            if (game?.cameras == null || game.cameras.Length < 2) return followedByCameraZero;
+            AbstractCreature creature = handler.betweenRoomsWaitingLobby[index].creature.abstractCreature;
+            for (int i = 0; i < game.cameras.Length; i++)
+            {
+                RoomCamera camera = game.cameras[i];
+                if (camera == null) continue;
+                bool followed = camera.cameraNumber == 0 ? followedByCameraZero : creature.FollowedByCamera(camera.cameraNumber);
+                if (followed && !CameraOwnerDead(game, camera.cameraNumber)) return true;
+            }
+            return false;
         }
 
         /// <summary>

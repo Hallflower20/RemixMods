@@ -21,10 +21,10 @@ Without the game DLLs every project fails with `CS0246: The type or namespace na
 **Solver tests (SplitScreenCoop, `dynamic-split-screen` branch only):** `SplitLayoutSolver.cs` is pure C# with Unity math stubbed, so its tests compile with plain `csc` in seconds. Run from **PowerShell** (Git Bash rewrites `/nologo` and backslash paths into file names):
 
 ```powershell
-& "C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\Roslyn\csc.exe" /nologo /target:exe /out:"$env:TEMP\Tests.exe" SplitLayoutSolver.cs Tests\UnityMathStub.cs Tests\Program.cs; & "$env:TEMP\Tests.exe"
+& "C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\Roslyn\csc.exe" /nologo /target:exe /out:"$env:TEMP\Tests.exe" SplitLayoutSolver.cs AdaptiveLayout.cs FrameStats.cs Tests\UnityMathStub.cs Tests\Program.cs Tests\AdaptiveTests.cs Tests\FrameStatsTests.cs; & "$env:TEMP\Tests.exe"
 ```
 
-Run it from `SplitScreenCoop/`; expect `PASS: <n> layout checks` (10332 as of 2026-09-16). There is no way to select a single test — `Tests/Program.cs` is one console program that runs every check. Add a check for every new solver rule.
+Run it from `SplitScreenCoop/`; expect `PASS: <n> layout checks` (26538 as of 2026-09-22). There is no way to select a single test — `Tests/Program.cs` is one console program that runs every check. Add a check for every new solver rule.
 
 Game assemblies are **not** in the repo, and projects locate them in inconsistent ways — check the specific `.csproj` before building:
 

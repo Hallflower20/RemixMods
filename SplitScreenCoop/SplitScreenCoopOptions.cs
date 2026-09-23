@@ -18,14 +18,19 @@ namespace SplitScreenCoop
         public readonly Configurable<bool> DebugOverlay;
         public readonly Configurable<float> ExtraRealizerBudget;
         public readonly Configurable<string> CameraRendering;
+        public readonly Configurable<string> SpareQuarter;
+        public readonly Configurable<bool> HudTakesTurns;
+        public readonly Configurable<bool> HudOntoPicture;
 
         // Shown in the Remix description box while the control or its label is
         // hovered. Remix reads a Configurable's info.description into the widget
         // by itself; labels get the same text explicitly.
         private const string SplitStyleHelp =
-            "Dynamic: one shared view; players who move apart get their own cell and merge back when close. " +
-            "Static: a fixed region for each living player (halves, thirds, quarters), never merging. " +
-            "Classic: the original always-split layouts.";
+            "Adaptive: one view while everyone shares a screen; otherwise halves (2 players) or a still grid of quarters (3-4). " +
+            "Dynamic: the older distance-based merging. Static: a fixed region per living player. Classic: the original layouts.";
+        private const string SpareQuarterHelp =
+            "Adaptive style, three players: what the fourth quarter shows. Map and meters: where everyone is, visited rooms " +
+            "and shelters, plus the shared food, karma and rain. Meters only, or Black to leave the meters in their corner.";
         private const string AlwaysSplitHelp =
             "Give every player their own cell at all times, even when standing together. " +
             "Off: players close together on one camera screen share a single full-size image.";
@@ -58,15 +63,21 @@ namespace SplitScreenCoop
             "the frame limit rises to keep each view's speed (needs vsync off). Every frame: those effects suit one view. " +
             "Auto takes turns while each view gets 38 fps.";
         private const string ExtraRealizerBudgetHelp =
-            "Rooms kept loaded around each extra player (the game keeps 1500 worth around one). " +
-            "Lower it if the game lags with 3-4 players, raise it if entering rooms stutters. Applies when a region loads. Default 750.";
+            "Rooms kept loaded for each room the players are spread over, past the first (the game keeps 1500 worth around one). " +
+            "Lower it if the game lags with 3-4 players apart, raise it if entering rooms stutters. Default 750.";
+        private const string HudTakesTurnsHelp =
+            "While views take turns, each player's HUD redraws with its own view instead of every frame. " +
+            "Less work at the raised frame limit. Turn off if a HUD flickers or lags.";
+        private const string HudOntoPictureHelp =
+            "Adaptive style: each HUD is drawn straight onto its view, so see-through HUD parts keep their colour and " +
+            "quarters stay smooth. Turn off if a HUD is missing or wrong.";
 
         public SplitScreenCoopOptions()
         {
             AlwaysSplit = config.Bind("AlwaysSplit", false, new ConfigurableInfo(AlwaysSplitHelp));
             DualDisplays = config.Bind("DualDisplays", false, new ConfigurableInfo(DualDisplaysHelp));
-            SplitStyle = config.Bind("SplitStyle", "Dynamic", new ConfigurableInfo(SplitStyleHelp,
-                new ConfigAcceptableList<string>("Classic", "Dynamic", "Static")));
+            SplitStyle = config.Bind("SplitStyle", "Adaptive", new ConfigurableInfo(SplitStyleHelp,
+                new ConfigAcceptableList<string>("Classic", "Dynamic", "Static", "Adaptive")));
             MergeDistance = config.Bind("MergeDistance", 600f, new ConfigurableInfo(MergeDistanceHelp,
                 new ConfigAcceptableRange<float>(100f, 1400f)));
             BlendWidth = config.Bind("BlendWidth", 250f, new ConfigurableInfo(BlendWidthHelp,
@@ -93,6 +104,10 @@ namespace SplitScreenCoop
                 new ConfigAcceptableRange<float>(0f, 1500f)));
             CameraRendering = config.Bind("CameraRendering", "Auto", new ConfigurableInfo(CameraRenderingHelp,
                 new ConfigAcceptableList<string>("Auto", "Alternate frames", "Every frame")));
+            SpareQuarter = config.Bind("SpareQuarter", "Map and meters", new ConfigurableInfo(SpareQuarterHelp,
+                new ConfigAcceptableList<string>("Map and meters", "Meters only", "Black")));
+            HudTakesTurns = config.Bind("HudTakesTurns", true, new ConfigurableInfo(HudTakesTurnsHelp));
+            HudOntoPicture = config.Bind("HudOntoPicture", true, new ConfigurableInfo(HudOntoPictureHelp));
         }
 
         private static OpLabel Label(float x, float y, string text, string help, bool bigText = false)
@@ -126,7 +141,7 @@ namespace SplitScreenCoop
         public override void Initialize()
         {
             var general = new OpTab(this, "General");
-            var dynamic = new OpTab(this, "Dynamic");
+            var dynamic = new OpTab(this, "Layout");
             Tabs = new[] { general, dynamic };
             var dual = new OpCheckBox(DualDisplays, 10f, 430f);
             dual.greyedOut = !SplitScreenCoop.DualDisplaySupported();
@@ -139,12 +154,17 @@ namespace SplitScreenCoop
                 CheckLabel(40f, 430f, "Dual Display (experimental)", DualDisplaysHelp),
                 Label(10f, 380f, "Extra rooms per player", ExtraRealizerBudgetHelp),
                 new OpFloatSlider(ExtraRealizerBudget, new Vector2(225f, 373f), 190, 0),
+                Label(10f, 320f, "Rendering", "Switches for the newer rendering savings. Leave them on; turn one off if its view looks wrong.", true),
+                new OpCheckBox(HudTakesTurns, 10f, 280f),
+                CheckLabel(40f, 280f, "HUD redraws with its view", HudTakesTurnsHelp),
+                new OpCheckBox(HudOntoPicture, 10f, 245f),
+                CheckLabel(40f, 245f, "HUD drawn onto its view", HudOntoPictureHelp),
                 // Combo boxes last (see Combo): the open list must draw over the rows below.
-                Combo(SplitStyle, 10f, 505f, 140f, new[] { "Dynamic", "Static", "Classic" })
+                Combo(SplitStyle, 10f, 505f, 140f, new[] { "Adaptive", "Dynamic", "Static", "Classic" })
             });
             dynamic.AddItems(new UIelement[]
             {
-                Label(10f, 550f, "Distance, area and zoom", "Settings for the Dynamic split-screen style. Hover a setting for what it does.", true),
+                Label(10f, 550f, "Split-screen layout", "Merge distance, blend width, zoom and smoothing apply to the Dynamic style; the rest to every split style. Hover a setting for what it does.", true),
                 Label(10f, 507f, "Merge distance", MergeDistanceHelp),
                 new OpFloatSlider(MergeDistance, new Vector2(225f, 500f), 190, 0),
                 Label(10f, 462f, "Blend width", BlendWidthHelp),
@@ -161,8 +181,10 @@ namespace SplitScreenCoop
                 Label(10f, 192f, "Camera rendering", CameraRenderingHelp),
                 new OpCheckBox(DebugOverlay, 10f, 140f),
                 CheckLabel(40f, 140f, "Show layout debug overlay", DebugOverlayHelp),
+                Label(10f, 97f, "Spare quarter (3 players)", SpareQuarterHelp),
                 // Combo boxes last, lowest first (see Combo): an open list covers the rows
                 // below it, the other box included.
+                Combo(SpareQuarter, 225f, 90f, 145f, new[] { "Map and meters", "Meters only", "Black" }),
                 Combo(CameraRendering, 225f, 185f, 145f, new[] { "Auto", "Alternate frames", "Every frame" }),
                 Combo(ZoomedFilter, 225f, 230f, 145f, new[] { "Bilinear", "Point" })
             });

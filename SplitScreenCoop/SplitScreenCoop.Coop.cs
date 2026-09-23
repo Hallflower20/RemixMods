@@ -67,12 +67,25 @@ namespace SplitScreenCoop
             orig(self);
         }
 
-        /// <summary>Every player is dead or in a predator's grasp: the co-op game-over condition.</summary>
+        /// <summary>
+        /// Every player is dead or lost to a predator's grasp: the co-op game-over
+        /// condition. Lost means held for <see cref="GraspGameOverTicks"/>, when vanilla
+        /// gives up on a grabbed player (Player.Update: the escape window closes at 30,
+        /// GameOver at 60). Any grasp at all used to count, so the first tick of a grab
+        /// on the last player standing played the game-over music and placed the karma
+        /// flower even when they shook it off.
+        /// </summary>
         private bool AllPlayersDown(RainWorldGame game)
         {
             if (game?.session?.Players == null) return false;
-            return game.session.Players.All(p => IsCreatureDead(p) || (p.realizedCreature is Player pl && pl.dangerGrasp != null));
+            // The co-op rules run every tick: loops, not LINQ.
+            foreach (AbstractCreature p in game.session.Players)
+                if (!(IsCreatureDead(p) || (p.realizedCreature is Player pl && pl.dangerGrasp != null &&
+                    pl.dangerGraspTime >= GraspGameOverTicks))) return false;
+            return true;
         }
+
+        private const int GraspGameOverTicks = 60;
 
         private void TextPrompt_EnterGameOverMode(On.HUD.TextPrompt.orig_EnterGameOverMode orig, TextPrompt self,
             Creature.Grasp dependentOnGrasp, int foodInStomach, int deathRoom, Vector2 deathPos)
@@ -120,16 +133,30 @@ namespace SplitScreenCoop
             return ReadyForWin(game) || ReadyForStarve(game);
         }
 
+        /// <summary>At least one player present, and every present player ready to sleep.</summary>
         public bool ReadyForWin(RainWorldGame game)
         {
-            return game.session.Players.Any(p => !PlayerDeadOrMissing(p) && PlayerReadyForWin(p)) 
-                && game.session.Players.All(p => PlayerDeadOrMissing(p) || PlayerReadyForWin(p));
+            bool anyReady = false;
+            foreach (AbstractCreature p in game.session.Players)
+            {
+                if (PlayerDeadOrMissing(p)) continue;
+                if (!PlayerReadyForWin(p)) return false;
+                anyReady = true;
+            }
+            return anyReady;
         }
 
+        /// <summary>At least one present player forcing a starving sleep, every other present player ready either way.</summary>
         public bool ReadyForStarve(RainWorldGame game)
         {
-            return game.session.Players.Any(p => !PlayerDeadOrMissing(p) && PlayerReadyForStarve(p))
-                && game.session.Players.All(p => PlayerDeadOrMissing(p) || PlayerReadyForWin(p) || PlayerReadyForStarve(p));
+            bool anyStarving = false;
+            foreach (AbstractCreature p in game.session.Players)
+            {
+                if (PlayerDeadOrMissing(p)) continue;
+                if (PlayerReadyForStarve(p)) anyStarving = true;
+                else if (!PlayerReadyForWin(p)) return false;
+            }
+            return anyStarving;
         }
         
         public bool PlayerReadyForWin(AbstractCreature p)
@@ -163,8 +190,13 @@ namespace SplitScreenCoop
             if (coopSharedFood) return needed <= (p.realizedCreature as Player).FoodInRoom(false);
 
             // otherwise check if room has food for everyone
-            int foodNeeded = p.Room.creatures.Where(c => c.state is PlayerState && c.realizedCreature is Player)
-                .Sum(c => Mathf.Max(0, (starving ? (c.realizedCreature as Player).slugcatStats.maxFood : toStarve ? 1 : (c.realizedCreature as Player).slugcatStats.foodToHibernate) - (c.state as PlayerState).foodInStomach));
+            int foodNeeded = 0;
+            foreach (AbstractCreature c in p.Room.creatures)
+            {
+                if (!(c.state is PlayerState state) || !(c.realizedCreature is Player other)) continue;
+                int wanted = starving ? other.slugcatStats.maxFood : toStarve ? 1 : other.slugcatStats.foodToHibernate;
+                foodNeeded += Mathf.Max(0, wanted - state.foodInStomach);
+            }
             return (p.realizedCreature as Player).FoodInRoom(false) >= foodNeeded;
         }
 
@@ -180,16 +212,71 @@ namespace SplitScreenCoop
                 && ShelterDoor.CoordInsideShelterRange(p.pos.Tile, room.shelterDoor.isAncient));
         }
 
+        // The shared food meter is one pool, kept by changes: each tick it takes the sum
+        // of what every player ate or spent since the tick before, and every player is
+        // set to it. Setting everyone to the fullest stomach (the old rule) undid every
+        // food cost: an Artificer's craft or a Gourmand's regurgitation came back on the
+        // next tick from a player who had not paid it. Counted in quarter pips.
+        private static int sharedFoodPool;
+        private static int sharedFoodPlayers = -1;
+        private static int[] sharedFoodGiven = new int[4];
+
+        /// <summary>Per session: the next game's first tick starts the pool from the fullest stomach.</summary>
+        private static void ResetSharedFood()
+        {
+            sharedFoodPlayers = -1;
+        }
+
         public static void UpdatePlayerFood(RainWorldGame game)
         {
-            if (coopSharedFood)
+            if (!coopSharedFood) return;
+            // Every tick: loops, not LINQ.
+            List<AbstractCreature> players = game.session.Players;
+            int count = players.Count;
+            if (count == 0) return;
+            if (sharedFoodGiven.Length < count)
             {
-                // synch food, players share a food meter
-                int food = game.session.Players.Max(p => (p.state as PlayerState).foodInStomach);
-                int quarters = game.session.Players.Where(p => (p.state as PlayerState).foodInStomach == food).Max(p => (p.state as PlayerState).quarterFoodPoints);
-                game.session.Players.ForEach(p => (p.state as PlayerState).foodInStomach = food);
-                game.session.Players.ForEach(p => (p.state as PlayerState).quarterFoodPoints = quarters);
+                sharedFoodGiven = new int[count];
+                sharedFoodPlayers = -1;
             }
+            // The smallest stomach, so nobody is filled past their own; vanilla empties
+            // the quarter pips of a full stomach, and so does pool % 4 at the cap.
+            int capacity = int.MaxValue;
+            foreach (AbstractCreature p in players)
+                capacity = Math.Min(capacity, p.realizedCreature is Player realized
+                    ? realized.MaxFoodInStomach : game.session.characterStats?.maxFood ?? int.MaxValue);
+            capacity = capacity >= int.MaxValue / 4 ? int.MaxValue : capacity * 4;
+            int pool;
+            if (count != sharedFoodPlayers)
+            {
+                // First tick of a session, or a player came or went: start from the
+                // fullest stomach, as the old rule did.
+                pool = 0;
+                for (int i = 0; i < count; i++) pool = Math.Max(pool, QuarterFood(players[i]));
+                sharedFoodPlayers = count;
+            }
+            else
+            {
+                pool = sharedFoodPool;
+                for (int i = 0; i < count; i++) pool += QuarterFood(players[i]) - sharedFoodGiven[i];
+            }
+            pool = Math.Max(0, Math.Min(pool, capacity));
+            sharedFoodPool = pool;
+            for (int i = 0; i < count; i++)
+            {
+                if (players[i].state is PlayerState state)
+                {
+                    state.foodInStomach = pool / 4;
+                    state.quarterFoodPoints = pool % 4;
+                    sharedFoodGiven[i] = pool;
+                }
+                else sharedFoodGiven[i] = 0; // QuarterFood reads 0 for it: no change
+            }
+        }
+
+        private static int QuarterFood(AbstractCreature player)
+        {
+            return player.state is PlayerState state ? state.foodInStomach * 4 + state.quarterFoodPoints : 0;
         }
 
         /// <summary>

@@ -1,5 +1,5 @@
 using System;
-using System.Linq;
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace SplitScreenCoop
@@ -10,30 +10,94 @@ namespace SplitScreenCoop
         /// Give every additional player an independent room realizer. Sharing the
         /// primary realizer's mutable lists caused duplicate mutation and freezes.
         /// </summary>
+        /// <summary>The player each additional realizer belongs to; its followCreature changes while that player is dead.</summary>
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<RoomRealizer, AbstractCreature> realizerOwners = new();
+
         private void MakeRealizer2(RainWorldGame game)
         {
             additionalRealizers.Clear();
             realizer2 = null;
             if (game?.roomRealizer == null || game.session?.Players == null) return;
 
-            foreach (AbstractCreature player in game.session.Players.Where(p => p != game.roomRealizer.followCreature))
+            foreach (AbstractCreature player in game.session.Players)
             {
+                if (player == game.roomRealizer.followCreature) continue;
                 var realizer = new RoomRealizer(player, game.world);
+                realizerOwners.Add(realizer, player);
                 additionalRealizers.Add(realizer);
             }
-            realizer2 = additionalRealizers.FirstOrDefault();
-            // Every realizer now measures the whole world's realized rooms against
-            // one budget (see RoomRealizer_CurrentPerformanceEstimation), so the
-            // budget grows with the player count instead of each realizer silently
-            // owning a full vanilla budget of its own.
-            // Vanilla keeps 1500 worth of rooms realized around one player. Every extra
-            // player adds a share for their own surroundings; the Remix slider trades
-            // room-load hitches (low) against rooms updating every tick (high).
-            float perExtraPlayer = Options != null ? Options.ExtraRealizerBudget.Value : 750f;
-            float budget = 1500f + perExtraPlayer * additionalRealizers.Count;
-            game.roomRealizer.performanceBudget = budget;
-            foreach (RoomRealizer realizer in additionalRealizers) realizer.performanceBudget = budget;
-            Logger.LogInfo($"Created {additionalRealizers.Count} additional room realizer(s); shared performance budget={budget}");
+            realizer2 = additionalRealizers.Count > 0 ? additionalRealizers[0] : null;
+            realizerBudgetRooms = CountLivingPlayerRooms(game);
+            realizerBudgetShrinkTicks = 0;
+            float budget = ApplyRealizerBudget(game);
+            Logger.LogInfo($"Created {additionalRealizers.Count} additional room realizer(s); shared performance budget={budget} for {realizerBudgetRooms} room(s) with players");
+        }
+
+        // Every realizer measures the whole world's realized rooms against one budget
+        // (see RoomRealizer_CurrentPerformanceEstimation). Vanilla keeps 1500 worth of
+        // rooms realized around one player; the budget adds the Remix slider's share for
+        // every other room the living players are spread over. It used to add a share
+        // per player, dead ones included, so four players standing together kept 2.5x
+        // vanilla's neighbour rooms realized, every one of them updating every tick. It
+        // grows at once when players split up and shrinks only after they have been
+        // together for 30 s, so someone stepping through a door and back does not make
+        // the realizers drop rooms and load them again.
+        private int realizerBudgetRooms = 1;
+        private int realizerBudgetShrinkTicks;
+        private const int RealizerBudgetShrinkTicks = 40 * 30;
+        private readonly int[] livingPlayerRooms = new int[4];
+
+        private int CountLivingPlayerRooms(RainWorldGame game)
+        {
+            int rooms = 0;
+            List<AbstractCreature> players = game?.session?.Players;
+            if (players != null)
+                for (int p = 0; p < players.Count; p++)
+                {
+                    AbstractCreature player = players[p];
+                    if (player?.Room == null || CreatureIsDead(player)) continue;
+                    int index = player.Room.index;
+                    bool counted = false;
+                    for (int i = 0; i < rooms && !counted; i++) counted = livingPlayerRooms[i] == index;
+                    if (!counted && rooms < livingPlayerRooms.Length) livingPlayerRooms[rooms++] = index;
+                }
+            return Math.Max(1, rooms);
+        }
+
+        private void UpdateRealizerBudget(RainWorldGame game)
+        {
+            if (game?.roomRealizer == null) return;
+            int rooms = CountLivingPlayerRooms(game);
+            if (rooms > realizerBudgetRooms)
+            {
+                realizerBudgetRooms = rooms;
+                realizerBudgetShrinkTicks = 0;
+            }
+            else if (rooms < realizerBudgetRooms)
+            {
+                if (++realizerBudgetShrinkTicks < RealizerBudgetShrinkTicks) return;
+                realizerBudgetRooms = rooms;
+                realizerBudgetShrinkTicks = 0;
+            }
+            else
+            {
+                realizerBudgetShrinkTicks = 0;
+                return;
+            }
+            float before = game.roomRealizer.performanceBudget;
+            float budget = ApplyRealizerBudget(game);
+            if (budget != before)
+                Logger.LogInfo($"[RoomRealizer] frame={Time.frameCount} shared budget {before:0} -> {budget:0}: the living players are in {realizerBudgetRooms} room(s)");
+        }
+
+        private float ApplyRealizerBudget(RainWorldGame game)
+        {
+            float perExtraRoom = Options != null ? Options.ExtraRealizerBudget.Value : 750f;
+            float budget = 1500f + perExtraRoom * Math.Max(0, realizerBudgetRooms - 1);
+            if (game?.roomRealizer != null) game.roomRealizer.performanceBudget = budget;
+            for (int i = 0; i < additionalRealizers.Count; i++)
+                if (additionalRealizers[i] != null) additionalRealizers[i].performanceBudget = budget;
+            return budget;
         }
 
         /// <summary>
@@ -118,26 +182,49 @@ namespace SplitScreenCoop
         /// <summary>
         /// Vanilla always copies camera zero's target into a realizer. Temporarily
         /// expose this realizer's own target there so each instance remains stable.
+        /// A dead player's realizer, the main one included, follows a living player
+        /// instead of the corpse: a predator dragging the body used to realize, and
+        /// preload the neighbours of, every room on its way, all of which then updated
+        /// every tick for the rest of the cycle. The dead player's own rooms age out
+        /// the way rooms do behind any player who left them.
         /// </summary>
         public void RoomRealizer_Update(On.RoomRealizer.orig_Update orig, RoomRealizer self)
         {
             RainWorldGame game = self?.world?.game;
-            if (game?.cameras == null || game.cameras.Length == 0 || self == game.roomRealizer)
+            if (game?.cameras == null || game.cameras.Length == 0)
             {
                 orig(self);
                 return;
             }
 
             AbstractCreature previous = game.cameras[0].followAbstractCreature;
+            AbstractCreature target = self == game.roomRealizer ? previous
+                : realizerOwners.TryGetValue(self, out AbstractCreature owner) ? owner : self.followCreature;
+            if (target != null && game.session?.Players?.Count > 1 && CreatureIsDead(target))
+                target = FirstLivingPlayer(game) ?? target;
+            if (target == null || target == previous)
+            {
+                orig(self);
+                return;
+            }
             try
             {
-                if (self.followCreature != null) game.cameras[0].followAbstractCreature = self.followCreature;
+                game.cameras[0].followAbstractCreature = target;
                 orig(self);
             }
             finally
             {
                 game.cameras[0].followAbstractCreature = previous;
             }
+        }
+
+        private static AbstractCreature FirstLivingPlayer(RainWorldGame game)
+        {
+            List<AbstractCreature> players = game?.session?.Players;
+            if (players == null) return null;
+            for (int i = 0; i < players.Count; i++)
+                if (players[i] != null && !CreatureIsDead(players[i])) return players[i];
+            return null;
         }
 
         private int lastKillRoomBlockFrame = -10000;
@@ -155,17 +242,22 @@ namespace SplitScreenCoop
         public void RoomRealizer_KillRoom(On.RoomRealizer.orig_KillRoom orig,
             RoomRealizer self, AbstractRoom room)
         {
+            string previousMarker = HangMarker;
             HangMarker = "RoomRealizer_KillRoom";
-            if (room != null && (RoomIsInUseByAnyPlayer(self?.world?.game, room) || RoomIsHeldByAnotherRealizer(self, room)))
+            try
             {
-                if (Time.frameCount - lastKillRoomBlockFrame > 200)
+                if (room != null && (RoomIsInUseByAnyPlayer(self?.world?.game, room) || RoomIsHeldByAnotherRealizer(self, room)))
                 {
-                    Logger.LogInfo($"[RoomRealizer] frame={Time.frameCount} refused to abstractize {room.name}; a player, their camera, their realizer or a shortcut vessel still needs it");
-                    lastKillRoomBlockFrame = Time.frameCount;
+                    if (Time.frameCount - lastKillRoomBlockFrame > 200)
+                    {
+                        Logger.LogInfo($"[RoomRealizer] frame={Time.frameCount} refused to abstractize {room.name}; a player, their camera, their realizer or a shortcut vessel still needs it");
+                        lastKillRoomBlockFrame = Time.frameCount;
+                    }
+                    return;
                 }
-                return;
+                orig(self, room);
             }
-            orig(self, room);
+            finally { HangMarker = previousMarker; }
         }
 
         /// <summary>
@@ -205,8 +297,9 @@ namespace SplitScreenCoop
             if (game.session?.Players != null)
                 foreach (AbstractCreature player in game.session.Players)
                 {
-                    if (player == null) continue;
-                    if ((player.state as PlayerState)?.permaDead == true) continue;
+                    // A corpse holds no room (see RoomRealizer_Update); a dead player's
+                    // camera still holds its own, below.
+                    if (player == null || CreatureIsDead(player)) continue;
                     if (player.Room == room) return true;
                     if (player.realizedCreature?.room?.abstractRoom == room) return true;
                 }

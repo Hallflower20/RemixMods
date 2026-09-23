@@ -282,6 +282,66 @@ Needs in-game confirmation
     like single player. [Perf] shows fpsPerView equal to the game's frame limit and
     frameLimit at twice that while alternate=True. With vsync on at 60 Hz Auto should
     say so once and render every camera every frame.
+[ ] Phase 4, Jolly off (the mod's own co-op): after a player dies the gate still opens
+    for the others wherever the body is (another room, inside the gate); a grab shaken
+    off within a second does not end the game (a grab held for 1.5 s still does); an
+    Artificer's craft or a Gourmand's regurgitation costs the shared food meter instead
+    of coming back.
+[ ] Phase 4, Watcher ripple-egg warp with 2+ players: after the fast-travel screen the
+    split is back at once, and the log has "[CameraMode] ... game resumed after" but no
+    "[CameraHealth]" lines and no "draw loop stalled". Dual displays: display 2 shows the
+    menu while it is up.
+[ ] Phase 4, Classic style: views look as before, with a thin black separator, and stay
+    sharp after a resolution or window size change.
+[ ] Phase 3, Adaptive with 3-4 players: HUD text and thin lines in the quarters look as
+    sharp as the picture, and see-through HUD parts (the map, fades) are no darker than
+    in single player. Remix > General > "HUD drawn onto its view" off must give the old
+    look back; say if the new one looks wrong anywhere.
+[ ] Phase 3: when two players on one screen part, neither view flashes the other's new
+    screen for a frame. A death with 3-4 players: no black behind the sliding views; at
+    game over the last death stays on screen (it used to jump to player 1's view).
+[ ] Phase 3: custom decals (drawn art in modded or Watcher rooms) appear on every view
+    after a split; two players entering a sky room one after the other see the same
+    lighting; the sleep screen and fast-travel maps look like single player.
+[ ] Phase 2, two or more views taking turns (Camera rendering: Auto or Alternate
+    frames): every player's HUD (food, map, warmth, names) updates smoothly and never
+    flickers. If it does, Remix > General > "HUD redraws with its view" off should
+    fix it; say which. Log: "[Perf] ... replayMs= replaysPerFrame=" and
+    "[RoomRealizer] ... shared budget" lines when the group splits and regroups.
+[ ] Stutter after the audit's phase 1: play 2-3 players for a while, including a room
+    full of particles (zero-g specks, fairy particles, gold flakes) with players on
+    different screens. Log: "[Perf] ... gcPerMin= allocMBps=" (lower is better) and
+    "[FrameHitch]" lines, now also for 25-50 ms frames, with gcCollections of that frame.
+[ ] Moon or Pebbles with only player 2 (or 3, 4) in the chamber: player 1's view must
+    stay with player 1, and the log must not fill with AssignCameraToPlayer lines.
+[ ] A death where a creature carries the body through pipes: the dead player's view
+    leaves the layout and nothing hitches while the body travels; no "[CameraMove]"
+    line for the dead player's camera.
+[ ] Map after a gate or a warp, every player: the slugcat, shelter and creature icons
+    sit inside your own view, as before the gate. Watcher campaign with creature sense
+    on: open the map with a box worm or fire sprite in another player's room.
+[ ] Sky rooms (Sky Islands, Outer Expanse) at dusk with two players in the same room on
+    different screens: both views change colour together.
+[ ] Adaptive style (now the default for new configs; pick it in Remix if yours says
+    Static or Dynamic). Two players: one view on the same screen; on different screens
+    two halves, full height, that only shift sideways (in short steps) when your own
+    slugcat nears the edge. Walking across a screen boundary together must not split.
+    Merging takes about a second and is a smooth widening; splitting is a smooth
+    narrowing.
+[ ] Adaptive, three and four players: a still grid; each quarter shows your whole
+    screen at half size and never moves while you walk. The grid only changes when
+    everyone reaches one screen (a zoom to one view), when someone dies or is revived
+    (a slide), never because two players met or parted. Three players: the fourth
+    quarter has the map (visited rooms, shelters, everyone's marker) and the shared
+    food/karma/rain. Try Spare quarter = Meters only and Black too.
+    Log: "[CameraLayout] ... adaptive merge|split|reflow|switch" lines, one per event.
+[ ] Snow room with 2+ players on different screens: only the view whose screen has
+    snow shows snow, on terrain and around lights and fog alike.
+[ ] Warps with 2+ players: after arriving, the warp effect and muffled sound end within
+    a few seconds on every view, including when player 2 is the one who triggers it and
+    when player 1 is already in the destination room. Each view keeps following its own
+    player during the warp. Log: every "[Warp] ... started" has a "finished"; a
+    "[Warp] released" warning means vanilla would have stuck there.
 [ ] Warmth meter in a cold region: ten steady circles under the food pips on dual
     displays and Classic split; under Dynamic and Static each view shows its own
     player's meter in the bottom left corner of its own cell.

@@ -85,7 +85,9 @@ namespace SplitScreenCoop
             public void Retarget()
             {
                 if (fcamera == null || display == null) return;
-                fcamera.targetTexture = _direct && !dynamicCompositing ? display.Extras().renderTexture : this.renderTexture;
+                // Called several times per camera per tick; assign only on a change.
+                RenderTexture target = _direct && !dynamicCompositing ? display.Extras().renderTexture : this.renderTexture;
+                if (fcamera.targetTexture != target) fcamera.targetTexture = target;
             }
 
 
@@ -109,9 +111,11 @@ namespace SplitScreenCoop
                 if (reinitDisplay) display.Extras().ReinitRenderTexture();
                 renderTexture = new RenderTexture(Futile.screen.renderTexture);
                 renderTexture.name = $"SplitScreen camera {Array.IndexOf(cameraListeners, this)}";
-                if (dynamicStyle && Options != null)
-                    renderTexture.filterMode = Options.ZoomedFilter.Value == "Point"
-                        ? FilterMode.Point : FilterMode.Bilinear;
+                // As ReadSettings sets it. A new RenderTexture filters bilinear whatever
+                // the one it copies, so Classic views went soft after every rebuild.
+                renderTexture.filterMode = dynamicStyle && Options != null
+                    ? Options.ZoomedFilter.Value == "Point" ? FilterMode.Point : FilterMode.Bilinear
+                    : Futile.screen.renderTexture.filterMode;
                 renderTexture.wrapMode = TextureWrapMode.Clamp;
                 renderTexture.Create();
                 SetMap(this.sourceRect, this.targetRect);
@@ -188,6 +192,11 @@ namespace SplitScreenCoop
             public void OnPreRender()
             {
                 lastPreRenderFrame = Time.frameCount;
+                // Only in a game. Menus set their own globals; replaying the game's over them
+                // gave the sleep, death and fast-travel maps camera 0's last in-game map
+                // values (_mapSize among them) whenever their region differed.
+                if (!(rainworldGameObject?.processManager?.currentMainLoop is RainWorldGame)) return;
+                long start = phaseWatch.ElapsedTicks;
                 restoringShaderState = true;
                 try
                 {
@@ -203,7 +212,21 @@ namespace SplitScreenCoop
                 finally
                 {
                     restoringShaderState = false;
+                    // [Perf] replayMs: whether skipping unchanged values would be worth it.
+                    frameReplayMs += (phaseWatch.ElapsedTicks - start) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                    frameReplays++;
                 }
+            }
+
+            /// <summary>
+            /// The previous-frame capture and binding matter only with several cameras: a
+            /// camera alone draws after its own last grab, as in vanilla. Solo play with the
+            /// mod installed paid a full-screen copy and a blend every frame for nothing.
+            /// </summary>
+            private static bool SeveralCameras()
+            {
+                return rainworldGameObject?.processManager?.currentMainLoop is RainWorldGame game &&
+                    game.cameras != null && game.cameras.Length > 1;
             }
 
             /// <summary>
@@ -219,14 +242,14 @@ namespace SplitScreenCoop
             /// </summary>
             private void BindOwnGrab()
             {
-                if (!(rainworldGameObject?.processManager?.currentMainLoop is RainWorldGame)) return;
+                if (!SeveralCameras()) return;
                 Shader.SetGlobalTexture(GrabTextureId,
                     lastFrame != null && lastFrame.IsCreated() ? (Texture)lastFrame : Texture2D.whiteTexture);
             }
 
             private void CaptureLastFrame()
             {
-                if (!(rainworldGameObject?.processManager?.currentMainLoop is RainWorldGame)) return;
+                if (!SeveralCameras()) return;
                 RenderTexture source = fcamera != null ? fcamera.targetTexture : null;
                 if (source == null || !source.IsCreated()) return;
                 try
@@ -342,6 +365,18 @@ namespace SplitScreenCoop
                     lastCompositeFrame = Time.frameCount;
                 }
                 else lastCompositeFrame = Time.frameCount;
+            }
+
+            /// <summary>Forget every recorded global: per session, so nothing of the last game is replayed into the next.</summary>
+            public void ClearRecordedShaderState()
+            {
+                ShaderColors.Clear();
+                ShaderVectors.Clear();
+                ShaderVectorArrays.Clear();
+                ShaderVectorLists.Clear();
+                ShaderFloats.Clear();
+                ShaderTextures.Clear();
+                ShaderKeywords.Clear();
             }
 
             public void OnDestroy()

@@ -56,10 +56,33 @@ namespace SplitScreenCoop
             public Vector3 requested;
             /// <summary>Last frame any camera drew the source; a camera's placement is current while it matches. -1: nobody has yet.</summary>
             public int lastFrame = -1;
+            // What the mesh's transform holds now, so PlaceMaskSourcesFor writes only what
+            // changed: the camera it was last placed for (by the setters during that
+            // camera's draw, or by PlaceMaskSourcesFor), -1 when unknown, and the values.
+            public int appliedCamera = -1;
+            public Vector3 appliedPosition, appliedScale;
+            public Quaternion appliedRotation;
+            public int appliedLayer = -1;
+
+            /// <summary>The transform now holds camera <paramref name="number"/>'s recorded pose.</summary>
+            public void Applied(int number)
+            {
+                appliedCamera = number;
+                appliedPosition = position[number];
+                appliedRotation = rotation[number];
+                appliedScale = scale[number];
+            }
+        }
+
+        private struct PlacedMask
+        {
+            public Watcher.MaskSource source;
+            public MaskPlacement placement;
         }
 
         private static readonly ConditionalWeakTable<Watcher.MaskSource, MaskPlacement> maskPlacements = new();
-        private static readonly List<Watcher.MaskSource> placedMaskSources = new();
+        /// <summary>Every known source with its placement, so the per-camera pass needs no table lookup.</summary>
+        private static readonly List<PlacedMask> placedMaskSources = new();
         private static readonly HashSet<string> strayMaskNames = new HashSet<string>();
         // The three setters arrive back to back for one source; skip the table lookup for the second and third.
         private static Watcher.MaskSource cachedPlacementSource;
@@ -73,7 +96,7 @@ namespace SplitScreenCoop
             {
                 placement = new MaskPlacement();
                 maskPlacements.Add(source, placement);
-                placedMaskSources.Add(source);
+                placedMaskSources.Add(new PlacedMask { source = source, placement = placement });
             }
             cachedPlacementSource = source;
             cachedPlacement = placement;
@@ -109,7 +132,12 @@ namespace SplitScreenCoop
             int number = -1;
             if (self?.obj == null || !MaskCamera(out number))
             {
-                if (self?.obj != null) PlacementOf(self).requested = value;
+                if (self?.obj != null)
+                {
+                    MaskPlacement unscoped = PlacementOf(self);
+                    unscoped.requested = value;
+                    unscoped.appliedCamera = -1; // moved for nobody in particular
+                }
                 orig(self, value);
                 return;
             }
@@ -118,27 +146,47 @@ namespace SplitScreenCoop
             orig(self, value + (Vector3)camOffsets[number]);
             placement.positionFrame[number] = Time.frameCount;
             RecordMaskPlacement(self, placement, number);
+            // The pose was just read back from the transform: it now holds this camera's.
+            placement.Applied(number);
         }
 
         public void MaskSource_set_GameObjectRotation(orig_MaskSourceSetVector orig, Watcher.MaskSource self, Vector3 value)
         {
             orig(self, value);
-            int number;
-            if (self?.obj != null && MaskCamera(out number)) RecordMaskPlacement(self, PlacementOf(self), number);
+            SetterMovedMask(self);
         }
 
         public void MaskSource_set_GameObjectScale(orig_MaskSourceSetVector orig, Watcher.MaskSource self, Vector3 value)
         {
             orig(self, value);
+            SetterMovedMask(self);
+        }
+
+        /// <summary>After a rotation or scale setter: record it, and keep the applied pose only if it was already this camera's.</summary>
+        private static void SetterMovedMask(Watcher.MaskSource self)
+        {
+            if (self?.obj == null) return;
+            MaskPlacement placement = PlacementOf(self);
             int number;
-            if (self?.obj != null && MaskCamera(out number)) RecordMaskPlacement(self, PlacementOf(self), number);
+            if (!MaskCamera(out number))
+            {
+                placement.appliedCamera = -1;
+                return;
+            }
+            RecordMaskPlacement(self, placement, number);
+            if (placement.appliedCamera == number) placement.Applied(number);
+            else placement.appliedCamera = -1; // another camera's position, this one's rotation or scale
         }
 
         /// <summary>Known from birth, so PlaceMaskSourcesFor hides it from every camera until one has asked for it.</summary>
         private void MaskSource_CreateGameObject(On.Watcher.MaskSource.orig_CreateGameObject orig, Watcher.MaskSource self)
         {
             orig(self);
-            if (self?.obj != null) PlacementOf(self);
+            if (self?.obj == null) return;
+            // A new GameObject: nothing written to the old one applies.
+            MaskPlacement placement = PlacementOf(self);
+            placement.appliedCamera = -1;
+            placement.appliedLayer = -1;
         }
 
         /// <summary>
@@ -174,7 +222,7 @@ namespace SplitScreenCoop
             int mask = overlay.cullingMask;
             for (int i = placedMaskSources.Count - 1; i >= 0; i--)
             {
-                Watcher.MaskSource source = placedMaskSources[i];
+                Watcher.MaskSource source = placedMaskSources[i].source;
                 if (source == null || source.beingDeleted || source.obj == null || source.meshRenderer == null) continue;
                 if (!source.meshRenderer.enabled || !source.obj.activeSelf || (mask & (1 << source.obj.layer)) == 0) continue;
                 source.meshRenderer.enabled = false;
@@ -190,30 +238,46 @@ namespace SplitScreenCoop
         /// <paramref name="cameraNumber"/>. Meshes this camera drew this frame get its
         /// transform and its isolated world layer; meshes it did not draw are hidden
         /// for its pass (they belong to rooms it does not show), and so are sources
-        /// no camera has asked for yet.
+        /// no camera has asked for yet. Every camera, every frame, every source ever
+        /// seen (311 in one log): only what differs from the mesh's current state is
+        /// written. With the cameras taking turns, the rendering camera's own draw has
+        /// usually just placed its meshes through the setters.
         /// </summary>
         internal static void PlaceMaskSourcesFor(int cameraNumber)
         {
             if (cameraNumber < 0 || cameraNumber >= 4 || placedMaskSources.Count == 0) return;
             bool isolate = (dynamicActive || dualDisplays) && worldLayers[cameraNumber] > 0;
+            int layer = isolate ? worldLayers[cameraNumber] : 0;
             for (int i = placedMaskSources.Count - 1; i >= 0; i--)
             {
-                Watcher.MaskSource source = placedMaskSources[i];
-                MaskPlacement placement;
-                if (source == null || source.beingDeleted || source.obj == null ||
-                    !maskPlacements.TryGetValue(source, out placement))
+                PlacedMask entry = placedMaskSources[i];
+                Watcher.MaskSource source = entry.source;
+                MaskPlacement placement = entry.placement;
+                if (source == null || source.beingDeleted || source.obj == null || placement == null)
                 {
                     placedMaskSources.RemoveAt(i);
                     continue;
                 }
                 bool shown = placement.lastFrame >= 0 && placement.frame[cameraNumber] == placement.lastFrame;
-                if (source.meshRenderer != null) source.meshRenderer.enabled = shown;
+                MeshRenderer renderer = source.meshRenderer;
+                if (renderer != null && renderer.enabled != shown) renderer.enabled = shown;
                 if (!shown) continue;
-                Transform transform = source.obj.transform;
-                transform.localPosition = placement.position[cameraNumber];
-                transform.localRotation = placement.rotation[cameraNumber];
-                transform.localScale = placement.scale[cameraNumber];
-                source.obj.layer = isolate ? worldLayers[cameraNumber] : 0;
+                Vector3 position = placement.position[cameraNumber], scale = placement.scale[cameraNumber];
+                Quaternion rotation = placement.rotation[cameraNumber];
+                if (placement.appliedCamera != cameraNumber || placement.appliedPosition != position ||
+                    placement.appliedRotation != rotation || placement.appliedScale != scale)
+                {
+                    Transform transform = source.obj.transform;
+                    transform.localPosition = position;
+                    transform.localRotation = rotation;
+                    transform.localScale = scale;
+                    placement.Applied(cameraNumber);
+                }
+                if (placement.appliedLayer != layer)
+                {
+                    source.obj.layer = layer;
+                    placement.appliedLayer = layer;
+                }
             }
         }
 
@@ -297,6 +361,55 @@ namespace SplitScreenCoop
                 for (int i = 0; i < fcameras.Length; i++)
                     if (fcameras[i] != null && originalTags[i] != null)
                         fcameras[i].gameObject.tag = originalTags[i];
+            }
+        }
+
+        /// <summary>
+        /// The camera viewing a room stands in for cameras[0] while vanilla code that
+        /// only works for camera 0 runs (lights sample its palette, particles spawn
+        /// around its position). A struct used as Begin, try { orig } finally { End }:
+        /// these hooks run for every light and particle of every realized room, every
+        /// tick (up to 1000 zero-g specks in one room), and the lambda wrapper made
+        /// about four heap objects per call. It leaves curCamera alone, so a global the
+        /// object writes stays in room scope and reaches every camera showing the room
+        /// (AboveCloudsView's sky colours reached only the first).
+        /// </summary>
+        private struct PrimaryCameraSwap
+        {
+            private RoomCamera[] cameras;
+            private int index;
+            private RoomCamera primary;
+            /// <summary>The first camera showing the room, or null.</summary>
+            public RoomCamera viewing;
+
+            public static PrimaryCameraSwap Begin(Room room)
+            {
+                var swap = new PrimaryCameraSwap();
+                RoomCamera[] cameras = room?.game?.cameras;
+                if (cameras == null) return swap;
+                for (int i = 0; i < cameras.Length; i++)
+                {
+                    if (cameras[i] == null || cameras[i].room != room) continue;
+                    swap.viewing = cameras[i];
+                    if (i > 0)
+                    {
+                        swap.cameras = cameras;
+                        swap.index = i;
+                        swap.primary = cameras[0];
+                        cameras[0] = cameras[i];
+                        cameras[i] = swap.primary;
+                    }
+                    break;
+                }
+                return swap;
+            }
+
+            public void End()
+            {
+                if (cameras == null) return;
+                cameras[0] = primary;
+                cameras[index] = viewing;
+                cameras = null;
             }
         }
 
@@ -503,14 +616,30 @@ namespace SplitScreenCoop
                 Shader.SetGlobalTexture("_LevelTex", Custom.rainWorld.persistentData.cameraTextures[owner.cameraNumber, 0]));
         }
 
+        // The pass's 1x1 source and its material, one per camera and kept. Vanilla makes
+        // a new temporary texture and material on every screen change and never frees
+        // them (RemovePass and RemoveAllBuffers drop only the command buffer); per camera,
+        // and again on every Auto rendering switch, that was ~4 leaked textures per screen
+        // change in the log of 2026-09-19 (12 -> 124 "(unnamed)" render textures).
+        private static readonly RenderTexture[] dynamicElementSources = new RenderTexture[4];
+        private static readonly Material[] dynamicElementMaterials = new Material[4];
+
         private void DynamicLevelElement_AddLevelCombiner(On.Watcher.DynamicLevelElement.orig_AddLevelCombiner orig, RoomCamera camera)
         {
             if (camera?.levelTexCombiner == null || camera.levelTexCombiner.bufferIDs.Contains("DynamicLevelElement")) return;
-            WithUnityMainCamera(camera, () => camera.levelTexCombiner.AddPass(
-                RenderTexture.GetTemporary(1, 1),
-                new Material(Shader.Find("Futile/DynamicLevelElementCombiner")),
-                "DynamicLevelElement",
-                CameraEvent.AfterForwardOpaque));
+            int number = camera.cameraNumber;
+            if (number < 0 || number >= dynamicElementSources.Length) return;
+            if (dynamicElementSources[number] == null)
+                dynamicElementSources[number] = RenderTexture.GetTemporary(1, 1);
+            if (dynamicElementMaterials[number] == null)
+            {
+                Shader shader = Shader.Find("Futile/DynamicLevelElementCombiner");
+                if (shader == null) return;
+                dynamicElementMaterials[number] = new Material(shader) { name = "SplitScreen dynamic elements " + number };
+            }
+            RenderTexture source = dynamicElementSources[number];
+            Material material = dynamicElementMaterials[number];
+            WithUnityMainCamera(camera, () => camera.levelTexCombiner.AddPass(source, material, "DynamicLevelElement", CameraEvent.AfterForwardOpaque));
         }
 
         /// <summary>
@@ -559,13 +688,23 @@ namespace SplitScreenCoop
         private void RippleFlow_Update(On.Watcher.FloatingDebris.RippleFlow.orig_Update orig,
             Watcher.FloatingDebris.RippleFlow self, bool eu)
         {
-            WithViewingCameraAsPrimary(self.room, () =>
+            // Every flow object, every tick: no closures. The ripple data belongs to the
+            // viewing camera, so its globals are recorded in that camera's scope.
+            PrimaryCameraSwap swap = PrimaryCameraSwap.Begin(self.room);
+            int previous = curCamera;
+            try
             {
+                if (swap.viewing != null) curCamera = swap.viewing.cameraNumber;
                 RoomCamera camera = self.room?.game?.cameras?[0];
                 if (camera != null && camera.rippleData == null)
                     camera.UpdateRippleData(self.room, camera.currentCameraPosition);
                 orig(self, eu);
-            });
+            }
+            finally
+            {
+                curCamera = previous;
+                swap.End();
+            }
         }
 
         private void RippleSpiderSpawner_SpawnRippleTear(On.Watcher.RippleSpider.RippleSpiderSpawner.orig_SpawnRippleTear orig,
@@ -627,6 +766,81 @@ namespace SplitScreenCoop
                 dynamicElementGrabs[cameraNumber] = grab;
             }
             return grab;
+        }
+
+        // ---- Warp timer --------------------------------------------------------
+        // A warp's screen effect runs on one WarpPointTimer, and vanilla always puts it
+        // on cameras[0], whichever player warped (WarpPoint.ChangeState(EnterWarp),
+        // OverWorld). Progress() advances it through the first half, then HOLDS at the
+        // halfway point, the peak of the effect, until MovePastHalfPoint(); vanilla
+        // calls that from cameras[0].MoveCamera(Room) and WarpMoveCameraActual, i.e.
+        // "the camera has arrived in the destination". With one camera that always
+        // happens during the hold. With a camera per player camera 0 can arrive early
+        // (a move in the first half only adds one tick), or never change room at all:
+        // its player was already in the destination room, or is dead, or the warp was
+        // within one room. Then the timer holds for ever, and it is not a local effect:
+        //  - every WarpPoint in the world asks cameras[0].warpPointTimer != null for
+        //    warpSequenceInProgress, so all of them believe another warp is running;
+        //  - camera 0's microphone stays muffled at the peak (globalSoundMuffle 1,
+        //    warpTransition 4);
+        //  - _playerWarpPointTime stays at 0.5, and RoomCamera.GetCameraBestIndex does
+        //    not change screens within a room while WarpInProgress reads it >= 0.
+        // (2026-09-22: "gate warp special effects sometimes linger after going through
+        // gate, no matter where you are".) Once the players have been moved (the origin
+        // warp point has left EnterWarp, which is where it waits for the destination to
+        // load) and camera 0 has had two seconds to release it the vanilla way, release
+        // it here, exactly as vanilla does: hold frame, then MovePastHalfPoint.
+        private const int WarpHoldGraceTicks = 80;
+        private Watcher.WarpPoint.WarpPointTimer trackedWarpTimer;
+        private int warpHeldTicks;
+        private int warpTimerStartFrame;
+
+        private static string WarpDestination(Watcher.WarpPoint.WarpPointTimer timer)
+        {
+            Watcher.WarpPoint origin = timer?.origin_warpPoint;
+            return origin?.overrideData?.destRoom ?? origin?.Data?.destRoom;
+        }
+
+        private void WatchWarpTimer(RainWorldGame game)
+        {
+            RoomCamera owner = game?.cameras != null && game.cameras.Length > 1 ? game.cameras[0] : null;
+            Watcher.WarpPoint.WarpPointTimer timer = owner?.warpPointTimer;
+            if (!ReferenceEquals(timer, trackedWarpTimer))
+            {
+                if (trackedWarpTimer != null)
+                    Logger.LogInfo($"[Warp] frame={Time.frameCount} warp effect finished after {Time.frameCount - warpTimerStartFrame} frames; cam0 room={RoomName(owner?.room)}");
+                trackedWarpTimer = timer;
+                warpHeldTicks = 0;
+                warpTimerStartFrame = Time.frameCount;
+                if (timer != null)
+                    Logger.LogInfo($"[Warp] frame={Time.frameCount} warp effect started (vanilla runs it on cam0 whoever warps); " +
+                        $"origin={RoomName(timer.origin_warpPoint?.room)} dest={WarpDestination(timer) ?? "?"} cam0 room={RoomName(owner.room)} " +
+                        $"cam0 follows p{PlayerNumber(owner.followAbstractCreature)} cutscene p{PlayerNumber(owner.cutscenePlayer)}");
+            }
+            if (timer == null || timer.finished) return;
+            // Progress()'s own test for the hold: neither below nor above the halfway point.
+            float half = timer.duration / 2f;
+            bool holding = !(timer.progress < half) && !(timer.progress > half);
+            if (!holding) { warpHeldTicks = 0; return; }
+            Watcher.WarpPoint origin = timer.origin_warpPoint;
+            bool moved = origin == null || origin.slatedForDeletetion || origin.room == null ||
+                origin.currentState != Watcher.WarpPoint.State.EnterWarp;
+            if (!moved) { warpHeldTicks = 0; return; } // still loading the destination: vanilla's hold
+            if (++warpHeldTicks < WarpHoldGraceTicks) return;
+            Logger.LogWarning($"[Warp] frame={Time.frameCount} released a warp effect held at its peak for {warpHeldTicks} ticks after the players were moved. " +
+                $"Vanilla releases it only when cam0 changes room, and cam0 stayed in {RoomName(owner.room)} " +
+                $"(dest={WarpDestination(timer) ?? "?"}, follows p{PlayerNumber(owner.followAbstractCreature)}, origin state={origin?.currentState})");
+            warpHeldTicks = 0;
+            RenderTexture previous = RenderTexture.active;
+            try
+            {
+                // The hold frame blit reads camera globals; give it camera 0's.
+                if (cameraListeners.Length > 0) cameraListeners[0]?.OnPreRender();
+                owner.WarpPointHoldFrame();
+            }
+            catch (Exception error) { LogHookError("WatchWarpTimer.holdFrame", error); }
+            finally { RenderTexture.active = previous; }
+            timer.MovePastHalfPoint();
         }
 
         private static void DisposeWatcherMasks()

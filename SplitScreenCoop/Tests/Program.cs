@@ -2,7 +2,7 @@ using System;
 using SplitScreenCoop;
 using UnityEngine;
 
-internal static class Program
+internal static partial class Program
 {
     private static int checks;
     private static readonly SplitLayoutSolver.Settings Settings = new SplitLayoutSolver.Settings();
@@ -667,6 +667,58 @@ internal static class Program
             "Merging moved the cells; only the pan should change");
     }
 
+    /// <summary>
+    /// Solve keeps its working storage between calls (it runs every tick); nothing it
+    /// returns may share any of it. Callers keep earlier layouts (the renderer until the
+    /// next tick, the slide memory, these tests), so a layout must read the same after
+    /// later calls, whatever they solve: two to four players, merges, a death.
+    /// </summary>
+    private static void KeptLayoutsDoNotChange()
+    {
+        var solver = new SplitLayoutSolver();
+        var kept = new System.Collections.Generic.List<SplitLayoutSolver.Layout>();
+        var copies = new System.Collections.Generic.List<string>();
+        var rounds = new[]
+        {
+            new[] { P(0, -800f, 0f, 1), P(1, 800f, 0f, 2) },
+            new[] { P(0, -20f, 0f, 1), P(1, 20f, 0f, 1), P(2, 900f, 0f, 2) },
+            new[] { P(0, -800f, 400f, 1), P(1, 800f, 400f, 2), P(2, -800f, -400f, 3), P(3, 800f, -400f, 4) },
+            new[] { P(0, -800f, 400f, 1), P(2, -800f, -400f, 3), P(3, 800f, -400f, 4) }, // player 2 died
+            new[] { P(0, -10f, 0f, 1), P(1, 0f, 0f, 1), P(2, 10f, 0f, 1), P(3, 20f, 0f, 1) },
+        };
+        foreach (var round in rounds)
+            for (int tick = 0; tick < 40; tick++)
+            {
+                var layout = solver.Solve(round, 1f / 40f, Settings);
+                if (tick % 13 != 0) continue;
+                kept.Add(layout);
+                copies.Add(Describe(layout));
+            }
+        for (int i = 0; i < kept.Count; i++)
+            Check(Describe(kept[i]) == copies[i], "Layout " + i + " changed after later Solve calls");
+    }
+
+    private static string Describe(SplitLayoutSolver.Layout layout)
+    {
+        var text = new System.Text.StringBuilder();
+        foreach (var view in layout.viewports)
+        {
+            text.Append(view.cameraNumber).Append(view.ghost).Append(view.sharesImageWith).Append(':');
+            foreach (var point in view.polygon) text.Append(point.x.ToString("R")).Append(',').Append(point.y.ToString("R")).Append(' ');
+            foreach (var point in view.targetPolygon) text.Append(point.x.ToString("R")).Append(',').Append(point.y.ToString("R")).Append(' ');
+            text.Append(view.zoom.ToString("R")).Append(' ').Append(view.splitAmount.ToString("R")).Append(' ')
+                .Append(view.regionAnchor.x.ToString("R")).Append('|');
+        }
+        foreach (var divider in layout.dividers)
+            text.Append(divider.firstCamera).Append(divider.secondCamera).Append(divider.start.x.ToString("R")).Append(' ')
+                .Append(divider.end.y.ToString("R")).Append(' ').Append(divider.alpha.ToString("R")).Append('|');
+        int count = layout.pairSplitAmounts.GetLength(0);
+        for (int i = 0; i < count; i++)
+            for (int j = 0; j < count; j++) text.Append(layout.pairSplitAmounts[i, j].ToString("R")).Append(',');
+        foreach (var input in layout.effectiveInputs) text.Append(input.playerIndex).Append(input.sameScreenKey).Append(';');
+        return text.ToString();
+    }
+
     private static float Area(Vector2[] polygon)
     {
         float twice = 0f;
@@ -706,6 +758,24 @@ internal static class Program
             ConservativeSameScreenSplit();
             SharedCameraWindow();
             StaticStyle();
+            KeptLayoutsDoNotChange();
+            AdaptiveStartsFromWhereEveryoneIs();
+            AdaptiveMergeWaitsForTheGroup();
+            AdaptiveSplitGraceAndGroupCrossing();
+            AdaptiveRemergeCooldown();
+            AdaptiveGridSlots();
+            AdaptivePartialGroupsNeverMoveAnything();
+            AdaptiveGridZoomIsAPureScale();
+            AdaptiveHalvesInPlaceMergeIsStill();
+            AdaptiveNothingJumps();
+            AdaptiveReflow();
+            AdaptiveNobodyAliveKeepsTheLayout();
+            AdaptiveFullViewStaysWithTheGroup();
+            AdaptiveFraming();
+            FrameWindowPercentiles();
+            FrameWindowCap();
+            HitchRule();
+            AllocationRate();
             Console.WriteLine("PASS: " + checks + " layout checks");
             return 0;
         }

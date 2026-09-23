@@ -1,7 +1,8 @@
 # CLAUDE.md — SplitScreen Co-op (Rain World mod)
 
 BepInEx/MonoMod mod for Rain World that gives each player their own camera and composites
-them into one dynamic, LEGO-style split screen. Branch of record: `dynamic-split-screen`.
+them into one adaptive split screen (the Adaptive style; the older LEGO-style Dynamic
+remains selectable). Branch of record: `dynamic-split-screen`.
 Read `HANDOFF.md` before touching rendering or layout code; it explains why things are the
 way they are and lists approaches that were tried and rejected. `Todo.txt` is the playtest
 checklist. Keep both updated when you change behaviour.
@@ -23,7 +24,7 @@ Solver tests are Unity-free and run in seconds. Run them after any change to
 `SplitLayoutSolver.cs`:
 
 ```bash
-csc.exe /nologo /target:exe /out:Tests.exe SplitLayoutSolver.cs Tests\UnityMathStub.cs Tests\Program.cs && Tests.exe
+csc.exe /nologo /target:exe /out:Tests.exe SplitLayoutSolver.cs AdaptiveLayout.cs FrameStats.cs Tests\UnityMathStub.cs Tests\Program.cs Tests\AdaptiveTests.cs Tests\FrameStatsTests.cs && Tests.exe
 ```
 
 (`csc.exe` is under the same MSBuild folder, `...\Bin\Roslyn\csc.exe`.) Expect
@@ -33,7 +34,10 @@ csc.exe /nologo /target:exe /out:Tests.exe SplitLayoutSolver.cs Tests\UnityMathS
 
 | File | Owns |
 |---|---|
-| `SplitLayoutSolver.cs` | Pure layout maths: fixed-slot rectangles by camera number, joins, slides, pans. No Unity. Positions never move a cell; only merges/parts/deaths restructure. |
+| `SplitLayoutSolver.cs` | Pure layout maths of Dynamic and Static: fixed-slot rectangles by camera number, joins, slides, pans. No Unity. |
+| `AdaptiveLayout.cs` | Pure state machine of the Adaptive style: one view / halves / grid by living count, zooms, reflow, framing steps. No Unity; tests in `Tests/AdaptiveTests.cs`. |
+| `SplitScreenCoop.Adaptive.cs` | Adaptive style in the game: screen keys, picture sharing, framing, compositing, spare quarter (meters, group map) |
+| `FrameStats.cs` | Pure frame-time window and allocation meter behind `[Perf]`/`[FrameHitch]`; tests in `Tests/FrameStatsTests.cs`. |
 | `SplitScreenCoop.Dynamic.cs` | Per-tick layout inputs, base camera choice, uv-shift pans, GL compositor, divider alpha, HUD routing |
 | `SplitScreenCoop.cs` | Hook registration, split modes, game Update/GrafUpdate/ShutDown hooks, classic HUD offsets |
 | `SplitScreenCoop.CameraDiagnostics.cs` | All logging tags, hang watchdog, Unity log capture, draw-stall detection, menu camera restore |
@@ -92,6 +96,46 @@ csc.exe /nologo /target:exe /out:Tests.exe SplitLayoutSolver.cs Tests\UnityMathS
 - **Vanilla follows the Watcher with every camera in the ripple layer**
   (`coopRippleDimensionPlayer`). `RoomCamera_Update` clears it before `orig` when each
   player has a camera, or the cameras fight `EnsureStableCameraAssignments` every tick.
+- **Never capture per-camera shader state from a per-room field.** `room.snowObject.visibleSnow`
+  is written by whichever camera blitted last; reading it for every camera put snow on
+  views without snow. Keep the value per camera where it is produced.
+- **Vanilla's warp effect is camera 0's, whoever warps**, and only camera 0 changing room
+  ends its peak. `WatchWarpTimer` releases a hold camera 0 will never end. Any other
+  "cameras[0].EnterCutsceneMode(player)" drags camera 0 to that player; `RoomCamera_Update`
+  keeps each camera on its own player during every cutscene type that follows a player
+  (`CutsceneFollowsItsPlayer`: Standard, HideJollyHud(AndArrows), Oracle, VoidSea,
+  EndingOE). The iterators re-enter theirs every tick of a conversation.
+- **No lambdas, LINQ or new collections in per-object, per-frame or per-tick hooks.**
+  Mono's collector stops the game for every collection. The cameras[0] stand-in around
+  lights and particles made ~4 heap objects per object per tick (up to 1000 specks in a
+  room). Use a struct and plain loops (`PrimaryCameraSwap`), reuse scratch lists, and
+  check `[Perf] allocMBps` / `gcPerMin`.
+- **A dead player's camera does not move** (`DeadPlayerCameraStaysPut`, both MoveCamera
+  hooks), except between worlds. Vanilla and the pipe hooks otherwise drag it after the
+  corpse, or after the first living player once the corpse is abstracted: synchronous
+  room loads for a view nobody sees.
+- **Adaptive draws each per-player HUD onto its own view's picture** (Remix "HUD drawn
+  onto its view"): the HUD camera copies the picture into its texture and draws over
+  it, the compositor draws that texture opaque (`Hidden/BlitCopy`); at rest the HUD
+  cameras draw straight onto the screen after the compositor. Blending a transparent
+  HUD texture over the picture darkens every see-through sprite (the double blend).
+- **The shader-state replay is for games only**, and every listener forgets it at game
+  start and shutdown. A global a vanilla method writes once for the first camera into a
+  room (`Room.NowViewed`) must be written in room scope, or later cameras never get it.
+- **A paused game can come back** (`RainWorldGame.ResumeProcess`: the Watcher's
+  fast-travel screen runs as the main process meanwhile). Nothing of the game drew in
+  between, so anything that measures from a "last rendered" frame must restart there
+  (`RainWorldGame_ResumeProcess`), and the split has to be put back.
+- **Without Jolly, vanilla's gate checks ask every player, corpses included**; the co-op
+  hooks ask only the players in play (`PlayerDeadOrMissing`). The shared food meter is
+  one pool kept by changes (`UpdatePlayerFood`): never set everyone to the fullest
+  stomach, that refunds every food cost.
+- **`SplitLayoutSolver.Solve` reuses only what never leaves it.** Everything in the
+  returned `Layout` must be new on every call: the tests and the slide memory keep
+  earlier layouts.
+- **Every region change rebuilds each camera's map** (`HUD.ResetMap`), and the Map
+  constructor puts its icon container on Futile's root stage; `HudMap_ctor` moves it
+  (and the warp map's) to the camera's HUD stage.
 - **Remix draws elements in add order** and a combo box's list belongs to its box: make
   boxes with `Combo(...)` and add them last, lowest first.
 - **A shader that reads `_GrabTexture` without its own `GrabPass` sees the last grab of
@@ -99,7 +143,7 @@ csc.exe /nologo /target:exe /out:Tests.exe SplitLayoutSolver.cs Tests\UnityMathS
   every sprite layer's queue itself (`3000 + depth`), so a shader's `Queue` tag means
   nothing: draw order is container order. (An earlier note here blamed the lime/red
   artifact on `DisplaySnowShader`; it was never the snow sprite, see the rule above.)
-  Each camera binds its previous frame as `_GrabTexture` in
+  With several cameras, each binds its previous frame as `_GrabTexture` in
   `OnPreRender` (`BindOwnGrab`). HANDOFF §5 "Thirteenth log" has the audit of all 306
   shaders; `Tools/grabaudit.py` and `Tools/shaderdisasm2.py` re-run it (pip install UnityPy).
 - **Taking turns costs every view its share of the frames.** Under the game's 60 fps
@@ -109,16 +153,28 @@ csc.exe /nologo /target:exe /out:Tests.exe SplitLayoutSolver.cs Tests\UnityMathS
   frames in which the rotation ran (median, per view, 38 fps) and retries with a
   back-off; it must not flap on merged states or on a load in the window. Check
   `[Perf] fpsPerView= frameLimit= vsync=`.
+- **While the views take turns, per-frame work runs N times per picture.** HUD cameras
+  draw only on their picture's turn (`ApplyHudTurns`, Remix "HUD redraws with its
+  view"); keep anything new that renders or writes engine state per frame to the same
+  rule, or write it only when it changes.
 - **Whoever stops the rotation hands the cameras back.** It leaves all but one camera
   disabled; only the dynamic pipeline re-enables them by itself. A frozen second
   display, or a pause menu missing on one display, is this.
 - **A HUD part that places sprites inside `Draw` cannot be moved by shifting those
   sprites around `orig`** (`HypothermiaMeter`): shift the part's own `pos`/`lastPos`.
   Read the vanilla `Draw` before writing such a hook.
-- **Three split styles.** Dynamic (merge and part), Static (the same pipeline with
-  `NeverMerge`: a fixed region per *living* player, reflowing only on death or revival,
-  no shelter collapse) and Classic (the original non-isolated layouts). Read
-  `NeverMerge`, not `alwaysSplit`, anywhere merging is decided.
+- **Adaptive is the flip-screen style (2026-09-22) and the default.** It merges by screen,
+  never by distance; the layout depends only on how many players are alive; nothing
+  moves except a zoom between one view and the split, a slide on death or revival, and
+  a half's framing step caused by its own player. A view must never move because
+  another player moved. The Dynamic rules below (no snaps, pans converge) describe the
+  older style; HANDOFF "Adaptive split style" has the design and its reasons.
+- **Four split styles.** Adaptive (above), Dynamic (merge and part by distance), Static
+  (Dynamic's pipeline with `NeverMerge`: a fixed region per *living* player, reflowing only
+  on death or revival, no shelter collapse) and Classic (the original non-isolated
+  layouts). Adaptive, Dynamic and Static all run on the dynamic pipeline (`dynamicStyle`);
+  `adaptiveStyle` picks the layout. Read `NeverMerge`, not `alwaysSplit`, anywhere
+  merging is decided.
 - **Futile's stage list order is draw order** (render queue 3000 + depth, handed out stage
   by stage). Harmless while every stage has its own Unity camera; the moment one camera
   draws several stages (dual displays: world + HUD + root) they must be listed bottom to
