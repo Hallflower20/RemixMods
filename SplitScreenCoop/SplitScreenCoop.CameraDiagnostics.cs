@@ -274,11 +274,19 @@ namespace SplitScreenCoop
         private void DetectDrawStall(RainWorldGame game)
         {
             if (game?.cameras == null || game.cameras.Length == 0 || game.GamePaused) { drawStallSince = -1; return; }
-            int number = game.cameras[0].cameraNumber;
-            if (number < 0 || number >= lastRoomCameraDrawFrames.Length) return;
-            int drawAge = FrameAge(lastRoomCameraDrawFrames[number]);
-            int updateAge = FrameAge(lastRoomCameraUpdateFrames[number]);
-            if (drawAge < FramesFor(0.5f) || updateAge > 2 || lastRoomCameraDrawFrames[number] < 0)
+            // The camera longest without a completed draw while its Update still runs. Only
+            // camera 0 was watched: on dual displays camera 1's draw threw every frame for
+            // three minutes (a Watcher RippleTree, log of 2026-09-22) and nothing said so.
+            int number = -1, drawAge = -1;
+            for (int i = 0; i < game.cameras.Length; i++)
+            {
+                int n = game.cameras[i]?.cameraNumber ?? -1;
+                if (n < 0 || n >= lastRoomCameraDrawFrames.Length || lastRoomCameraDrawFrames[n] < 0 ||
+                    FrameAge(lastRoomCameraUpdateFrames[n]) > 2) continue;
+                int age = FrameAge(lastRoomCameraDrawFrames[n]);
+                if (age > drawAge) { drawAge = age; number = n; }
+            }
+            if (number < 0 || drawAge < FramesFor(0.5f))
             {
                 drawStallSince = -1;
                 // Pass-through is a diagnosis mode, not a state to stay in: once the
@@ -765,6 +773,22 @@ namespace SplitScreenCoop
         private float nextRenderingDecision, nextRotationAttempt, rotationBackoff = 30f, rotationSince;
         private string lastRenderingWhy;
 
+        // What vsync really held the game to in the last failed rotation attempt, and under
+        // which setup. The refresh rate Unity reports is not always the pace: on dual displays
+        // (log of 2026-09-22) the game ran at 60 fps under vsync and Auto still tried the
+        // rotation four times in four minutes, each try two seconds at half speed per view,
+        // while the same machine on one display read 60 Hz and never tried. Static: the
+        // display setup outlives a session.
+        private static float vsyncMeasuredFps;
+        private static int vsyncMeasuredCount = -1, vsyncMeasuredRefresh = -1;
+        private static bool vsyncMeasuredDual;
+
+        private static bool VsyncMeasurementApplies()
+        {
+            return vsyncMeasuredFps > 0f && vsyncMeasuredCount == QualitySettings.vSyncCount &&
+                vsyncMeasuredRefresh == Screen.currentResolution.refreshRate && vsyncMeasuredDual == dualDisplays;
+        }
+
         private void ResetFrameRenderingDecision()
         {
             rotationSampleCount = 0; rotationSampleIndex = 0; rotationSampleViews = 0;
@@ -833,8 +857,17 @@ namespace SplitScreenCoop
                     return;
                 }
                 wanted = false;
+                bool vsync = QualitySettings.vSyncCount > 0;
+                if (vsync)
+                {
+                    vsyncMeasuredFps = fps;
+                    vsyncMeasuredCount = QualitySettings.vSyncCount;
+                    vsyncMeasuredRefresh = Screen.currentResolution.refreshRate;
+                    vsyncMeasuredDual = dualDisplays;
+                }
                 why = $"Auto: {fps:0} fps while {rotationSampleViews} views took turns is {perView:0} each, under {RotationMinPerViewFps:0}" +
-                    $"{(QualitySettings.vSyncCount > 0 ? "; vsync sets the pace, turn it off to let the frame limit rise" : "")}; next try in {rotationBackoff:0} s";
+                    (vsync ? $"; vsync holds the game at {fps:0} fps, so Auto stops trying while vsync is on (turn it off to let the frame limit rise)"
+                        : $"; next try in {rotationBackoff:0} s");
                 nextRotationAttempt = now + rotationBackoff;
                 rotationBackoff = Mathf.Min(rotationBackoff * 2f, 300f);
             }
@@ -844,8 +877,10 @@ namespace SplitScreenCoop
                 int views = renderedCameraNumbers.Count;
                 if (QualitySettings.vSyncCount > 0)
                 {
-                    // Under vsync the outcome is known without trying.
+                    // Under vsync the outcome is known without trying. A failed attempt under the
+                    // same setup measured the real pace, which the reported refresh rate is not always.
                     float paced = Screen.currentResolution.refreshRate / (float)QualitySettings.vSyncCount;
+                    if (VsyncMeasurementApplies()) paced = paced > 0f ? Mathf.Min(paced, vsyncMeasuredFps) : vsyncMeasuredFps;
                     if (paced > 0f && paced / views < RotationMinPerViewFps)
                     {
                         string vsyncWhy = $"Auto: vsync paces the game at {paced:0} fps, {views} views taking turns would get {paced / views:0} each; every camera renders every frame. " +

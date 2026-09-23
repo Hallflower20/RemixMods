@@ -271,7 +271,7 @@ Needs in-game confirmation
 [ ] A frog attached to a creature next to an activating warp point no longer fills the
     log with NullReferenceException in Watcher.Frog.ReleaseGrasp, and the room keeps
     updating.
-[ ] Remix menu: the split style list opens over the two checkboxes, and on the Dynamic
+[ ] Remix menu: the split style list opens over the two checkboxes, and on the Layout
     tab the filter list opens over the camera rendering box and that one over the debug
     checkbox.
 [ ] Dual display pause: the FIRST pause of a session shows the menu on both displays
@@ -282,6 +282,19 @@ Needs in-game confirmation
     like single player. [Perf] shows fpsPerView equal to the game's frame limit and
     frameLimit at twice that while alternate=True. With vsync on at 60 Hz Auto should
     say so once and render every camera every frame.
+[ ] Watcher rooms with ripple trees (purple spiral stalks) and two players, on dual displays
+    and on one display: nothing on player 2's view follows the camera or stays behind when
+    the view moves, and both players see the same trees. Log: no IndexOutOfRangeException,
+    no "[HookError] ... DrawSprites threw", and "[Perf]" lines every 10 s while playing
+    (never "paused for the whole window" outside a pause).
+[ ] Dual displays: a steady 60 fps on both. The log has at most one "camera rendering: one
+    camera per frame" try per setup, then "vsync holds the game at 60 fps, so Auto stops
+    trying".
+[ ] Static style, 2-4 players: regions, pans, slides and deaths look as before. One change:
+    the line between two players standing together on one screen now stays solid (it
+    used to fade out when the two pictures lined up).
+[ ] Remix > General: the style list is Adaptive, Static, Classic, and hovering each style in
+    the open list shows its own description. A config that had Dynamic opens as Adaptive.
 [ ] Phase 4, Jolly off (the mod's own co-op): after a player dies the gate still opens
     for the others wherever the body is (another room, inside the gate); a grab shaken
     off within a second does not end the game (a grab held for 1.5 s still does); an
@@ -322,8 +335,8 @@ Needs in-game confirmation
     on: open the map with a box worm or fire sprite in another player's room.
 [ ] Sky rooms (Sky Islands, Outer Expanse) at dusk with two players in the same room on
     different screens: both views change colour together.
-[ ] Adaptive style (now the default for new configs; pick it in Remix if yours says
-    Static or Dynamic). Two players: one view on the same screen; on different screens
+[ ] Adaptive style (the default; pick it in Remix if yours says Static or Classic).
+    Two players: one view on the same screen; on different screens
     two halves, full height, that only shift sideways (in short steps) when your own
     slugcat nears the edge. Walking across a screen boundary together must not split.
     Merging takes about a second and is a smooth widening; splitting is a smooth

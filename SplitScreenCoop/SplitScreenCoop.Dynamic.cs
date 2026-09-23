@@ -61,7 +61,6 @@ namespace SplitScreenCoop
         private int globalMeterSource = -1;
         private int globalPromptSource = -1;
         private string lastDynamicLayoutKey;
-        private readonly string[] lastWorldFallbackReasons = new string[4];
         public static bool dynamicStyle = true;
         public static bool dynamicActive;
         public static bool dynamicDebugOverlay;
@@ -612,7 +611,6 @@ namespace SplitScreenCoop
                 if (cameraListeners[i] == null) continue;
                 cameraListeners[i].dynamicCompositing = false;
                 cameraListeners[i].Retarget();
-                lastWorldFallbackReasons[i] = null;
                 ownViewShiftValid[i] = false;
                 ownViewBaseNumbers[i] = -1;
                 lastDrawnListeners[i] = null;
@@ -709,18 +707,8 @@ namespace SplitScreenCoop
             if (count == 0 && game.cameras.Length > 0) aliveCameras.Add(game.cameras[0].cameraNumber);
             count = aliveCameras.Count;
             if (count == 0) return;
-            // Everyone is in the same shelter: there is one thing to look at and the
-            // sleep sequence draws its own full-screen UI. Collapse to a single view
-            // so only one HUD is composited instead of one per region.
-            // Not in the Static style: its regions depend on who is alive and on
-            // nothing else.
-            if (count > 1 && !staticStyle && AllPlayersInOneShelter(game, aliveCameras))
-            {
-                layoutShelterCamera.Clear();
-                layoutShelterCamera.Add(aliveCameras[0]);
-                aliveCameras = layoutShelterCamera;
-                count = 1;
-            }
+            // Only Static comes here now (Adaptive returned above; Dynamic, the style that
+            // collapsed to one view when everyone shared a shelter, was removed).
             // Every tick: the working arrays are kept, indexed by position in the list
             // of living cameras. The solver reads its inputs' Count, so those are kept
             // one array per count.
@@ -737,71 +725,30 @@ namespace SplitScreenCoop
                 RoomCamera camera = CameraByNumber(game, cameraNumber);
                 roomCameras[i] = camera;
                 AbstractCreature player = GetPlayerForCamera(game, cameraNumber);
-                string fallback = null;
-                Vector2 playerPos = Vector2.zero;
+                Vector2 playerPos;
                 bool hasPlayerPos = TryGetPlayerRoomPosition(camera, player, out playerPos);
-                bool playerInShortcut = player?.realizedCreature?.inShortcut ?? false;
                 roomPositions[i] = playerPos;
                 Room room = player?.realizedCreature?.room ?? camera?.room;
                 playerRooms[i] = room;
                 bool cameraRoomReady = room != null && camera?.room == room;
                 validRoomPositions[i] = hasPlayerPos && cameraRoomReady;
-                // A camera with no usable room has no image of its own to show. Key it
-                // on the room it is loading so cameras heading to the same place stay
-                // merged; giving each one a unique key forces a hard split, which is
-                // what made spawn-in open on a split screen for a couple of frames.
+                // The screen each camera shows, for picture sharing below: regions whose
+                // players are on one screen draw one camera's picture (one render, and
+                // grab effects right without taking turns). A camera with no usable room
+                // is keyed on the room it is loading, so cameras heading to the same
+                // place share one picture as soon as it exists.
                 AbstractRoom pending = camera?.loadingRoom?.abstractRoom ?? camera?.room?.abstractRoom;
-                long screenKey = !cameraRoomReady
+                keys[i] = !cameraRoomReady
                     ? pending != null ? long.MinValue + 1L + pending.index : long.MinValue
                     : ScreenKey(room, camera.currentCameraPosition);
-                // Players in one pipe share the pending room's key, so a group taking
-                // a shortcut together stays one group through the transit and lands
-                // on the same screen key when they arrive. (Holding each player's
-                // previous key instead was tried: nobody renders that old screen once
-                // the cameras move on, so the cells fell back to their own stale,
-                // disabled cameras and flickered between sources.)
-                keys[i] = screenKey;
-                Vector2 worldPos = playerPos;
-                bool validWorld = false;
-                if (playerInShortcut) fallback = "shortcut movement; holding world direction while following vessel";
-                else if (!hasPlayerPos) fallback = "warp or unrealized player position";
-                else if (room?.world == game.world && room.abstractRoom != null &&
-                    room.abstractRoom.mapPos.sqrMagnitude > 0.01f)
-                {
-                    worldPos = room.world.RoomToWorldPos(playerPos, room.abstractRoom.index);
-                    validWorld = FiniteVector(worldPos);
-                    if (!validWorld) fallback = "non-finite world map position";
-                }
-                else if (room != null)
-                {
-                    // Within one room the raw coordinates have a meaningful direction.
-                    bool otherRoomPresent = false;
-                    for (int j = 0; j < count; j++)
-                    {
-                        RoomCamera other = CameraByNumber(game, aliveCameras[j]);
-                        if (other?.room != null && other.room != room) { otherRoomPresent = true; break; }
-                    }
-                    validWorld = !otherRoomPresent;
-                    if (!validWorld) fallback = "different regions or missing room map position";
-                }
-                else fallback = "room unavailable";
-                if (cameraNumber >= 0 && cameraNumber < lastWorldFallbackReasons.Length)
-                {
-                    if (fallback != null && lastWorldFallbackReasons[cameraNumber] != fallback)
-                        Logger.LogInfo($"[CameraMode] frame={Time.frameCount} world-direction fallback cam={cameraNumber}; reason={fallback}; holding last valid direction");
-                    lastWorldFallbackReasons[cameraNumber] = fallback;
-                }
-                long roomKey = room?.abstractRoom == null ? long.MinValue + cameraNumber :
-                    ((long)(uint)(room.world?.name?.GetHashCode() ?? 0) << 32) | (uint)room.abstractRoom.index;
-                inputs[i] = new SplitLayoutSolver.PlayerInput { playerIndex = cameraNumber, worldPos = worldPos,
-                    sameScreenKey = screenKey, roomKey = roomKey, validWorldPos = validWorld, mergedScreenPos = new Vector2(0.5f, 0.5f) };
+                inputs[i] = new SplitLayoutSolver.PlayerInput { playerIndex = cameraNumber, screenPos = new Vector2(0.5f, 0.5f) };
                 positions[i] = CameraScreenPosition(camera, playerPos);
             }
 
-            // A room can change one player's discrete camera position while
-            // both players are still visible on another camera's current
-            // prebaked screen. Keep that one image until sharing is no longer
-            // possible, instead of forcing a premature same-room hard split.
+            // A room can change one player's discrete camera position while both
+            // players are still visible on another camera's current prebaked screen.
+            // Keep drawing that one camera's picture for both regions until sharing is
+            // no longer possible.
             int sharedCandidate = -1, sharedCount = 1;
             bool[] sharedVisible = layoutSharedVisible;
             bool[] visible = layoutVisible;
@@ -818,15 +765,15 @@ namespace SplitScreenCoop
                         continue;
                     Vector2 screen = CameraScreenPosition(source, roomPositions[playerIndex]);
                     visible[playerIndex] = SplitLayoutSolver.SharedCameraCanShow(screen);
-                    // One-way hysteresis. A cell may only *start* drawing another
-                    // camera's image once its own camera sits on that same screen,
-                    // which is the moment vanilla cuts and the two images are the
-                    // same picture. Adopting it earlier, while the player is merely
-                    // visible near the edge of the other screen, replaced the cell's
-                    // content with a different screen and then panned it into place,
-                    // which read as a swap followed by a swipe. Once sharing, keep
-                    // sharing while the player stays visible, so a camera switching
-                    // screens at the edge does not break a merged view apart.
+                    // One-way hysteresis. A region may only *start* drawing another
+                    // camera's picture once its own camera sits on that same screen,
+                    // which is the moment vanilla cuts and the two pictures are the
+                    // same. Adopting it earlier, while the player is merely visible
+                    // near the edge of the other screen, replaced the region's content
+                    // with a different screen and then panned it into place, which read
+                    // as a swap followed by a swipe. Once sharing, keep sharing while
+                    // the player stays visible, so a camera switching screens at the
+                    // edge does not flip its region between pictures.
                     if (visible[playerIndex] && playerIndex != candidate)
                     {
                         RoomCamera own = roomCameras[playerIndex];
@@ -861,12 +808,10 @@ namespace SplitScreenCoop
                     }
                     else if (keys[i] == sharedKey)
                         keys[i] = long.MinValue + aliveCameras[i];
-                    inputs[i].sameScreenKey = keys[i];
                 }
             }
 
-            // Every player sharing a prebaked camera screen is measured against the
-            // same source camera, so its UV transform is exactly identity at t=0.
+            // Every player is measured against the camera whose picture its region draws.
             int[] bases = layoutBases;
             for (int i = 0; i < count; i++)
             {
@@ -874,7 +819,7 @@ namespace SplitScreenCoop
                 if (preferredBase[i] >= 0)
                 {
                     bases[i] = preferredBase[i];
-                    inputs[i].mergedScreenPos = validRoomPositions[i]
+                    inputs[i].screenPos = validRoomPositions[i]
                         ? CameraScreenPosition(roomCameras[baseIndex], roomPositions[i]) : positions[i];
                     continue;
                 }
@@ -890,11 +835,10 @@ namespace SplitScreenCoop
                 bases[i] = aliveCameras[baseIndex];
                 Vector2 sharedPosition = validRoomPositions[i]
                     ? CameraScreenPosition(roomCameras[baseIndex], roomPositions[i]) : positions[i];
-                inputs[i].mergedScreenPos = sharedPosition;
+                inputs[i].screenPos = sharedPosition;
             }
             dynamicSettings.screenAspect = Futile.screen == null ? 1.75f :
                 (float)Futile.screen.pixelWidth / Mathf.Max(1f, Futile.screen.pixelHeight);
-            dynamicSettings.permanentSplit = NeverMerge;
             NoteFrameEvent("solve layout");
             HangMarker = "UpdateDynamicLayout.Solve";
             // This runs once per game tick, not once per rendered frame. At 240 fps
@@ -932,7 +876,7 @@ namespace SplitScreenCoop
                     RoomCamera camera = CameraByNumber(game, number);
                     Vector2 roomPosition;
                     bool valid = TryGetPlayerRoomPosition(camera, GetPlayerForCamera(game, number), out roomPosition);
-                    allPositions[i] = valid ? CameraScreenPosition(camera, roomPosition) : allInputs[i].mergedScreenPos;
+                    allPositions[i] = valid ? CameraScreenPosition(camera, roomPosition) : allInputs[i].screenPos;
                     allBases[i] = number;
                 }
             }
@@ -968,7 +912,6 @@ namespace SplitScreenCoop
         private readonly bool[] layoutVisible = new bool[4];
         private readonly int[] layoutPreferredBase = new int[4];
         private readonly int[] layoutBases = new int[4];
-        private readonly List<int> layoutShelterCamera = new List<int>(1);
 
         private void SelectGlobalHudSources(RainWorldGame game, List<int> aliveCameras)
         {
@@ -1165,16 +1108,13 @@ namespace SplitScreenCoop
         }
 
         /// <summary>
-        /// Runs every rendered frame. Every cell draws the image of its base camera
-        /// (the camera whose prebaked screen the players in that cell share), panned
-        /// so the followed slugcat sits at the cell centre. The pan target lerps
-        /// from "identity" at split 0 to "centred" at split 1, so two cells that show
-        /// one screen line up exactly when their players are close and part again as
-        /// they separate, with no blending anywhere. Members of one image group get
-        /// one common pan. Positions are interpolated with the sprites' timeStacker,
-        /// the result is damped, and it snaps only when the image underneath changed:
-        /// a new room or camera position on the base camera, or a cell that moved
-        /// elsewhere on screen.
+        /// Runs every rendered frame (Static). Every region draws the picture of its
+        /// base camera (the camera whose prebaked screen its player is on), panned so
+        /// the followed slugcat sits at the region's centre as far as the picture
+        /// allows; a lone view shows its picture unpanned (the solver's split 0).
+        /// Positions are interpolated with the sprites' timeStacker, the result is
+        /// damped, and it snaps only when the picture underneath changed: a new room or
+        /// camera position on the base camera, or a region that moved elsewhere.
         /// </summary>
         private void RefreshDynamicViewShifts(RainWorldGame game, float timeStacker)
         {
@@ -1189,8 +1129,8 @@ namespace SplitScreenCoop
                 Vector2 source;
                 if (viewport.ghost || baseCamera?.room == null ||
                     !TryGetInterpolatedScreenPosition(baseCamera, GetPlayerForCamera(game, viewport.cameraNumber), timeStacker, out source))
-                    source = i < dynamicInputs.Length && FiniteVector(dynamicInputs[i].mergedScreenPos)
-                        ? dynamicInputs[i].mergedScreenPos : new Vector2(0.5f, 0.5f);
+                    source = i < dynamicInputs.Length && FiniteVector(dynamicInputs[i].screenPos)
+                        ? dynamicInputs[i].screenPos : new Vector2(0.5f, 0.5f);
                 liveSourceScratch[i] = source;
             }
             for (int i = 0; i < count; i++)
@@ -1200,28 +1140,11 @@ namespace SplitScreenCoop
                 if (viewport.ghost || number < 0 || number >= ownViewShifts.Length) continue;
                 RoomCamera baseCamera = i < baseCameraNumbers.Length ? CameraByNumber(game, baseCameraNumbers[i]) : null;
                 if (baseCamera?.room == null) { ownViewShiftValid[number] = false; continue; }
-                // Same two-stage pan as the solver, from live positions: the joined
-                // group pans as one image (identical transform for every member, so
-                // cells on one screen line up at split 0), then each cell blends
-                // towards its own centre by its split against its group-mates.
-                int leader = viewport.sharesImageWith >= 0 ? viewport.sharesImageWith : number;
-                Vector2 groupSource = Vector2.zero;
-                int members = 0;
-                for (int j = 0; j < count; j++)
-                {
-                    var other = viewports[j];
-                    int otherLeader = other.sharesImageWith >= 0 ? other.sharesImageWith : other.cameraNumber;
-                    if (other.ghost || otherLeader != leader) continue;
-                    groupSource += liveSourceScratch[j];
-                    members++;
-                }
-                groupSource = members > 0 ? groupSource / members : liveSourceScratch[i];
+                // The solver's pan rule, from live positions.
                 Vector2 source = liveSourceScratch[i];
-                Vector2 groupCenter = (viewport.groupMin + viewport.groupMax) * 0.5f;
-                Vector2 transformAnchor = Vector2.Lerp(groupSource, groupCenter, viewport.groupSplit);
-                Vector2 groupAnchor = transformAnchor + (source - groupSource) * viewport.zoom;
+                Vector2 center = (viewport.windowMin + viewport.windowMax) * 0.5f;
                 Vector2 anchor = SplitLayoutSolver.ClampVector(
-                    Vector2.Lerp(groupAnchor, viewport.centroid, viewport.innerSplit), viewport.anchorMin, viewport.anchorMax);
+                    Vector2.Lerp(source, center, viewport.splitAmount), viewport.anchorMin, viewport.anchorMax);
                 Vector2 target = SplitLayoutSolver.ClampedUvShift(source, anchor, viewport.windowMin, viewport.windowMax, viewport.zoom);
                 long sourceKey = ((long)baseCamera.room.abstractRoom.index << 8) | (uint)(baseCamera.currentCameraPosition & 0xFF);
                 Vector2 basePosition = InterpolatedCameraPos(baseCamera, timeStacker);
@@ -1334,103 +1257,10 @@ namespace SplitScreenCoop
             return new Vector2(Mathf.Floor(cameraPos.x), Mathf.Floor(cameraPos.y));
         }
 
-        private int ViewportIndex(int cameraNumber)
-        {
-            if (dynamicLayout?.viewports == null) return -1;
-            for (int i = 0; i < dynamicLayout.viewports.Length; i++)
-                if (dynamicLayout.viewports[i].cameraNumber == cameraNumber) return i;
-            return -1;
-        }
-
-        /// <summary>
-        /// How visible a divider is: how far apart, in world pixels, the two views
-        /// meeting at it currently are. Each cell shows its base camera's picture
-        /// offset by its pan, so the views coincide exactly when both cells map display
-        /// space to the same world origin; then one camera frames both players and
-        /// there is nothing to indicate. The ramp is wide (4 to 300 px) so that the
-        /// line fades over the whole glide as two views converge, not just its last
-        /// few pixels, and the result is damped so a camera cut (which moves a view by
-        /// a screen in one frame) fades the line in rather than popping it.
-        /// Player distance on its own was tried as the signal and hid the line while
-        /// the views were still visibly apart.
-        /// </summary>
-        private float DividerAlpha(SplitLayoutSolver.DividerSegment edge)
-        {
-            int a = edge.firstCamera, b = edge.secondCamera;
-            float target = DividerTargetAlpha(edge);
-            if (a < 0 || b < 0 || a >= dividerAlphaState.GetLength(0) || b >= dividerAlphaState.GetLength(1)) return target;
-            float dt = Mathf.Clamp(Time.deltaTime, 0.001f, 0.1f);
-            if (dividerAlphaFrame[a, b] < Time.frameCount - 3)
-            {
-                dividerAlphaState[a, b] = target;
-                dividerAlphaVelocity[a, b] = 0f;
-            }
-            else
-                dividerAlphaState[a, b] = Mathf.SmoothDamp(dividerAlphaState[a, b], target, ref dividerAlphaVelocity[a, b],
-                    DividerFadeSeconds, Mathf.Infinity, dt);
-            dividerAlphaFrame[a, b] = Time.frameCount;
-            return dividerAlphaState[a, b];
-        }
-
-        private float DividerTargetAlpha(SplitLayoutSolver.DividerSegment edge)
-        {
-            if (!(rainworldGameObject?.processManager?.currentMainLoop is RainWorldGame game)) return edge.alpha;
-            int ia = ViewportIndex(edge.firstCamera), ib = ViewportIndex(edge.secondCamera);
-            if (ia < 0 || ib < 0 || ia >= baseCameraNumbers.Length || ib >= baseCameraNumbers.Length) return edge.alpha;
-            var va = dynamicLayout.viewports[ia];
-            var vb = dynamicLayout.viewports[ib];
-            if (va.ghost || vb.ghost) return edge.alpha;
-            RoomCamera ca = CameraByNumber(game, baseCameraNumbers[ia]);
-            RoomCamera cb = CameraByNumber(game, baseCameraNumbers[ib]);
-            if (ca?.room == null || cb?.room == null || ca.room != cb.room) return 1f;
-            if (Mathf.Abs(va.zoom - vb.zoom) > 0.01f) return 1f;
-            int a = edge.firstCamera, b = edge.secondCamera;
-            if (a < 0 || b < 0 || a >= ownViewShifts.Length || b >= ownViewShifts.Length ||
-                !ownViewShiftValid[a] || !ownViewShiftValid[b]) return edge.alpha;
-            Vector2 originA = InterpolatedCameraPos(ca, lastTimeStacker) + Vector2.Scale(ownViewShifts[a], ca.sSize);
-            Vector2 originB = InterpolatedCameraPos(cb, lastTimeStacker) + Vector2.Scale(ownViewShifts[b], cb.sSize);
-            float misalignment = (originA - originB).magnitude;
-            float t = Mathf.Clamp01((misalignment - DividerInvisibleBelowPixels) /
-                (DividerOpaqueAbovePixels - DividerInvisibleBelowPixels));
-            return t * t * (3f - 2f * t);
-        }
-
-        // The line must cover the seam for as long as the two images are offset
-        // there. A wide 4→300 px ramp left it nearly transparent at 30–80 px of
-        // offset, which is exactly the follow slack between two cameras on one
-        // screen and the pan difference of a merging pair: the seam then read as the
-        // picture shearing. Opaque above 32 px; the damping below still makes the
-        // last stretch of the merge a visible fade rather than a cut.
-        private const float DividerInvisibleBelowPixels = 3f;
-        private const float DividerOpaqueAbovePixels = 32f;
-        private const float DividerFadeSeconds = 0.25f;
-        private readonly float[,] dividerAlphaState = new float[4, 4];
-        private readonly float[,] dividerAlphaVelocity = new float[4, 4];
-        private readonly int[,] dividerAlphaFrame = new int[4, 4];
-
         private static void PolygonBounds(Vector2[] polygon, out Vector2 min, out Vector2 max)
         {
             min = new Vector2(1f, 1f); max = Vector2.zero;
             ExpandBounds(polygon, ref min, ref max);
-        }
-
-        /// <summary>
-        /// True when every camera in the layout follows a player who is inside the
-        /// same shelter. The first camera must actually be showing it, so the
-        /// collapsed view is never a camera that is still loading somewhere else.
-        /// </summary>
-        private bool AllPlayersInOneShelter(RainWorldGame game, List<int> aliveCameras)
-        {
-            AbstractRoom shelter = null;
-            for (int i = 0; i < aliveCameras.Count; i++)
-            {
-                AbstractCreature player = GetPlayerForCamera(game, aliveCameras[i]);
-                AbstractRoom room = player?.realizedCreature?.room?.abstractRoom ?? player?.Room;
-                if (room == null || !room.shelter) return false;
-                if (shelter == null) shelter = room;
-                else if (shelter != room) return false;
-            }
-            return shelter != null && CameraByNumber(game, aliveCameras[0])?.room?.abstractRoom == shelter;
         }
 
         private static void ExpandBounds(Vector2[] polygon, ref Vector2 min, ref Vector2 max)
@@ -1469,11 +1299,8 @@ namespace SplitScreenCoop
             RoomCamera camera = self.jollyHud.Camera;
             var viewport = DynamicViewportForCamera(camera.cameraNumber);
             if (viewport?.polygon == null) return;
-            bool merged = !NeverMerge;
-            foreach (var region in dynamicLayout.viewports)
-                if (!region.ghost && region.splitAmount > 0.05f) { merged = false; break; }
-            if (merged || (TryProjectJollyPlayer(self, out Vector2 projected) &&
-                PointInsideDynamicRegion(camera.cameraNumber, projected)))
+            if (TryProjectJollyPlayer(self, out Vector2 projected) &&
+                PointInsideDynamicRegion(camera.cameraNumber, projected))
             {
                 self.hidden = true;
                 self.alpha = 0f;
@@ -1523,12 +1350,7 @@ namespace SplitScreenCoop
         private bool PointInsideDynamicRegion(int cameraNumber, Vector2 point)
         {
             var view = DynamicViewportForCamera(cameraNumber);
-            if (view?.polygon == null) return false;
-            int leader = view.sharesImageWith >= 0 ? view.sharesImageWith : cameraNumber;
-            foreach (var member in dynamicLayout.viewports)
-                if (member.cameraNumber == leader || member.sharesImageWith == leader)
-                    if (PointInsidePolygon(member.polygon, point)) return true;
-            return false;
+            return view?.polygon != null && PointInsidePolygon(view.polygon, point);
         }
 
         private static bool PointInsidePolygon(Vector2[] polygon, Vector2 point)
@@ -1645,17 +1467,10 @@ namespace SplitScreenCoop
             if (adaptiveStyle) mergedFullScreen = FillAdaptiveRenderedCameras();
             else
             {
-            mergedFullScreen = !NeverMerge;
-            for (int i = 0; i < dynamicLayout.viewports.Length; i++)
-                if (dynamicLayout.viewports[i].splitAmount > 0f) mergedFullScreen = false;
-            int directCamera = baseCameraNumbers.Length > 0 ? baseCameraNumbers[0] :
-                dynamicLayout.viewports[0].cameraNumber;
-            renderedCameraNumbers.Clear();
-            if (mergedFullScreen) renderedCameraNumbers.Add(directCamera);
-            else
-            {
-                // Only base cameras render: a cell always draws the image of the
-                // camera whose prebaked screen its players share.
+                // Static: only base cameras render. A region always draws the picture of
+                // the camera whose prebaked screen its player is on.
+                mergedFullScreen = false;
+                renderedCameraNumbers.Clear();
                 for (int i = 0; i < dynamicLayout.viewports.Length; i++)
                 {
                     if (dynamicLayout.viewports[i].ghost) continue;
@@ -1664,9 +1479,8 @@ namespace SplitScreenCoop
                 }
                 renderedCameraNumbers.Sort();
             }
-            }
             // HUD stages are separate from world stages, so even a full-screen
-            // merged image passes through the final compositor in Dynamic style.
+            // image passes through the final compositor.
             dynamicActive = true;
             FilterMode zoomFilter = Options?.ZoomedFilter.Value == "Point"
                 ? FilterMode.Point : FilterMode.Bilinear;
@@ -1765,35 +1579,27 @@ namespace SplitScreenCoop
             {
                 GL.LoadOrtho();
                 GL.Clear(true, true, Color.black);
+                // While a dying player's region closes, the first living picture fills the
+                // screen underneath, so the shrinking region never shows black.
                 int liveSource = -1;
-                bool hasGhost = false, fullyMerged = !NeverMerge;
+                bool hasGhost = false;
                 for (int i = 0; i < dynamicLayout.viewports.Length; i++)
                 {
-                    var view = dynamicLayout.viewports[i];
-                    if (view.ghost) { hasGhost = true; fullyMerged = false; continue; }
+                    if (dynamicLayout.viewports[i].ghost) { hasGhost = true; continue; }
                     if (liveSource < 0) liveSource = baseCameraNumbers[i];
-                    if (baseCameraNumbers[i] != liveSource || view.splitAmount > 0.001f ||
-                        view.imageBlend > 0.001f || view.zoom < 0.999f) fullyMerged = false;
                 }
-                if (liveSource >= 0 && (hasGhost || fullyMerged))
+                if (liveSource >= 0 && hasGhost)
                     DrawDynamicPolygon(compositor.texturedMaterial,
                         cameraListeners[liveSource]?.renderTexture, FullScreenPolygon,
                         Vector2.zero, 1f);
-                // At a complete merge, render one native image. Otherwise every cell
-                // draws its base camera's image, opaque, with its own pan. Nothing is
-                // ever alpha-blended between two images: when two cells share a screen
-                // and their split amount is 0 their pans are identical, so the seam
-                // simply is not there.
-                if (!fullyMerged)
-                {
-                    // While cells slide to new rectangles they may overlap or leave
-                    // gaps, so the resting layout is drawn underneath first.
-                    if (dynamicLayout.sliding)
-                        for (int i = 0; i < dynamicLayout.viewports.Length; i++)
-                            DrawWorldCell(compositor.texturedMaterial, i, dynamicLayout.viewports[i].targetPolygon);
+                // Every region draws its base camera's picture, opaque, with its own pan.
+                // While regions slide to new rectangles they may overlap or leave gaps,
+                // so the resting layout is drawn underneath first.
+                if (dynamicLayout.sliding)
                     for (int i = 0; i < dynamicLayout.viewports.Length; i++)
-                        DrawWorldCell(compositor.texturedMaterial, i, dynamicLayout.viewports[i].polygon);
-                }
+                        DrawWorldCell(compositor.texturedMaterial, i, dynamicLayout.viewports[i].targetPolygon);
+                for (int i = 0; i < dynamicLayout.viewports.Length; i++)
+                    DrawWorldCell(compositor.texturedMaterial, i, dynamicLayout.viewports[i].polygon);
                 // Dividers separate world images, so they belong above the world
                 // and below every overlay. Drawing them last painted opaque black
                 // over whatever HUD or pause-menu pixels happened to sit under a bar.
@@ -1935,14 +1741,12 @@ namespace SplitScreenCoop
                 var edge = dynamicLayout.dividers[i];
                 Vector2 along = edge.end - edge.start;
                 if (along.sqrMagnitude < 0.00001f) continue;
-                float alpha = DividerAlpha(edge);
-                if (alpha <= 0.002f) continue;
                 Vector2 normal = new Vector2(-along.y, along.x).normalized;
                 // Pad in pixels along the normal so a tilted line is as thick as a straight one.
                 float pixelWidth = Mathf.Max(1f, Futile.screen.pixelWidth), pixelHeight = Mathf.Max(1f, Futile.screen.pixelHeight);
                 Vector2 pad = new Vector2(normal.x * edge.width / pixelWidth, normal.y * edge.width / pixelHeight);
                 GL.Begin(GL.QUADS);
-                GL.Color(new Color(0f, 0f, 0f, alpha));
+                GL.Color(Color.black);
                 GL.Vertex3(edge.start.x - pad.x, edge.start.y - pad.y, 0f);
                 GL.Vertex3(edge.start.x + pad.x, edge.start.y + pad.y, 0f);
                 GL.Vertex3(edge.end.x + pad.x, edge.end.y + pad.y, 0f);
@@ -1989,14 +1793,6 @@ namespace SplitScreenCoop
                 string source = view.sharesImageWith < 0 ? "self" : view.sharesImageWith.ToString();
                 GUI.Label(new Rect(p.x * Screen.width - 105f, (1f - p.y) * screenHeight - 12f, 220f, 24f),
                     $"P{view.cameraNumber + 1} {view.areaFraction:P0} zoom {view.zoom:F2} src {source}");
-            }
-            float y = 12f;
-            for (int i = 0; i < dynamicLayout.viewports.Length; i++)
-            for (int j = i + 1; j < dynamicLayout.viewports.Length; j++)
-            {
-                GUI.Label(new Rect(12f, y, 190f, 22f),
-                    $"t{dynamicLayout.viewports[i].cameraNumber},{dynamicLayout.viewports[j].cameraNumber}={dynamicLayout.pairSplitAmounts[i,j]:F2}");
-                y += 20f;
             }
         }
     }

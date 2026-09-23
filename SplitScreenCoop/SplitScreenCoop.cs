@@ -303,6 +303,15 @@ namespace SplitScreenCoop
                 On.Watcher.FloatingDebris.RippleFlow.Update += RippleFlow_Update;
                 On.Watcher.RippleSpider.RippleSpiderSpawner.SpawnRippleTear += RippleSpiderSpawner_SpawnRippleTear;
                 On.RoomCamera.ClearMaskMaker += RoomCamera_ClearMaskMaker;
+                // Drawables that rebuild their sprites for the first camera only (Drawables file).
+                On.RippleTree.DrawSprites += RippleTree_DrawSprites;
+                On.Watcher.FloatingDebris.Aurora.DrawSprites += Aurora_DrawSprites;
+                On.Watcher.WarpPoint.DrawSprites += WarpPoint_DrawSprites;
+                On.Spear.DrawSprites += Spear_DrawSprites;
+                On.DangleFruit.DrawSprites += DangleFruit_DrawSprites;
+                On.Pomegranate.DrawSprites += Pomegranate_DrawSprites;
+                On.TerrainCurve.DrawSprites += TerrainCurve_DrawSprites;
+                On.BackgroundScene.SaintsJourneyIllustration.DrawSprites += SaintsJourneyIllustration_DrawSprites;
 
                 // unity hooks
                 // set shader variables into a dict so it can be set per-camera
@@ -393,17 +402,14 @@ namespace SplitScreenCoop
         {
             dualDisplays = Options.DualDisplays.Value;
             alwaysSplit = Options.AlwaysSplit.Value;
-            staticStyle = Options.SplitStyle.Value == "Static";
-            adaptiveStyle = Options.SplitStyle.Value == "Adaptive";
+            // Three styles. The Dynamic style (merging by distance) was removed on 2026-09-22 at
+            // the user's request, and its merging with it: the solver now only lays out Static's
+            // fixed regions. Anything else a config still holds reads as Adaptive, which replaced it.
+            string style = Options.SplitStyle.Value;
+            staticStyle = style == "Static";
+            adaptiveStyle = style != "Static" && style != "Classic";
             spareQuarterMode = Options.SpareQuarter.Value;
-            dynamicStyle = Options.SplitStyle.Value != "Classic" && dynamicPipelineAvailable &&
-                !dynamicPipelineFailed;
-            // Existing installs may still hold the old eager default in their
-            // Remix config. Treat only that exact default as the new baseline.
-            dynamicSettings.mergeDistance = Mathf.Approximately(Options.MergeDistance.Value, 280f) ||
-                Mathf.Approximately(Options.MergeDistance.Value, 850f) ? 600f : Options.MergeDistance.Value;
-            dynamicSettings.blendWidth = Mathf.Approximately(Options.BlendWidth.Value, 200f) ||
-                Mathf.Approximately(Options.BlendWidth.Value, 300f) ? 250f : Options.BlendWidth.Value;
+            dynamicStyle = style != "Classic" && dynamicPipelineAvailable && !dynamicPipelineFailed;
             dynamicSettings.minZoom = Options.MinZoom.Value;
             dynamicSettings.zoomExponent = Options.ZoomExponent.Value;
             dynamicSettings.dividerWidth = Options.DividerWidth.Value;
@@ -654,6 +660,7 @@ namespace SplitScreenCoop
             drawPathSafeMode = false;
             pendingKarmaFlowerPosition = null;
             ResetSharedFood();
+            ForgetOwedRebuilds();
             CurrentSplitMode = SplitMode.NoSplit;
             ResetCameraDiagnostics();
             inputLoggedAfterStart = false;

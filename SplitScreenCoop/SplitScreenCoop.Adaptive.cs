@@ -147,7 +147,6 @@ namespace SplitScreenCoop
                 {
                     viewports = new SplitLayoutSolver.ViewportState[count],
                     dividers = new SplitLayoutSolver.DividerSegment[0],
-                    pairSplitAmounts = new float[count, count],
                     effectiveInputs = new SplitLayoutSolver.PlayerInput[count],
                 };
                 for (int i = 0; i < count; i++)
@@ -179,7 +178,7 @@ namespace SplitScreenCoop
                 // for the whole of a zoom into or out of a quarter.
                 viewport.zoom = view == null ? 1f : Mathf.Min(view.zoom, view.TargetZoom);
                 viewport.splitAmount = adaptiveLayout.full ? 0f : 1f;
-                viewport.areaFraction = viewport.groupAreaFraction = cell.w * cell.h;
+                viewport.areaFraction = cell.w * cell.h;
             }
             dynamicLayout = adaptiveSnapshot;
             dynamicInputs = adaptiveSnapshot.effectiveInputs;

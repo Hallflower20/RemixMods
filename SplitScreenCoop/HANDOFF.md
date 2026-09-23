@@ -38,7 +38,7 @@ Unity math in `Tests/UnityMathStub.cs`.
 & "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\MSBuild\Current\Bin\Roslyn\csc.exe" /target:exe /out:Tests.exe SplitLayoutSolver.cs AdaptiveLayout.cs FrameStats.cs Tests\UnityMathStub.cs Tests\Program.cs Tests\AdaptiveTests.cs Tests\FrameStatsTests.cs; .\Tests.exe
 ```
 
-Expect `PASS: 26538 layout checks` (the pan-budget test samples an 11x11 grid per cell,
+Expect `PASS: 21702 layout checks` (the pan-budget test samples an 11x11 grid per cell,
 which is where most of that count comes from). `SplitLayoutSolver.cs` is deliberately
 pure and Unity-free so it stays testable — **keep it that way.** Anything needing a
 `RoomCamera`, a `Room` or a `RenderTexture` belongs in `SplitScreenCoop.Dynamic.cs`.
@@ -63,7 +63,7 @@ reference crept in.
 |---|---|
 | `SplitScreenCoop.cs` | Hook registration, Futile camera creation, `SetSplitMode`, classic split layouts, camera↔player ownership |
 | `SplitScreenCoop.Dynamic.cs` | The dynamic pipeline: layers, stages, HUD routing, compositor, per-frame view panning |
-| `SplitLayoutSolver.cs` | **Pure** rectangle layout solver with hysteresis (Dynamic and Static). Unity-free, unit-tested |
+| `SplitLayoutSolver.cs` | **Pure** layout of the Static style: fixed regions, damped cuts, slides, pans. Unity-free, unit-tested |
 | `AdaptiveLayout.cs` | **Pure** state machine and animation of the Adaptive style. Unity-free, unit-tested (`Tests/AdaptiveTests.cs`) |
 | `SplitScreenCoop.Adaptive.cs` | Adaptive style: per-tick keys and picture sharing, per-frame framing, compositing, spare quarter (meters, group map) |
 | `FrameStats.cs` | **Pure** frame-time window and allocation meter behind `[Perf]` and `[FrameHitch]`. Unity-free, unit-tested (`Tests/FrameStatsTests.cs`) |
@@ -74,6 +74,7 @@ reference crept in.
 | `SplitScreenCoop.ShaderShenanigans.cs` | Per-camera shader global capture and replay |
 | `SplitScreenCoop.Coop.cs` | Shared food, karma, shelter/gate/game-over rules |
 | `SplitScreenCoop.WatcherCompat.cs` | Watcher ripple/warp/level-combiner routing |
+| `SplitScreenCoop.Drawables.cs` | Vanilla drawables that rebuild their sprites for the first camera only (RippleTree, Aurora, WarpPoint, Spear, DangleFruit, Pomegranate, TerrainCurve, SaintsJourneyIllustration); the error contained per drawable |
 | `SplitScreenCoop.CoopFixes.cs` | Misc vanilla co-op fixes |
 | `SplitScreenCoop.CameraListener.cs` | `MonoBehaviour` on each Unity camera: render targets, pre/post render |
 | `SplitScreenCoopOptions.cs` | Remix config |
@@ -91,7 +92,7 @@ document.
 toward the prebaked screen origin and clamps it to ±20 px horizontally and a 32 px band
 vertically (`RoomCamera.Update`, the `Mathf.Clamp` lines after `seekPos`). The render
 texture of each camera is therefore always one prebaked room screen, give or take a lean.
-All "following" in Dynamic style is the compositor translating uvs inside that one image.
+All "following" in the dynamic pipeline is the compositor translating uvs inside that one image.
 A cell of normalized width `w` drawn at zoom `z` samples a window `w/z` wide, so it can
 pan by exactly `1 - w/z`. That budget is the whole design constraint.
 
@@ -129,7 +130,7 @@ The compositor camera draws nothing itself; `DynamicCompositor.OnPostRender` cal
 `CompositeDynamicLayout`, which issues immediate-mode `GL` polygons. Order inside it:
 
 1. `GL.Clear` to black
-2. full-screen backdrop, only when a ghost exists or the layout is fully merged
+2. full-screen backdrop, only while a dying player's region closes (a ghost exists)
 3. per-viewport world polygons
 4. `DrawDynamicDividers`
 5. `DrawDynamicHud`
@@ -145,112 +146,61 @@ hint text), and — via the culling mask — Futile's root stage.
 
 ### Layout: rectangles, decided by a small tree
 
-`SplitLayoutSolver` builds a guillotine partition of the screen from **fixed slots**.
-World positions play no part in where a cell sits (they only decide merging, see below,
-and the pan inside a cell). Items — a single player or a merged group — are ordered by
-their lowest camera number:
+`SplitLayoutSolver` (the Static style) builds a guillotine partition of the screen from
+**fixed slots**, one region per living player, ordered by camera number. Where a player
+stands plays no part in where their region sits, only in the pan inside it:
 
-- **Two items**: side by side, first item left (stacked, first on top, only inside a
-  box that is taller than wide on screen, i.e. a pair tiling a half-width column).
-  The cut follows the weights: two singles are halves, a pair beside a single owns two
-  thirds.
-- **Three items**: the item with the most members (a merged pair) takes the top half;
-  with three singles camera 0 does. The other two take the bottom, left to right by
-  number. The top item is weighed against the *largest* of the others, so three
-  players give one half and two quarters.
-- **Four items**: a 2×2 grid, cameras 0 1 / 2 3.
+- **Two players**: side by side, the lower number left (stacked, the lower on top, only
+  inside a box that is taller than wide on screen).
+- **Three**: the lowest number takes the top half, the other two the bottom quarters, left
+  to right by number. The half is weighed against the *larger* of the two quarters, so
+  three players give one half and two quarters.
+- **Four**: a 2x2 grid, cameras 0 1 / 2 3.
 
 This replaced (2026-09-16) a position-driven tree: a two-player divider that rotated
-continuously with the players' on-screen direction, side swaps and axis flips with
-dead zones and hold times, and a three-player "peel off the most isolated player"
-choice. The players' verdict was that the screens "constantly shift around depending
-on positions" and that only two things should ever change the screen: a split when
-two players get far enough apart and a merge when they get close. Every dead zone,
-hold time and score is gone with it (`directionDeadZone`, `layoutHoldSeconds`,
-`dividerTurnSeconds`, `SwitchMargin`, `ChooseAxis`, `ChooseSplitOff`,
-`SplitTwoRotating`, `CutForArea`, `Clip`); `Tests/Program.cs` `PositionsNeverRestructure`
-pins the new contract: any motion, including crossing sides, circling and changing
-rooms, leaves every rectangle exactly where it was and never sets `restructured`.
+continuously with the players' on-screen direction, side swaps and axis flips with dead
+zones and hold times, and a three-player "peel off the most isolated player" choice. The
+players' verdict was that the screens "constantly shift around depending on positions";
+every dead zone, hold time and score went with it (`directionDeadZone`,
+`layoutHoldSeconds`, `dividerTurnSeconds`, `SwitchMargin`, `ChooseAxis`, `ChooseSplitOff`,
+`SplitTwoRotating`, `CutForArea`, `Clip`). `Tests/Program.cs` `PositionsNeverRestructure`
+pins the contract: any motion leaves every rectangle exactly where it was and never sets
+`restructured`. Merging by distance (the Dynamic style) was the other thing that changed
+the tree until 2026-09-22; see §5 "Merging stripped from the solver".
 
-`NodeMemory` (keyed by the bitmask of cameras in the node) now only holds the damped
-cut fraction and the `layoutKey` (the item masks in slot order). While the key is
-unchanged the cut `SmoothDamp`s with the live weights, so a dying player's cell slides
-shut; when the key changes the cut snaps to its target and the slide below is the only
-animation. (Damping across a key change was tried first: the third player's cell then
-passed through a half on its way from a quarter to a third because the old fraction
-belonged to a cut on the other axis.)
+`NodeMemory` (keyed by the bitmask of cameras in the node) holds the damped cut fraction
+and the `layoutKey` (the cameras in slot order). While the key is unchanged the cut
+`SmoothDamp`s with the live weights, so a dying player's region slides shut; when the key
+changes the cut snaps to its target and the slide below is the only animation. (Damping
+across a key change was tried first: a region then passed through intermediate sizes
+because the old fraction belonged to a cut on the other axis.)
 
-**Nothing fades.** Merging is geometric, like a LEGO split screen. Two players on one
-prebaked screen share a base camera (`baseCameraNumbers`), every cell draws that
-camera's image opaque, and each cell's pan target is
-`lerp(identity, centre-my-player, splitAmount)`. At split 0 both cells sample the same
-image with the same pan, so the seam does not exist and the divider (alpha = split) is
-gone; as the players separate the pans diverge and the divider returns. The per-pair
-split amount is `SmoothDamp`ed (`splitSmoothingTime`, 0.25 s) because a player arriving
-on the other's screen through a pipe changes the pair's screen key in one tick. Do not
-reintroduce an alpha blend between two camera images; that was the "fading" the users
-rejected.
+Structural changes with three or four regions (a player arriving, or a dead player's
+region being removed) are animated, never cut: the tick the layout key of any node changes
+starts a **slide** of `transitionSeconds` (0.45 s): each region's `polygon` interpolates
+from its previous rectangle to `targetPolygon`; `Layout.sliding` is true meanwhile and
+`Layout.restructured` on the first tick (logged as `[CameraLayout] ... restructured`).
+Sliding rectangles overlap and leave gaps, so the compositor first draws every
+`targetPolygon` (the resting layout) and then the sliding `polygon`s over it, all opaque.
+Two-region layouts never slide.
 
-**When a cell may adopt another camera's image** is a one-way hysteresis in the
-`sharedCandidate` loop of `UpdateDynamicLayout`. Starting to share requires the player's
-*own* camera to sit on the base camera's screen (same room and camera position): that is
-the instant vanilla cuts, and the two images are the same picture, so nothing visible
-changes except the line beginning to fade. Adopting earlier, as soon as the player was
-merely visible near the edge of the other screen, replaced the cell's content with a
-different screen and then panned it into place, which the playtest described as "swaps
-to the other camera, then swipes". Once sharing (`lastBaseByCamera`), a cell keeps
-sharing while its player stays visible on the base screen, so a camera switching screens
-at the edge does not break a merged view apart prematurely.
+**Picture sharing.** Two regions whose players are on one prebaked screen draw one camera's
+picture (`baseCameraNumbers`): one world render instead of two, and grab effects right
+without taking turns. Each region pans that picture to centre its own player. Whether a
+region may *adopt* another camera's picture is a one-way hysteresis in the
+`sharedCandidate` loop of `UpdateDynamicLayout`: starting to share requires the player's
+*own* camera to sit on the base camera's screen (same room and camera position), the
+instant vanilla cuts, when the two pictures are the same; adopting earlier, as soon as the
+player was merely visible near the edge of the other screen, replaced the region's content
+with a different screen and then panned it into place ("swaps to the other camera, then
+swipes"). Once sharing (`lastBaseByCamera`), a region keeps sharing while its player stays
+visible on the base screen. A region that switches base camera on the same screen carries
+its shift over by the two cameras' position difference (`ownViewBaseNumbers/Positions` in
+`RefreshDynamicViewShifts`) so the displayed world does not jolt by the follow slack, and a
+base switch to a camera that has not rendered yet redraws last frame's image
+(`lastDrawnListeners`) instead of leaving the region black for a frame.
 
-Structural changes with three or four cells (a pair joining or parting, a player
-arriving or a dead player's cell being removed) are animated, never cut: the tick the
-layout key of any node changes starts a **slide** of `transitionSeconds` (0.45 s): each
-cell's `polygon` interpolates from its previous rectangle to `targetPolygon`;
-`Layout.sliding` is true meanwhile and `Layout.restructured` on the first tick (logged
-as `[CameraLayout] … restructured`). Sliding rectangles overlap and leave gaps, so the
-compositor first draws every `targetPolygon` (the resting layout) and then the sliding
-`polygon`s over it, all opaque. Two-cell layouts never slide: two players joining or
-parting keeps both rectangles where they are, only the pans and the line change.
-
-**Divider opacity is how far apart the two views are, damped.** `DividerTargetAlpha` in
-`Dynamic.cs` computes where each cell's image sits in world pixels (base camera position,
-interpolated and clamped like `RoomCamera.DrawUpdate`, plus that cell's pan × screen
-size). When the two origins coincide the picture is continuous across the line, i.e. one
-camera already frames both players and there is nothing to indicate, so the line is 0.
-It ramps to solid over `DividerInvisibleBelowPixels` (3) to `DividerOpaqueAbovePixels`
-(32). It used to be 4→300 px so the fade spanned the whole glide, but that left the line
-nearly transparent while the seam was still offset by 30–80 px (the follow slack between
-two cameras on one screen, or a merging pair's pan difference), and the exposed seam read
-as the picture *shearing*. The line now covers any visible offset and drops over the last
-32 px; `DividerAlpha` damps it per camera pair (`DividerFadeSeconds`, 0.25 s), so the
-drop is still a fade and a camera cut, which moves one view by a screen in one frame,
-fades the line in rather than popping it. Different rooms are solid.
-
-Two related seams: a cell that switches base camera on the same screen carries its shift
-over by the two cameras' position difference (`ownViewBaseNumbers/Positions` in
-`RefreshDynamicViewShifts`) so the displayed world does not jolt by the slack; and a base
-switch to a camera that has not rendered yet redraws last frame's image
-(`lastDrawnListeners`) instead of leaving the cell black for a frame.
-The solver still computes a distance-based `DividerSegment.alpha` (`PairMemory.line`,
-`lineSmoothingTime`); the compositor only uses it as a fallback when alignment cannot be
-computed. Two rejected variants, so nobody re-tries them: distance alone hid the line
-while the views were still visibly apart; and an earlier narrow 64 px ramp *before the
-pans were damped* never crossed its band, because alignment then happened in one frame.
-With the shift damped over 0.12 s and the split over 0.5 s, the narrow band is crossed
-gradually, which is why 3→32 px works now.
-
-**Why a merge across a screen boundary cannot be fully continuous, and what is done
-instead.** A half-width cell is 683 px wide; adjacent prebaked screens in a wide room
-overlap by less than that. A cell keeping its player centred therefore has to change
-which screen it samples somewhere, and at that point its content must jump by (cell
-width − overlap). Vanilla makes that jump too (the whole view cuts); here only one half
-does. The merge pan is then a *glide*: `splitSmoothingTime` is 0.5 s, so when the cut
-puts the pair inside the merge band the view moves to its merged position over half a
-second with the line fading alongside, instead of the 0.25 s move that read as a snap.
-A merge that does not cross a boundary is driven by distance and needs no glide.
-
-Players that are joined (same prebaked screen, within `mergeDistance`) form one group,
-and their individual cells just tile the group rectangle — they draw one image.
+Dividers are solid black lines between regions (`DividerSegment`), drawn under the HUD.
 
 ### The uv-shift model
 
@@ -262,33 +212,23 @@ For a rectangle that clamp is exact, and the tests prove that any source positio
 shown inside its own cell (`PanBudget` in `Tests/Program.cs`).
 
 One shift exists per camera, `ownViewShifts[n]`, recomputed **every rendered frame** in
-`RefreshDynamicViewShifts` (hooked from `RainWorldGame.GrafUpdate`). Player positions
-are measured against the cell's *base* camera and interpolated with the same
-`timeStacker` the sprites used. The pan has two stages, and the solver
-(`ViewportState.groupSplit` / `innerSplit`) and the compositor compute the same formula:
-
-1. A **joined group** pans as one image: anchor = lerp(group's live average position,
-   group box centre, `groupSplit`) plus each member's offset from that average, scaled by
-   zoom. `groupSplit` is the group's largest split against players *outside* it. Every
-   member's shift is identical, so at split 0 cells on one screen line up exactly.
-2. Each cell then blends from that group anchor to its **own centroid** by `innerSplit`,
-   its largest split against its own group-mates.
-
-A pair joins (becomes one item of the layout tree) below split 0.02 and parts only above
-0.95, i.e. when stage 2 is nearly complete, so joining and parting restructure the tree
-but never pop the pan. The anchor is then clamped (`PanBounds`, `ViewportState.anchorMin/
-Max`) into the cell's window shrunk by `VisibleMargin` × split, and the source-window
-clamp (`windowMin/Max`) blends from the group's box to the cell's own box with
-`innerSplit`. That is the "always visible in your own cell" guarantee: at split 0 the
-margin is zero so seamless cells stay exactly aligned; once the image has parted, the
-player is inside their cell by at least the margin. The result is `SmoothDamp`ed over
-0.12 s and snaps only when the image underneath changed: the base camera's room or camera
-position, or the cell moving more than 0.08 across the screen. Only base cameras have
-their Unity camera enabled.
+`RefreshDynamicViewShifts` (hooked from `RainWorldGame.GrafUpdate`). Player positions are
+measured against the region's *base* camera and interpolated with the same `timeStacker`
+the sprites used. The solver and the compositor use the same rule: while the screen is
+split (`splitAmount` 1) the anchor is the region's centre, clamped (`PanBounds`,
+`ViewportState.anchorMin/Max`) into the region shrunk by `VisibleMargin`, so the player is
+always inside their own region by at least the margin; a lone view (`splitAmount` 0) is
+anchored at its player, i.e. its picture is shown unpanned. The source window
+(`windowMin/Max`) is the region's box. The result is `SmoothDamp`ed over 0.12 s and snaps
+only when the picture underneath changed: the base camera's room or camera position, or
+the region moving more than 0.08 across the screen. Only base cameras have their Unity
+camera enabled. (Until 2026-09-22 the pan had two stages for merged groups, a joined group
+panning as one image by `groupSplit` and each member blending to its own centre by
+`innerSplit`; with merging off both reduce to this rule.)
 
 **Timing.** `UpdateDynamicLayout` runs once per *game tick* (40 Hz), not per rendered
 frame, so the solver gets `1 / game.framesPerSecond` as dt, never `Time.deltaTime`. Per
-frame code (`RefreshDynamicViewShifts`, `DividerAlpha`) does use `Time.deltaTime`.
+frame code (`RefreshDynamicViewShifts`) does use `Time.deltaTime`.
 
 HUD polygons use `DynamicHudShift` → `HudUvShift`, which centres the HUD's native screen
 centre on the cell centroid and clamps to avoid edge-clamp smear.
@@ -301,8 +241,8 @@ once unclickable.
 
 ### Zoom
 
-`zoomTarget = clamp(groupArea^ViewZoomExponent, MinZoom, 1)`, then raised to at least the
-group rectangle's larger side so the window fits inside the source. The Remix default is
+`zoomTarget = clamp(regionArea^ViewZoomExponent, MinZoom, 1)` (Static; a lone view is never
+zoomed), then raised to at least the region's larger side so the window fits inside the source. The Remix default is
 now `ViewZoomExponent = 0` (native scale everywhere, pan to follow). Zooming out shrinks
 the pan budget; at `zoom == cell extent` the cell shows the whole screen and cannot follow
 at all. The key was renamed from `ZoomExponent` because saved configs held the old 0.5.
@@ -328,7 +268,7 @@ at all. The key was renamed from `ZoomExponent` because saved configs held the o
    used to do it too, which re-isolated camera 0 during shutdown right after
    `ResetDynamicLayout` restored `initialWorldCullingMasks`, and the main menu rendered
    black after Exit.
-9. **Do not steer `RoomCamera.pos` in Dynamic style.** The vanilla clamp wins every tick
+9. **Do not steer `RoomCamera.pos` in the dynamic pipeline.** The vanilla clamp wins every tick
    anyway; the old follow code only made `lastPos`/`pos` inconsistent.
 10. **Texel snapping**: `DrawDynamicPolygon` rounds `uvShift` to whole source texels when
     `zoom > 0.999`. Without it a fractional pan blends two texels per pixel and the view
@@ -1600,6 +1540,114 @@ fast-travel screen, `[CameraMode] ... game resumed after` is logged and no `[Cam
 line or "draw loop stalled" follows; with dual displays display 2 shows the menu. Classic:
 views as sharp as before, after a resolution change too.
 
+### Dual-display playtest after phase 4 (2026-09-22): ripple trees, Dynamic removed
+
+The log (`LogOutput(1).log`, phase 4 DLL) has three sessions in the Watcher's WTDA: Static on
+dual displays, then Static and Adaptive on one display.
+
+- **Props following the view on display 2.** From frame 8762 `RippleTree.DrawSprites` threw
+  `IndexOutOfRangeException` (in `TriangleMesh.MoveVertice`) inside camera 1's
+  `RoomCamera.DrawUpdate`, every frame for the rest of the session, and again in the
+  Adaptive session from frame 32980 (12699 throws in all). A ripple tree keeps its stalks and
+  the scale they were generated for on the tree (`stalk`, `leftStalk`, `rightStalk`,
+  `lastUseScale`); while it grows, `DrawSprites` rebuilds the meshes of the camera that draws
+  first and records the scale, so camera 1 kept meshes sized for the old stalks and wrote past
+  their end. `DrawUpdate` draws every sprite leaser in one loop, so everything camera 1 drew
+  after the tree (and the level image's position, and the single-camera drawables) stopped
+  updating and stayed where it was on screen while the view moved: the "subroom props
+  following me", on the second player's display only. `RippleTree_DrawSprites` sends a leaser
+  whose meshes do not fit the current stalks down vanilla's own rebuild path (`lastUseScale =
+  NaN`); the stalks come from the tree's seed, so a second rebuild in a frame generates the
+  same stalks and the first camera's meshes stay valid.
+- **The same assumption in other drawables.** Every vanilla `DrawSprites` that calls
+  `InitiateSprites` was read (14 types). BrainMold, DaddyCorruption, ClimbableVineRenderer,
+  MudOverlay, KarmaFlowerPatch and PlateTree check the camera's own leaser and are fine.
+  `FloatingDebris.Aurora` has RippleTree's flaw (mesh size from the floater count, the flag
+  cleared inside `InitiateSprites`) and gets the same kind of size check. Six set a one-shot
+  flag that the first camera consumes: WarpPoint `refreshGraphics` (locked, sealed), Spear
+  `reinitiateSpritesOnDraw` (poison ran out), DangleFruit `convertToRot`, Pomegranate
+  `refreshSprites` (smashed), TerrainCurve `spritesDirty`, SaintsJourneyIllustration
+  `imageDirty`. `RebuildOwed` keeps each request owed to every other camera until it has drawn
+  once with the flag set; vanilla's branch does the rebuild. Reset per session
+  (`ForgetOwedRebuilds`); a counter keeps draws off the table while nothing is owed. All in
+  `SplitScreenCoop.Drawables.cs`.
+- **Containment.** `SpriteLeaser_Update` catches an exception from one drawable and logs
+  `[HookError] <Type>.DrawSprites threw on camera N (xcount)` at most every 10 s per type; the
+  camera draws everything else. The next one-camera assumption costs its own object's sprites,
+  not the whole view, and names itself in the log.
+- **Draw stalls on any camera.** `DetectDrawStall` watched camera 0 only, so camera 1's
+  three-minute stall raised nothing; it now takes the camera longest without a completed draw.
+- **The frame rate.** Before the throws, dual displays held a flat 60 fps (p99 16.7 ms, render
+  0.4 ms). From then on every frame threw through the draw and Unity logged the exception with
+  its stack: allocation went from 1-5 MB/s to about 21 MB/s, collections to 12-36 a minute,
+  and `[Perf]` went blind ("paused for the whole window": the frame bookkeeping after the draw
+  never ran). Separately, Auto tried the camera rotation four times in four minutes on dual
+  displays, each try two seconds at 30 fps per view, although vsync held the game at 60: the
+  refresh rate Unity reported there did not show the pace, while the same machine on one
+  display read 60 Hz and never tried. A failed attempt under vsync now records the measured
+  pace (`vsyncMeasuredFps`, with the vsync count, refresh rate and display setup it was
+  measured under), and Auto does not try again while those are unchanged.
+- **Dynamic style removed** (the user: "just remove the old adaptive splitscreen, im guessing
+  its called dynamic, we don't need it anymore"). The style list is Adaptive, Static, Classic,
+  with Adaptive first because Remix turns a saved value it does not list into the first one: a
+  config that says Dynamic opens as Adaptive, and `ReadSettings` reads anything but Static or
+  Classic as Adaptive. Merge distance and blend width, used only by Dynamic, are gone from the
+  menu, and so is Dynamic's shelter collapse in `UpdateDynamicLayout`. The solver still merges
+  when asked and its tests still ask; Static runs it with `permanentSplit`, so the mod never
+  does. Stripping the merging out of the solver is possible but was not asked for.
+- **Style descriptions.** A control bound to a Configurable shows only the first sentence of
+  its help, and the style help was one string that began with Adaptive, so only Adaptive ever
+  had a description. Each style now has its own (`ListItem.desc`, shown while the style is
+  hovered in the open list), the closed box says to hover them, and help texts that mentioned
+  Dynamic or merging cells were rewritten. The description line is one unwrapped label at the
+  bottom of the screen: keep every help text to one line.
+
+**Not verified in game.** Watcher rooms with ripple trees and two cameras (dual displays and
+one display): nothing on player 2's view stays behind when the view moves, both players see the
+same trees, no IndexOutOfRange and no `[HookError] ... DrawSprites threw`, `[Perf]` lines
+normal while playing. Dual displays: 60 fps and at most one rotation try per setup. Remix:
+each style shows its description; a config that said Dynamic opens as Adaptive.
+
+### Merging stripped from the solver (2026-09-22)
+
+The user, after the Dynamic style was removed: "yes strip the merging code out too". The
+solver now lays out Static's fixed regions only.
+
+- **Gone from `SplitLayoutSolver`:** the per-pair split amounts (distance-based, damped by
+  `splitSmoothingTime`), the divider opacity by distance (`PairMemory.line`,
+  `lineSmoothingTime`), joins and parts with their hysteresis (`JoinBelow`/`UnjoinAbove`,
+  the union-find), multi-player items and their slices, the two-stage group pan
+  (`groupSplit`, `innerSplit`, `imageBlend`, the group box and anchors),
+  `Layout.pairSplitAmounts`, `DividerSegment.alpha`, and the inputs and settings that only
+  fed them (`PlayerInput.worldPos/sameScreenKey/roomKey/validWorldPos`, `mergeDistance`,
+  `blendWidth`, `permanentSplit`, `splitSmoothingTime`, `lineSmoothingTime`).
+  `mergedScreenPos` is now `screenPos`. Kept: fixed slots, the damped cuts, the death fade,
+  slides, the pan rule, zoom, dividers, `SharedCameraCanShow`.
+- **Proof that Static is unchanged:** the solver before the strip, run with
+  `permanentSplit` as Static ran it, against the stripped one on 1,545,247 random layouts:
+  every field the stripped solver still returns is identical bit for bit, and every field
+  it dropped held the constant the strip assumed (group split = split, inner split 0, image
+  blend = split, the group box = the window, divider alpha 1, pair amounts 1, no shared
+  image). Two deliberately wrong strips were caught with millions of mismatches each.
+- **Gone from the game side:** the world positions, room keys and "world-direction
+  fallback" log lines computed every tick for the merge distance; the divider fade
+  (`DividerAlpha`, `DividerTargetAlpha`); the merged full-screen paths in
+  `ApplyDynamicCameraRendering` and `CompositeDynamicLayout`; the merged-view branch of the
+  off-screen player pointer (`JollyOffRoom_Update`); the group logic of
+  `RefreshDynamicViewShifts`. Picture sharing between regions on one screen stays: it is a
+  render saving, not a merge.
+- **One visible change in Static:** the divider between two players on one screen used to
+  be a merge cue as well; `DividerTargetAlpha` faded it out when the two pictures lined up
+  within 3 px (the players standing together). It is now always solid.
+- **Tests:** the twelve merge tests went (divider fade, merged pairs with their slots and
+  weights, continuity and sweeps, shared-source uvs, same-screen splits, merge restructures
+  and slides, screen arrival). `SlideOnMerge` became `SlideOnArrival` (a fourth player
+  arriving restructures once and slides) and `LoneViewIsUnpanned` pins the pan rule, both
+  mutation-checked. `PASS: 21702`.
+
+**Not verified in game.** Static with 2-4 players: regions, pans, slides and deaths as
+before; the line between two players standing together stays solid.
+
 ### Static split style (2026-09-18)
 
 A third value of the "Split-screen style" option, next to Dynamic and Classic. It is the
@@ -1647,6 +1695,9 @@ Ordered by confidence that something is still wrong or unknown.
    until a log shows they matter: skipping unchanged shader replays (`[Perf] replayMs`
    decides), freeing a dead player's camera room (a parked-camera state), and the 67 ms
    paused frames (8d).
+0b. **One-camera drawables.** Any `[HookError] ... DrawSprites threw` names a vanilla
+   drawable the fourteen-type scan of 2026-09-22 missed (a mod's, or one whose rebuild does
+   not go through `InitiateSprites`); fix it the way `SplitScreenCoop.Drawables.cs` does.
 1. **Stutter.** The second playtest log has 19 `[FrameHitch]` lines over ~190k frames.
    The big ones are room loads (633 ms at spawn, 425 ms `realize CC_C03`, 329 ms with no
    event) and region/gate transitions; texture sharing fired 80 times and every camera
@@ -1721,7 +1772,7 @@ Ordered by confidence that something is still wrong or unknown.
 | `[Coop]` | Game-over decision, which camera's prompt entered game-over mode, `GoToDeathScreen` |
 | `[Hang]` | Main thread stalled 4 s / 30 s; `last marker` names the mod path (or vanilla `orig`) it was in. **Start here for a freeze** |
 | `[UnityLog]` | A Unity exception/error mirrored into this log with its stack trace (the playtest config does not write Unity's log). **Start here for a black screen with audio** |
-| `[HookError]` | The mod's own after-draw/after-update code threw and was contained |
+| `[HookError]` | The mod's own after-draw/after-update code threw and was contained. `<Type>.DrawSprites threw on camera N` is a vanilla drawable that threw inside one camera's draw: contained (the camera draws everything else), and most likely another object that assumes one camera (see `SplitScreenCoop.Drawables.cs`) |
 | `[CameraHealth] draw loop stalled` | `RoomCamera.DrawUpdate` stopped completing while `Update` runs; the mod's draw-path code is now in pass-through |
 | `[MenuCamera]` | Watchdog corrections and a camera snapshot after every process switch. **Start here for a black menu** |
 | `[CameraLayout]` | Layer allocation at startup; then every structural layout change as `groups=[cam:sharesImageWith,...]\|sources=[...]\|rendering=[...]\|direct=bool`; `restructured; cells=[…]` each time the layout tree changed shape (a slide) |

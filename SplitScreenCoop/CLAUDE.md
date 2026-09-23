@@ -2,7 +2,7 @@
 
 BepInEx/MonoMod mod for Rain World that gives each player their own camera and composites
 them into one adaptive split screen (the Adaptive style; the older LEGO-style Dynamic
-remains selectable). Branch of record: `dynamic-split-screen`.
+was removed on 2026-09-22). Branch of record: `dynamic-split-screen`.
 Read `HANDOFF.md` before touching rendering or layout code; it explains why things are the
 way they are and lists approaches that were tried and rejected. `Todo.txt` is the playtest
 checklist. Keep both updated when you change behaviour.
@@ -34,7 +34,7 @@ csc.exe /nologo /target:exe /out:Tests.exe SplitLayoutSolver.cs AdaptiveLayout.c
 
 | File | Owns |
 |---|---|
-| `SplitLayoutSolver.cs` | Pure layout maths of Dynamic and Static: fixed-slot rectangles by camera number, joins, slides, pans. No Unity. |
+| `SplitLayoutSolver.cs` | Pure layout maths of Static: fixed-slot rectangles by camera number, damped cuts, slides, pans. No Unity. |
 | `AdaptiveLayout.cs` | Pure state machine of the Adaptive style: one view / halves / grid by living count, zooms, reflow, framing steps. No Unity; tests in `Tests/AdaptiveTests.cs`. |
 | `SplitScreenCoop.Adaptive.cs` | Adaptive style in the game: screen keys, picture sharing, framing, compositing, spare quarter (meters, group map) |
 | `FrameStats.cs` | Pure frame-time window and allocation meter behind `[Perf]`/`[FrameHitch]`; tests in `Tests/FrameStatsTests.cs`. |
@@ -43,6 +43,7 @@ csc.exe /nologo /target:exe /out:Tests.exe SplitLayoutSolver.cs AdaptiveLayout.c
 | `SplitScreenCoop.CameraDiagnostics.cs` | All logging tags, hang watchdog, Unity log capture, draw-stall detection, menu camera restore |
 | `SplitScreenCoop.ShaderShenanigans.cs` | Per-camera shader globals, palettes, rot/ghost modes, room change |
 | `SplitScreenCoop.RotSpores.cs`, `WatcherCompat.cs` | Vanilla objects that assumed one camera, made per-camera |
+| `SplitScreenCoop.Drawables.cs` | Drawables that rebuild their sprites for the first camera only; each drawable's exception contained |
 | `SplitScreenCoop.LevelTextures.cs` | Level PNG decode sharing between cameras |
 | `SplitScreenCoop.Realizer2.cs` | One room realizer per player, shared budget |
 | `SplitScreenCoop.Coop.cs`, `CoopFixes.cs` | Game-over rules, sleeping, food maths |
@@ -54,10 +55,10 @@ csc.exe /nologo /target:exe /out:Tests.exe SplitLayoutSolver.cs AdaptiveLayout.c
   code (`GrafUpdate`, `OnPostRender`) uses `Time.deltaTime`.
 - **Every camera renders one prebaked 1400x800 screen.** All "following" is uv panning of
   that image; a cell cannot show more than its screen. See the uv-shift model in HANDOFF.
-- **No alpha blending between camera images.** The user rejected crossfades. Merges are
-  geometric: same image, pans converge, the divider line fades. Nothing may snap.
-- **Cells never move with the players.** Slots are fixed by camera number; only a merge,
-  a part, an arrival or a death restructures (as a slide). The users rejected the earlier
+- **No alpha blending between camera images.** The user rejected crossfades. Adaptive's
+  merges are geometric (a zoom between one view and the split). Nothing may snap.
+- **Cells never move with the players.** Slots are fixed by camera number; in Static only
+  an arrival or a death restructures (as a slide). The users rejected the earlier
   position-driven layout (rotating divider, side swaps) as "constantly shifting around".
 - **Vanilla assumes one camera.** Any `IDrawable` that keeps Unity objects per room object
   instead of per sprite leaser breaks when a second camera enters its room (rot spores,
@@ -167,14 +168,23 @@ csc.exe /nologo /target:exe /out:Tests.exe SplitLayoutSolver.cs AdaptiveLayout.c
   never by distance; the layout depends only on how many players are alive; nothing
   moves except a zoom between one view and the split, a slide on death or revival, and
   a half's framing step caused by its own player. A view must never move because
-  another player moved. The Dynamic rules below (no snaps, pans converge) describe the
-  older style; HANDOFF "Adaptive split style" has the design and its reasons.
-- **Four split styles.** Adaptive (above), Dynamic (merge and part by distance), Static
-  (Dynamic's pipeline with `NeverMerge`: a fixed region per *living* player, reflowing only
-  on death or revival, no shelter collapse) and Classic (the original non-isolated
-  layouts). Adaptive, Dynamic and Static all run on the dynamic pipeline (`dynamicStyle`);
-  `adaptiveStyle` picks the layout. Read `NeverMerge`, not `alwaysSplit`, anywhere
-  merging is decided.
+  another player moved. HANDOFF "Adaptive split style" has the design and its reasons.
+- **Three split styles.** Adaptive (above), Static (`SplitLayoutSolver`: a fixed region per
+  *living* player, reflowing only on death or revival) and Classic (the original
+  non-isolated layouts). The Dynamic style (merging by distance) was removed on 2026-09-22
+  at the user's request, and its merging was stripped out of the solver the same day; a
+  config that still names it reads as Adaptive. Adaptive and Static run on the dynamic
+  pipeline (`dynamicStyle`); `adaptiveStyle` picks the layout. In Adaptive and Classic
+  read `NeverMerge`, not `alwaysSplit`, where merging is decided.
+- **A vanilla drawable that rebuilds its sprites inside DrawSprites, from a flag or a size
+  kept on the object, rebuilds for the first camera only.** The next camera keeps sprites
+  for the old state and, with fewer vertices, throws every frame; that stopped its whole
+  draw loop (sprites frozen on screen, "following" the view: RippleTree, 2026-09-22).
+  `SplitScreenCoop.Drawables.cs` rebuilds each camera's own leaser; `SpriteLeaser_Update`
+  contains what still throws as `[HookError] <Type>.DrawSprites threw`.
+- **Remix shows only the first sentence of a bound control's help**, on one unwrapped line
+  at the bottom of the screen: one short line per help text, and per-item descriptions
+  (`ListItem.desc`) for a list whose entries need explaining.
 - **Futile's stage list order is draw order** (render queue 3000 + depth, handed out stage
   by stage). Harmless while every stage has its own Unity camera; the moment one camera
   draws several stages (dual displays: world + HUD + root) they must be listed bottom to

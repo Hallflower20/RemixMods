@@ -307,7 +307,15 @@ namespace SplitScreenCoop
                 renderedCameraNumbers.Count > 0 && !CameraRendersThisFrame(rCam.cameraNumber) &&
                 !DrawSpritesRetiresLeaser(self.drawableObject, rCam))
                 return;
-            orig(self, timeStacker, rCam, camPos);
+            try { orig(self, timeStacker, rCam, camPos); }
+            catch (Exception error)
+            {
+                // RoomCamera.DrawUpdate draws every leaser in one loop: a throw here left every
+                // leaser after this one, the room image's position and the single-camera
+                // drawables undrawn for this camera, every frame the drawable kept throwing.
+                LogDrawableError(self, rCam, error);
+                return;
+            }
             if (self.maskSources != null && self.maskSources.Length > 0 && !self.deleteMeNextFrame)
                 RecordLeaserMaskSources(self, rCam);
         }

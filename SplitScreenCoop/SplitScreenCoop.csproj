@@ -411,6 +411,7 @@
     <Compile Include="SplitScreenCoop.ShaderShenanigans.cs" />
     <Compile Include="SplitScreenCoop.WatcherCompat.cs" />
     <Compile Include="SplitScreenCoop.RotSpores.cs" />
+    <Compile Include="SplitScreenCoop.Drawables.cs" />
     <Compile Include="SplitScreenCoop.Adaptive.cs" />
     <Compile Include="AdaptiveLayout.cs" />
     <Compile Include="FrameStats.cs" />
