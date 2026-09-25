@@ -9,7 +9,7 @@
     <AppDesignerFolder>Properties</AppDesignerFolder>
     <RootNamespace>SplitScreenCoop</RootNamespace>
     <AssemblyName>SplitScreen Co-op</AssemblyName>
-    <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
+    <TargetFrameworkVersion>v4.8.1</TargetFrameworkVersion>
     <LangVersion>latest</LangVersion>
     <FileAlignment>512</FileAlignment>
     <Deterministic>true</Deterministic>
@@ -398,15 +398,23 @@
   <ItemGroup>
     <Compile Include="SplitScreenCoop.CameraListener.cs" />
     <Compile Include="SplitScreenCoop.CameraDiagnostics.cs" />
+    <Compile Include="SplitLayoutSolver.cs" />
     <Compile Include="SplitScreenCoop.Coop.cs" />
     <Compile Include="SplitScreenCoop.CoopFixes.cs" />
     <Compile Include="SplitScreenCoop.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="SplitScreenCoop.DisplayExtras.cs" />
+    <Compile Include="SplitScreenCoop.Dynamic.cs" />
+    <Compile Include="SplitScreenCoop.LevelTextures.cs" />
     <Compile Include="SplitScreenCoop.Multicamera.cs" />
     <Compile Include="SplitScreenCoop.Realizer2.cs" />
     <Compile Include="SplitScreenCoop.ShaderShenanigans.cs" />
     <Compile Include="SplitScreenCoop.WatcherCompat.cs" />
+    <Compile Include="SplitScreenCoop.RotSpores.cs" />
+    <Compile Include="SplitScreenCoop.Drawables.cs" />
+    <Compile Include="SplitScreenCoop.Adaptive.cs" />
+    <Compile Include="AdaptiveLayout.cs" />
+    <Compile Include="FrameStats.cs" />
     <Compile Include="SplitScreenCoopOptions.cs" />
   </ItemGroup>
   <ItemGroup>

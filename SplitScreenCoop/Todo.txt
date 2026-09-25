@@ -1,6 +1,10 @@
 SplitScreen Co-op 0.2.2 status
 ================================
 
+See HANDOFF.md for how the dynamic pipeline renders, the invariants that are easy
+to break, the mechanism behind each recent fix, and how to build without a working
+MSBuild. Read it before changing rendering code.
+
 Implemented
 -----------
 [x] Automatic split mode with Remix options for permanent split and dual display.
@@ -23,6 +27,362 @@ Implemented
 [x] Delayed room-camera resync after missed transitions.
 [x] Split-camera map input no longer enters vanilla camera cycling.
 [x] Adaptive layouts use only living players and reflow after deaths.
+[x] Dividers composite under the HUD and pause menu instead of over them.
+[x] Pause buttons and confirm text follow the view's actual HUD translation.
+[x] HUD textures no longer smear their border into neighbouring cells.
+[x] Native-scale views sample on whole texels, so following does not soften the image.
+[x] A view that cannot legally pan far enough still keeps its slugcat on its own
+    side of a divider, at the cost of a clamped edge strip.
+[x] A dead player's camera no longer forces synchronous room resyncs while the
+    corpse is carried.
+[x] Dynamic layout is solved before the first frame after spawn-in.
+[x] Palette changes from room effects, day/night and palette rooms are attributed
+    to the camera that made them.
+[x] Karma fade circles travel with the globally routed karma meter.
+
+[x] A realizer can no longer abstractize a room another player, their camera or a
+    shortcut vessel still needs. RemoveNotVisitedRooms bypassed CanAbstractizeRoom,
+    which froze a player inside a pipe permanently.
+[x] One shared pause menu on the global stage, at native coordinates, so the
+    pointer lines up with what is drawn.
+[x] Futile's root stage is composited again, which is where Menu.MouseCursor
+    parents the cursor.
+[x] All players inside one shelter collapse to a single view and a single HUD.
+[x] Shader globals written from Room.Update are attributed to the cameras showing
+    that room instead of leaking between views.
+[x] Cameras loading the same room share a screen key, so spawn-in no longer opens
+    split for a couple of frames.
+
+[x] Layout cells are axis-aligned rectangles (2: side by side; 3: one half over
+    two quarters; 4: a 2x2 grid; slots by camera number, see below). Each view
+    samples one prebaked screen, and only a rectangle keeps
+    enough pan to always show its own slugcat; the Voronoi cells could not, which
+    is what the "player visibility correction" slack, the smeared edge strips and
+    the per-frame jumps were compensating for. That slack is gone.
+[x] Views pan every rendered frame from interpolated positions and are damped, so
+    following no longer steps at the 40 Hz tick or snaps when a clamp toggles.
+[x] The vanilla camera is left alone in Dynamic style; the mod no longer fights
+    RoomCamera's own clamp every tick with a follow target it could never reach.
+[x] Exiting to the menu no longer leaves a black screen: SetSplitMode stopped
+    re-isolating camera 0's culling mask after ResetDynamicLayout restored it.
+[x] Cameras that switch to a screen another camera already decoded copy its
+    pixels instead of decoding the PNG again on the main thread.
+[x] Room realizers share one performance budget (1500 + 750 per extra player) and
+    may not abstractize a room another realizer still needs, which stopped the
+    reload ping-pong of neighbour rooms between players.
+[x] Frames over 50 ms are logged as [FrameHitch] with the room loads, camera moves
+    and texture decodes that happened in them.
+[x] Default view zoom is native scale (Remix key ViewZoomExponent = 0); raise it
+    for zoomed-out cells.
+[x] MSBuild builds again (csproj targets v4.8.1, matching the installed pack).
+
+[x] Nothing fades any more. Two players on one prebaked screen merge the LEGO
+    way: both cells keep drawing the same image and each cell's pan lerps from
+    "centre my player" to "identity" as the split amount falls, so the halves
+    line up and the divider vanishes; moving apart reverses it. The split
+    amount is damped (0.25 s) so a player arriving on the other's screen
+    through a pipe glides in instead of popping. Three or more cells slide from
+    their old rectangles to their new ones over the resting layout when the
+    grouping changes; a dying player's cut slides shut.
+[x] Only base cameras render; a cell always draws the camera whose prebaked
+    screen its players share, so merged views are one image, not a blend.
+[x] A cell only starts drawing the other camera's image once its own camera is
+    on that screen (the vanilla cut moment), and keeps sharing while its player
+    stays visible there. Merging no longer swaps a cell to a different screen
+    and swipes it into place; the line just fades as the pans converge.
+[ ] Whole-process freezes (26-69 s frames, no [Hang]) in the twelfth log: not
+    the mod's frame cost (p95 4 ms). Next log: look for "[Hang] the whole
+    process stood still" and the renderTextures count; on the playtest PC
+    check RAM use and Event Viewer for display-driver resets.
+[x] Camera audit (HANDOFF §5 "Camera audit"): every named screen grab (17 of
+    them; _SlopedTerrainMask alone feeds slush water and backgrounds) was
+    camera 0's on the other cameras. World cameras now render one per frame
+    (Auto while every view keeps 50 fps; Remix "Camera rendering"), so each
+    frame has one grabbing camera. _tileCorrection (blizzard, dust wave) is
+    recomputed per camera; environment-coloured lights, light beams, gold
+    flakes, fairy particles, zero-g specks and OE clouds run with the viewing
+    camera as cameras[0]. [ShaderAudit] logs any global written outside camera
+    scope with the method that wrote it.
+[x] Sleep/death screens no longer freeze on the last game frame when the
+    surviving player was not camera 0 (listener 0 left in split mode kept
+    copying its stale texture over the menu).
+[x] A pause no longer trips the draw-stall detector on unpausing (paused draws
+    count), and pass-through mode ends by itself after 600 healthy frames.
+[x] The pause menu's cursor draws above the menu again (global HUD stage sits
+    below Futile's root stage).
+[x] Hidden AbstractSpaceVisualizer labels are removed at shutdown (the root
+    stage grew by 500 per session).
+[x] Revisited screens upload a cached level image instead of decoding the PNG.
+[x] Cameras that skip DrawSprites while off still let objects retire their
+    leasers (the skip had leaked every dead object's sprites on those cameras).
+[x] Dynamic level elements (foliage, grass, rot tubes, candles) get their own
+    per-camera grab: Unity's named GrabPass happens once per frame, so the
+    other cameras had combined camera 0's grab into their level texture.
+[x] A warp moves every camera, not only the precast one; a session resumed
+    from a warp no longer leaves cameras 1-3 at room=null with the screen
+    split around an empty cell.
+[x] The unloaded-world cleanup skips cameras already loading a room, so a
+    warp no longer strips the watched camera's ripple masks (broken colours)
+    or empties the other cells.
+[x] [Perf] heartbeat line and an "Extra rooms per player" Remix slider for the
+    realizer budget.
+[x] Sleep lockout after a region change (seventh playtest): a rot-spore renderer
+    node of a camera left behind in the unloaded world held a destroyed
+    GameObject; re-parenting that camera's layers at shutdown threw, the
+    process switch aborted before clearing the current process, and the dead
+    game was updated forever. Nodes now leave their containers before their
+    GameObject dies, cameras left in an unloaded world drop their sprite
+    leasers when the new world loads, the shutdown hook contains every
+    exception, and [UnityLog] buckets by message plus top stack frames.
+[x] Cameras that are not rendering skip DrawSprites for their room objects
+    (three players in one room were three full draw passes per frame).
+[x] Watcher foliage, grass and other dynamic level elements keep their colour
+    on every camera. They are Unity mask meshes shared between cameras, and
+    only the last camera to draw had them in view; the others composited a
+    stale grab into their level texture. Each camera now places the meshes
+    for itself right before it renders (CameraListener.OnPreCull).
+[x] Cells sit in fixed slots by camera number (two: left/right; three: the
+    merged pair or camera 0 on top, the others below; four: a grid) and only a
+    merge, a part, an arrival or a death changes the layout. The rotating
+    two-player divider, side swaps, axis flips, dead zones and hold times are
+    gone: the screens no longer shift around with the players' positions.
+[x] The divider's opacity is how far apart the two views are in world pixels
+    (fading over 4 to 300 px, damped 0.2 s per pair), so it fades across the
+    whole glide as views converge and is hidden when the two halves are already
+    one continuous picture. Solid across rooms.
+[x] Merging across a screen boundary in a wide room cannot be continuous (a half
+    cell is wider than the overlap between adjacent screens), so the pan after
+    the cut glides over 0.5 s instead of 0.25 s, with the line fading alongside.
+[x] A living player being abstracted mid-pipe no longer counts as dead
+    (IsCreatureDead dropped the slated-for-deletion clause). That false death
+    removed their camera and, with the other player held or dead, ended the
+    game with someone alive.
+[x] The game-over prompt itself is gated: TextPrompt.EnterGameOverMode is
+    refused unless every player is dead or held, whichever vanilla path raised
+    it. "[Coop] blocked game-over prompt" logs each refusal with player states.
+[x] A camera whose followed player is dead is muted regardless of layout state,
+    in addition to cameras with no live cell.
+[x] Cameras that are not in the layout (dead players, fading ghosts) are muted;
+    their point of view no longer plays in the mix.
+[x] Rot (Watcher "red goop") renders on every camera: vanilla UpdateRotMode
+    always wrote the rot effect colours into cameras[0]'s palette, and Room.Update
+    handed cameras[0] other rooms' rot amounts. Re-implemented per camera.
+[x] Globals written while a room loads (RoofTopView's _SceneOrigoPosition and
+    friends, the city backdrop) are kept in a per-room record and copied to a
+    camera when it arrives in that room.
+[x] Any player's map button reveals the shared meters, not only the owner of the
+    camera whose HUD supplies them.
+[x] Menu camera watchdog: while no game runs, camera 0 is forced enabled, on the
+    screen texture, with the root stage in its mask, and every other camera off.
+    "[MenuCamera]" logs what it had to correct plus a snapshot per process switch.
+[x] Food pips are white again: the letterbox bars were routed onto the global
+    stage after the meters, so they were drawn over the pips. The text prompt is
+    routed first now, as vanilla builds it.
+[x] Ghost (echo) and rot palette modes are mirrored onto every camera showing the
+    room; Room.cs only ever updated cameras[0].
+[x] The game-over and pause prompts win the global prompt slot outright, so the
+    "Game Over - Press ... to restart" line cannot be left in an unrouted HUD.
+[x] [Coop] log lines mark game over, the prompt camera and GoToDeathScreen, and
+    the heartbeat carries each camera's palette state (palA/palB/blend/ghost/fog).
+
+Needs in-game confirmation
+--------------------------
+[ ] Black screen after Exit or death: read the "[MenuCamera]" lines. If they
+    show corrections, the watchdog fixed it and the correction names the cause;
+    if they show none and the screen is still black, the problem is not a
+    camera at all (look at fadeToBlack/blackDelay in the same line).
+[ ] Food pip colour: a screenshot is needed. Pips are drawn with the
+    VectorCircleFadable shader, which colours them from _PalTex, so they follow
+    the palette of the camera supplying the meters, as in vanilla. Empty pips
+    below the survival limit flash red in a shelter until sleep is possible,
+    also as in vanilla.
+[ ] Palette differences between cameras: compare the palA/palB/blend/ghost/fog
+    numbers of the two cameras in the same [CameraState] heartbeat. If they
+    match and the views still differ, the difference is not in RoomCamera state.
+[ ] Game over with everyone dead: expect "[Coop] game over" then
+    "game over prompt entered on cam=0", the prompt text at bottom left, and
+    "[Coop] GoToDeathScreen" after a key press.
+[ ] Rectangular dynamic layouts: orientation follows the players, sides do not
+    flip on jitter, nothing juts or smears at cell edges, dead players' cells
+    slide shut.
+[ ] Following: the slugcat sits at its cell centre whenever the room screen
+    allows, and the view stays smooth through pipes and screen changes.
+[ ] Three players: the layout settles instead of sliding back and forth. Count
+    "[CameraLayout] ... restructured" lines; players standing still should
+    produce none. Pairs now join at 600 px and part around 840 px.
+[ ] Three players all in one pipe: they stay one group through the transit
+    (shared pending-room key) and no slivers appear on leaving a shelter.
+[ ] Freeze: if it recurs, the log has a "[Hang] ... last marker=" line naming
+    where the main thread was. Send that line. (Menus no longer produce a
+    false one.)
+[ ] Continue after death: the new session's rooms draw normally (level
+    texture keys are reset per session).
+[ ] Every player stays inside their own cell once their image has parted from
+    a neighbour's; at the seamless moment they may span the seam.
+[ ] Black screen with audio: was the rot particle cloud (SentientRotSpores)
+    once two cameras viewed CC_B06; fixed with one renderer per camera. Check
+    a rot room with all three players in it: particles visible on every
+    view, no "[UnityLog]" lines. If any other object throws the same way the
+    log will again carry a "[UnityLog]" line naming it.
+[ ] Layout only rearranges while everyone in that part of the layout is in
+    one room; in separate rooms it holds, and re-decides when they pipe
+    together.
+[ ] Merging: no visible shear at the seam. The line stays solid until the two
+    images are within ~32 px of lining up, then fades over about a quarter
+    second; switching which camera a cell draws no longer jolts the picture.
+[ ] Slides and merges now run at the configured speed at any frame rate
+    (the solver is fed the 40 Hz tick, not the render frame time).
+[ ] Stutter: read the [FrameHitch] lines from the next log. Each one names what
+    happened in that frame (realize/abstractize room, MoveCamera, level texture
+    decode or copy, GC collections). That decides what to optimize next.
+[ ] Pause: exactly one pair of letterbox bars (the global prompt camera's), one
+    pause menu, and Exit returns to the main menu.
+[ ] Death no longer stalls the other views (the forced room resync was the one
+    mechanism found in code; confirm against a fresh log).
+[ ] Spawn-in flash is gone with the layout primed in RainWorldGame_ctor.
+[ ] The single shared pause menu is clickable, with a visible cursor, in 2-, 3- and
+    4-player layouts. (Per-region pause menus and their button re-placement were
+    removed; the menu is now drawn on the global stage at native coordinates.)
+[ ] 3- and 4-player layouts generally - the solver is covered by tests but the
+    compositor, HUD routing and player-visibility slack have only seen two players.
+[ ] Watcher secondary views: Room.cs calls UpdateGhostMode/UpdateRotMode on
+    cameras[0] only, so ghost and rot palettes are likely wrong on other views.
+[ ] Secondary-view palettes stay correct through a full day/night cycle and a
+    shelter fade.
+[ ] Two players far apart in Chimney Canopy show their own room's colours; that
+    region's AboveCloudsView/RoofTopView effects were the leak.
+[ ] Watch for "[RoomRealizer] refused to abstractize" in the log - a steady stream
+    of those would mean rooms are being held realized too aggressively.
+[ ] Snow dunes and other sloped terrain render normally on every view, split or merged:
+    no flat lime hill with a dark red top anywhere, and none crossing the divider (it
+    was a Watcher terrain mask mesh drawn raw by the overlay camera). The log must not
+    contain [MaskAudit]. Grass, candles, pearl reader images and urban shadows now get
+    their masks under Dynamic and Static as well: report anything that looks new.
+[ ] Food pips in the Watcher campaign with 2+ players: eaten pips are white, uneaten
+    ones are rings, both on a dark backing disc (they were all dark discs because the
+    backing disc was routed on top of the fill).
+[ ] Dual display: the [Input] line at game start lists a device for player 2 and
+    player 2 moves; both displays keep updating with one camera per frame (Auto). If a
+    display looks frozen, set Camera rendering to "Every frame" and report.
+[ ] Split on a 60 fps machine: [Perf] shows alternate=True while rendered=[0,1], and the
+    water / foliage / terrain masks are right on the second view.
+[ ] Watcher in the ripple layer with 2+ players: every camera keeps following its own
+    player; no run of "[CameraHealth] forcing room resync ... reason=player assignment".
+[ ] A frog attached to a creature next to an activating warp point no longer fills the
+    log with NullReferenceException in Watcher.Frog.ReleaseGrasp, and the room keeps
+    updating.
+[ ] Remix menu: the split style list opens over the two checkboxes, and on the Layout
+    tab the filter list opens over the camera rendering box and that one over the debug
+    checkbox.
+[ ] Dual display pause: the FIRST pause of a session shows the menu on both displays
+    (display 2 used to be frozen: its camera had been left switched off). In the log
+    every pause has "[Pause] ... overlay check" for cam=0 and cam=1 with "IS drawn",
+    and there is no "[CameraHealth] ... stopped rendering".
+[ ] Smoothness with two views (dual displays and split screen): each view should feel
+    like single player. [Perf] shows fpsPerView equal to the game's frame limit and
+    frameLimit at twice that while alternate=True. With vsync on at 60 Hz Auto should
+    say so once and render every camera every frame.
+[ ] Watcher rooms with ripple trees (purple spiral stalks) and two players, on dual displays
+    and on one display: nothing on player 2's view follows the camera or stays behind when
+    the view moves, and both players see the same trees. Log: no IndexOutOfRangeException,
+    no "[HookError] ... DrawSprites threw", and "[Perf]" lines every 10 s while playing
+    (never "paused for the whole window" outside a pause).
+[ ] Dual displays: a steady 60 fps on both. The log has at most one "camera rendering: one
+    camera per frame" try per setup, then "vsync holds the game at 60 fps, so Auto stops
+    trying".
+[ ] Static style, 2-4 players: regions, pans, slides and deaths look as before. One change:
+    the line between two players standing together on one screen now stays solid (it
+    used to fade out when the two pictures lined up).
+[ ] Remix > General: the style list is Adaptive, Static, Classic, and hovering each style in
+    the open list shows its own description. A config that had Dynamic opens as Adaptive.
+[ ] Phase 4, Jolly off (the mod's own co-op): after a player dies the gate still opens
+    for the others wherever the body is (another room, inside the gate); a grab shaken
+    off within a second does not end the game (a grab held for 1.5 s still does); an
+    Artificer's craft or a Gourmand's regurgitation costs the shared food meter instead
+    of coming back.
+[ ] Phase 4, Watcher ripple-egg warp with 2+ players: after the fast-travel screen the
+    split is back at once, and the log has "[CameraMode] ... game resumed after" but no
+    "[CameraHealth]" lines and no "draw loop stalled". Dual displays: display 2 shows the
+    menu while it is up.
+[ ] Phase 4, Classic style: views look as before, with a thin black separator, and stay
+    sharp after a resolution or window size change.
+[ ] Phase 3, Adaptive with 3-4 players: HUD text and thin lines in the quarters look as
+    sharp as the picture, and see-through HUD parts (the map, fades) are no darker than
+    in single player. Remix > General > "HUD drawn onto its view" off must give the old
+    look back; say if the new one looks wrong anywhere.
+[ ] Phase 3: when two players on one screen part, neither view flashes the other's new
+    screen for a frame. A death with 3-4 players: no black behind the sliding views; at
+    game over the last death stays on screen (it used to jump to player 1's view).
+[ ] Phase 3: custom decals (drawn art in modded or Watcher rooms) appear on every view
+    after a split; two players entering a sky room one after the other see the same
+    lighting; the sleep screen and fast-travel maps look like single player.
+[ ] Phase 2, two or more views taking turns (Camera rendering: Auto or Alternate
+    frames): every player's HUD (food, map, warmth, names) updates smoothly and never
+    flickers. If it does, Remix > General > "HUD redraws with its view" off should
+    fix it; say which. Log: "[Perf] ... replayMs= replaysPerFrame=" and
+    "[RoomRealizer] ... shared budget" lines when the group splits and regroups.
+[ ] Stutter after the audit's phase 1: play 2-3 players for a while, including a room
+    full of particles (zero-g specks, fairy particles, gold flakes) with players on
+    different screens. Log: "[Perf] ... gcPerMin= allocMBps=" (lower is better) and
+    "[FrameHitch]" lines, now also for 25-50 ms frames, with gcCollections of that frame.
+[ ] Moon or Pebbles with only player 2 (or 3, 4) in the chamber: player 1's view must
+    stay with player 1, and the log must not fill with AssignCameraToPlayer lines.
+[ ] A death where a creature carries the body through pipes: the dead player's view
+    leaves the layout and nothing hitches while the body travels; no "[CameraMove]"
+    line for the dead player's camera.
+[ ] Map after a gate or a warp, every player: the slugcat, shelter and creature icons
+    sit inside your own view, as before the gate. Watcher campaign with creature sense
+    on: open the map with a box worm or fire sprite in another player's room.
+[ ] Sky rooms (Sky Islands, Outer Expanse) at dusk with two players in the same room on
+    different screens: both views change colour together.
+[ ] Adaptive style (the default; pick it in Remix if yours says Static or Classic).
+    Two players: one view on the same screen; on different screens
+    two halves, full height, that only shift sideways (in short steps) when your own
+    slugcat nears the edge. Walking across a screen boundary together must not split.
+    Merging takes about a second and is a smooth widening; splitting is a smooth
+    narrowing.
+[ ] Adaptive, three and four players: a still grid; each quarter shows your whole
+    screen at half size and never moves while you walk. The grid only changes when
+    everyone reaches one screen (a zoom to one view), when someone dies or is revived
+    (a slide), never because two players met or parted. Three players: the fourth
+    quarter has the map (visited rooms, shelters, everyone's marker) and the shared
+    food/karma/rain. Try Spare quarter = Meters only and Black too.
+    Log: "[CameraLayout] ... adaptive merge|split|reflow|switch" lines, one per event.
+[ ] Snow room with 2+ players on different screens: only the view whose screen has
+    snow shows snow, on terrain and around lights and fog alike.
+[ ] Warps with 2+ players: after arriving, the warp effect and muffled sound end within
+    a few seconds on every view, including when player 2 is the one who triggers it and
+    when player 1 is already in the destination room. Each view keeps following its own
+    player during the warp. Log: every "[Warp] ... started" has a "finished"; a
+    "[Warp] released" warning means vanilla would have stuck there.
+[ ] Warmth meter in a cold region: ten steady circles under the food pips on dual
+    displays and Classic split; under Dynamic and Static each view shows its own
+    player's meter in the bottom left corner of its own cell.
+[ ] Pausing in a big room: if the game crawls while paused, send the log; the
+    [FrameHitch] lines with paused=True now say where the time went.
+[ ] Static style: 2, 3 and 4 players get halves / half over two quarters / quarters from
+    the first frame, stay split when standing together or sharing a shelter, and the
+    screen is handed out again when a player dies and again when they are revived.
+    Log line: [CameraLayout] split style=Static; static=True; neverMerge=True.
+[ ] Dual display pause: both displays show their pause menu over the game, the pointer
+    is on top on display 1, and the HUD is visible in play (the 19:16 build drew the
+    world over all three). Log line to check: [CameraLayout] stage draw order ends in
+    "global HUD, root" and starts with the world stages.
+[ ] Dual display after isolation: both displays draw world and HUD, pause menus show, and
+    [Perf] frame times are lower than before. Send the log: [Pause] lines explain the
+    missing pointer, [FrameHitch] updateMs/grafMs and "prepare ROOM" events explain lag.
+[ ] Dual display: pause shows a menu on both displays; after player 1 dies the menu is
+    still visible; display 2 shows the menus (not a frozen game frame) after sleeping,
+    dying, and after toggling fullscreen; a second monitor of another aspect is
+    letterboxed, not stretched.
+
+Build notes
+-----------
+The .NET Framework 4.8.1 Developer Pack is installed and both csproj files target
+v4.8.1, so MSBuild/Visual Studio build normally. Pass /p:RainWorldPath so the
+references resolve from the actual Steam folder (the hard-coded HintPaths point at
+a drive that does not exist here). Mod/plugins/SplitScreen Co-op.dll is the
+post-build copy of bin\Release.
 
 Release validation
 ------------------

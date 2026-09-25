@@ -13,6 +13,12 @@ namespace SplitScreenCoop
         /// </summary>
         public Vector2 DialogBox_DrawPos(On.HUD.DialogBox.orig_DrawPos orig, HUD.DialogBox self, float timeStacker)
         {
+            if (dynamicStyle && !dualDisplays)
+            {
+                // The native HUD texture is translated to the region centroid by
+                // DrawDynamicHud; shifting this twice would push dialog off-screen.
+                return orig(self, timeStacker);
+            }
             if (CurrentSplitMode == SplitMode.SplitVertical)
             {
                 return orig(self, timeStacker) - new Vector2(self.hud.rainWorld.screenSize.x / 4f, 0f);
@@ -25,6 +31,33 @@ namespace SplitScreenCoop
         /// </summary>
         public void VirtualMicrophone_DrawUpdate(On.VirtualMicrophone.orig_DrawUpdate orig, VirtualMicrophone self, float timeStacker, float timeSpeed)
         {
+            if (dynamicStyle && !dualDisplays)
+            {
+                var view = DynamicViewportForCamera(self.camera.cameraNumber);
+                // A camera whose player is dead, or which has no live cell on screen,
+                // must not contribute a point of view to the mix. The dead-player
+                // test does not depend on the layout, so it holds during layout
+                // transitions and game over too. VirtualMicrophone.Update rebuilds
+                // volumeGroups every tick, so zeroing them here is per frame only.
+                AbstractCreature followed = self.camera.followAbstractCreature;
+                bool followerDead = followed == null || IsCreatureDead(followed);
+                bool noLiveCell = dynamicActive && (view == null || view.ghost);
+                if (followerDead || noLiveCell)
+                {
+                    for (int g = 0; g < self.volumeGroups.Length; g++) self.volumeGroups[g] = 0f;
+                }
+                else if (view?.sharesImageWith >= 0)
+                {
+                    RoomCamera source = CameraByNumber(self.camera.game, view.sharesImageWith);
+                    if (source?.virtualMicrophone is VirtualMicrophone other)
+                        self.volumeGroups[0] *= Mathf.InverseLerp(100f, 1000f,
+                            (self.listenerPoint - other.listenerPoint).magnitude);
+                    self.volumeGroups[1] = 0f;
+                    self.volumeGroups[2] = 0f;
+                }
+                orig(self, timeStacker, timeSpeed);
+                return;
+            }
             if (self.camera.cameraNumber > 0 && self.camera.room == self.camera.game.cameras[0].room)
             {
                 if (self.camera.game.cameras[0].virtualMicrophone is VirtualMicrophone other)
@@ -46,7 +79,20 @@ namespace SplitScreenCoop
         {
             orig(self, manager, game);
 
-            if (CurrentSplitMode != SplitMode.NoSplit && renderedCameraNumbers.Count > 1 && !inpause)
+            if (dynamicStyle && !dualDisplays && dynamicLayout != null)
+            {
+                // One pause menu for the whole screen. A per-region copy is drawn
+                // inside that region's HUD texture, which the compositor translates,
+                // so what you see is not where Futile thinks the button is and the
+                // pointer cannot reach it. The global stage is drawn over the
+                // finished composite at native coordinates, so the mouse lines up.
+                MovePauseMenuGlobal(self);
+                return;
+            }
+
+            // Dual displays never leave NoSplit but render two cameras, and each
+            // display needs its own menu; the per-slot offsets are zero there.
+            if ((CurrentSplitMode != SplitMode.NoSplit || dualDisplays) && renderedCameraNumbers.Count > 1 && !inpause)
             {
                 inpause = true;
                 try
@@ -75,6 +121,28 @@ namespace SplitScreenCoop
                     inpause = false;
                 }
             }
+            else if (!(dynamicStyle && !dualDisplays) && renderedCameraNumbers.Count > 0 && !inpause)
+            {
+                // One rendered camera in classic or dual mode. The menu is built at
+                // the world origin, which only camera 0 looks at; when camera 0's
+                // player is dead the survivor's camera renders and the menu was
+                // invisible on every screen.
+                self.container.SetPosition(camOffsets[renderedCameraNumbers[0]]);
+            }
+            // After the menus are placed, and not for the extra menus built above.
+            if (dualDisplays && !inpause) LogPauseDiagnostics(self, "pause menu opened");
+            if (!inpause) ArmPauseOverlayCheck(); // measures, 0.8 s from now, whether each view really got the menu
+        }
+
+        public void PauseMenu_GrafUpdate(On.Menu.PauseMenu.orig_GrafUpdate orig,
+            Menu.PauseMenu self, float timeStacker)
+        {
+            // A pause menu built before the first layout solve, or one left behind by
+            // an earlier session, can still be parented to a per-view HUD stage.
+            if (dynamicStyle && !dualDisplays && globalHudStage != null &&
+                self?.container != null && self.container.container != globalHudStage)
+                MovePauseMenuGlobal(self);
+            orig(self, timeStacker);
         }
 
         private static Vector2 PauseOffsetForSlot(SplitMode mode, int slot, Vector2 screenSize)
@@ -103,6 +171,7 @@ namespace SplitScreenCoop
         /// </summary>
         public void PauseMenu_ShutDownProcess(On.Menu.PauseMenu.orig_ShutDownProcess orig, Menu.PauseMenu self)
         {
+            if (dualDisplays && !inpause) LogPauseDiagnostics(self, "pause menu closing");
             orig(self);
             if (CurrentSplitMode != SplitMode.NoSplit)
             {
@@ -112,7 +181,9 @@ namespace SplitScreenCoop
                     if (roomCamera != null) SetCameraZoom(roomCamera, oldCameraZoom[cameraNumber]);
                 }
             }
-            var otherpause = self.manager?.sideProcesses?.FirstOrDefault(t => t is Menu.PauseMenu);
+            // Only ever stop a *different* pause menu. Dynamic mode builds one shared
+            // menu, and matching self here would shut this one down a second time.
+            var otherpause = self.manager?.sideProcesses?.FirstOrDefault(t => t is Menu.PauseMenu && t != self);
             if (otherpause != null) self.manager.StopSideProcess(otherpause); // removes from sideprocesses list so this isnt a recursive loop
         }
 
@@ -123,6 +194,8 @@ namespace SplitScreenCoop
         {
             orig(self, player);
             AssignCameraToPlayer(self, player);
+            MoveCameraHudToOverlay(self);
+            MovePlayerNamesToWorld(self);
         }
 
         public delegate bool delget_ShouldBeCulled(GraphicsModule gm);
@@ -136,6 +209,8 @@ namespace SplitScreenCoop
                 bool result = orig(gm);
                 for (int i = 1; i < gm.owner.room.game.cameras.Length; i++)
                 {
+                    if (dynamicActive && !renderedCameraNumbers.Contains(gm.owner.room.game.cameras[i].cameraNumber))
+                        continue;
                     result = result &&
                     !gm.owner.room.game.cameras[i].PositionCurrentlyVisible(gm.owner.firstChunk.pos, gm.cullRange + ((!gm.culled) ? 100f : 0f), true) &&
                     !gm.owner.room.game.cameras[i].PositionVisibleInNextScreen(gm.owner.firstChunk.pos, (!gm.culled) ? 100f : 50f, true);
@@ -151,7 +226,9 @@ namespace SplitScreenCoop
         public void Water_InitiateSprites(On.Water.orig_InitiateSprites orig, Water self, RoomCamera.SpriteLeaser sLeaser, RoomCamera rCam)
         {
             orig(self, sLeaser, rCam);
-            if (CurrentSplitMode != SplitMode.NoSplit)
+            // Every mode with a second camera, dual displays included (they stay in
+            // NoSplit while rendering two cameras).
+            if (rCam.game?.cameras?.Length > 1)
             {
                 var camPos = rCam.pos + rCam.offset;
                 float y = -10f;
@@ -197,10 +274,7 @@ namespace SplitScreenCoop
                 // was A && !B
                 // becomes (A || A2) && !B
                 // b param here is A
-                c.EmitDelegate<Func<bool, ShortcutHandler, int, bool>>((b, sc, k) =>
-                {
-                    return b || sc.game.cameras.Any(c=> sc.betweenRoomsWaitingLobby[k].creature.abstractCreature.FollowedByCamera(c.cameraNumber));
-                });
+                c.EmitDelegate<Func<bool, ShortcutHandler, int, bool>>(FollowedByLivingPlayersCamera);
             }
             else Logger.LogError(new Exception("Couldn't IL-hook ShortcutHandler_Update part 1 FollowedByCamera from SplitScreenMod")); // deffendisve progrmanig
 
@@ -212,8 +286,7 @@ namespace SplitScreenCoop
                 c.Remove();
                 c.EmitDelegate<Action<World, AbstractRoom>>((w, r) =>
                 {
-                    w.ActivateRoom(r);
-                    if (w?.game?.roomRealizer is RoomRealizer rr) rr.AddNewTrackedRoom(r, true);
+                    TrackShortcutDestination(w, r);
                 });
             }
             else Logger.LogError(new Exception("Couldn't IL-hook ShortcutHandler_Update part 2 AddNewTrackedRoom from SplitScreenMod")); // deffendisve progrmanig
@@ -247,6 +320,28 @@ namespace SplitScreenCoop
         }
 
         /// <summary>
+        /// Whether a creature waiting to leave a pipe into an unrealized room is followed by
+        /// a camera, so the room is realized for it (vanilla asks camera 0 only). With a
+        /// camera per player, a dead player's camera does not count: it follows the corpse,
+        /// and "followed" includes whatever carries it, so a predator dragging the body
+        /// realized every room on its way for a view nobody sees.
+        /// </summary>
+        private static bool FollowedByLivingPlayersCamera(bool followedByCameraZero, ShortcutHandler handler, int index)
+        {
+            RainWorldGame game = handler?.game;
+            if (game?.cameras == null || game.cameras.Length < 2) return followedByCameraZero;
+            AbstractCreature creature = handler.betweenRoomsWaitingLobby[index].creature.abstractCreature;
+            for (int i = 0; i < game.cameras.Length; i++)
+            {
+                RoomCamera camera = game.cameras[i];
+                if (camera == null) continue;
+                bool followed = camera.cameraNumber == 0 ? followedByCameraZero : creature.FollowedByCamera(camera.cameraNumber);
+                if (followed && !CameraOwnerDead(game, camera.cameraNumber)) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
         /// activating a room should add it to the tracked active rooms
         /// </summary>
         public void ShortcutHandler_SuckInCreature(ILContext il)
@@ -260,8 +355,7 @@ namespace SplitScreenCoop
                 c.Remove();
                 c.EmitDelegate<Action<World, AbstractRoom>>((w, r) =>
                 {
-                    w.ActivateRoom(r);
-                    if (w?.game?.roomRealizer is RoomRealizer rr) rr.AddNewTrackedRoom(r, true);
+                    TrackShortcutDestination(w, r);
                 });
             }
             else Logger.LogError(new Exception("Couldn't IL-hook ShortcutHandler_SuckInCreature AddNewTrackedRoom from SplitScreenMod")); // deffendisve progrmanig
@@ -330,6 +424,9 @@ namespace SplitScreenCoop
                 c.Emit(OpCodes.Ldarg_0);
                 c.EmitDelegate<Action<RoomCamera>>((rc) =>
                 {
+                    // Dynamic style keeps the vanilla camera: it stays on its prebaked
+                    // screen and the compositor pans the rendered image instead.
+                    if (dynamicStyle && !dualDisplays) return;
                     if (cameraZoomed[rc.cameraNumber])
                         return;
                     if (CurrentSplitMode == SplitMode.SplitHorizontal)
@@ -399,6 +496,7 @@ namespace SplitScreenCoop
                     c.Emit(OpCodes.Ldarg_0); // RoomCamera
                     c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                     {
+                        if (dynamicStyle && !dualDisplays) return v;
                         if ((CurrentSplitMode == SplitMode.SplitVertical || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                         {
                             return v - rc.sSize.x / 4f;
@@ -411,6 +509,7 @@ namespace SplitScreenCoop
                     c.Emit(OpCodes.Ldarg_0); // RoomCamera
                     c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                     {
+                        if (dynamicStyle && !dualDisplays) return v;
                         if ((CurrentSplitMode == SplitMode.SplitVertical || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                         {
                             return v + rc.sSize.x / 4f;
@@ -423,6 +522,7 @@ namespace SplitScreenCoop
                     c.Emit(OpCodes.Ldarg_0); // RoomCamera
                     c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                     {
+                        if (dynamicStyle && !dualDisplays) return v;
                         if ((CurrentSplitMode == SplitMode.SplitHorizontal || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                         {
                             return v - rc.sSize.y / 4f;
@@ -436,6 +536,7 @@ namespace SplitScreenCoop
                     c.Emit(OpCodes.Ldarg_0); // RoomCamera
                     c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                     {
+                        if (dynamicStyle && !dualDisplays) return v;
                         if ((CurrentSplitMode == SplitMode.SplitHorizontal || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                         {
                             return v + rc.sSize.y / 4f;
@@ -501,6 +602,7 @@ namespace SplitScreenCoop
                         c.Emit(OpCodes.Ldarg_0); // RoomCamera
                         c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                         {
+                            if (dynamicStyle && !dualDisplays) return v;
                             if ((CurrentSplitMode == SplitMode.SplitVertical || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                             {
                                 return v - rc.sSize.x / 4f;
@@ -513,6 +615,7 @@ namespace SplitScreenCoop
                         c.Emit(OpCodes.Ldarg_0); // RoomCamera
                         c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                         {
+                            if (dynamicStyle && !dualDisplays) return v;
                             if ((CurrentSplitMode == SplitMode.SplitVertical || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                             {
                                 return v + rc.sSize.x / 4f;
@@ -525,6 +628,7 @@ namespace SplitScreenCoop
                         c.Emit(OpCodes.Ldarg_0); // RoomCamera
                         c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                         {
+                            if (dynamicStyle && !dualDisplays) return v;
                             if ((CurrentSplitMode == SplitMode.SplitHorizontal || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                             {
                                 return v - rc.sSize.y / 4f;
@@ -538,6 +642,7 @@ namespace SplitScreenCoop
                         c.Emit(OpCodes.Ldarg_0); // RoomCamera
                         c.EmitDelegate<Func<float, RoomCamera, float>>((v, rc) =>
                         {
+                            if (dynamicStyle && !dualDisplays) return v;
                             if ((CurrentSplitMode == SplitMode.SplitHorizontal || IsGridSplit(CurrentSplitMode)) && !cameraZoomed[rc.cameraNumber])
                             {
                                 return v + rc.sSize.y / 4f;

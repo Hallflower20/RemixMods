@@ -11,10 +11,34 @@ namespace SplitScreenCoop
 {
     public partial class SplitScreenCoop
     {
+        /// <summary>
+        /// Vanilla bug, not ours, but it ruined a session (log of 2026-09-18: 1201
+        /// exceptions, one per tick, until the game was closed). Frog.ReleaseGrasp reads
+        /// base.grasps[grasp].grabbed without checking the slot, and
+        /// Creature.LoseAllGrasps calls ReleaseGrasp for every slot, empty ones included.
+        /// A frog that is attached to a creature (FrogState.creatureAttachedTo) but holds
+        /// nothing in that slot therefore throws whenever anything makes it lose its
+        /// grasps. An activating warp point does that every tick from
+        /// WarpPoint.SuckInCreatures; the exception aborts Room.Update, so the whole room
+        /// stops updating. Creature.ReleaseGrasp does nothing for an empty slot, and
+        /// neither does this.
+        /// </summary>
+        private void Frog_ReleaseGrasp(On.Watcher.Frog.orig_ReleaseGrasp orig, Watcher.Frog self, int grasp)
+        {
+            if (self?.grasps == null || grasp < 0 || grasp >= self.grasps.Length || self.grasps[grasp] == null) return;
+            orig(self, grasp);
+        }
+
         public delegate AbstractCreature orig_get_FirstAlivePlayer(RainWorldGame self);
         public AbstractCreature get_FirstAlivePlayer(orig_get_FirstAlivePlayer orig, RainWorldGame self)
         {
-            if (selfSufficientCoop) return self.session.Players.FirstOrDefault(p => !PlayerDeadOrMissing(p)) ?? orig(self); // null bad lmao
+            if (selfSufficientCoop)
+            {
+                // Player.Update asks this per player per tick: a loop, not a LINQ closure.
+                foreach (AbstractCreature p in self.session.Players)
+                    if (!PlayerDeadOrMissing(p)) return p;
+                return orig(self); // null bad lmao
+            }
             return orig(self);
         }
 
@@ -107,14 +131,50 @@ namespace SplitScreenCoop
         }
 
 
+        // Without Jolly the gate asks every player, corpses included, in these three
+        // checks (Jolly asks PlayersToProgressOrWin). A dead player in another room made
+        // the zone -1 whenever it came after a living one in the player list, an
+        // abstracted corpse never "stands still", and a corpse in the airlock is never
+        // "through to the other side": each held the gate shut for the rest of the
+        // cycle. Only the players still in play count here, with vanilla's rules.
         private int RegionGate_PlayersInZone(On.RegionGate.orig_PlayersInZone orig, RegionGate self)
         {
-            if (selfSufficientCoop)
+            if (!selfSufficientCoop || self.room == null) return orig(self);
+            int zone = -1;
+            bool anyone = false;
+            foreach (AbstractCreature p in self.room.game.Players)
             {
-                // vanilla logic was just wrong alltogether?
-                if (self.room.game.Players.Any(p => (!PlayerDeadOrMissing(p) && p.Room != self.room.abstractRoom))) return -1;
+                if (PlayerDeadOrMissing(p)) continue;
+                int own = self.DetectZone(p);
+                // All in one zone, as vanilla asks; one of them outside the gate room means none.
+                if (own < 0 || (anyone && own != zone)) return -1;
+                zone = own;
+                anyone = true;
             }
-            return orig(self);
+            return zone;
+        }
+
+        private bool RegionGate_PlayersStandingStill(On.RegionGate.orig_PlayersStandingStill orig, RegionGate self)
+        {
+            if (!selfSufficientCoop || self.room == null) return orig(self);
+            foreach (AbstractCreature p in self.room.game.Players)
+            {
+                if (PlayerDeadOrMissing(p)) continue;
+                if (!(p.realizedCreature is Player player) || player.touchedNoInputCounter < 20) return false;
+            }
+            return true;
+        }
+
+        private bool RegionGate_AllPlayersThroughToOtherSide(On.RegionGate.orig_AllPlayersThroughToOtherSide orig, RegionGate self)
+        {
+            if (!selfSufficientCoop || self.room == null) return orig(self);
+            int middle = self.room.TileWidth / 2;
+            foreach (AbstractCreature p in self.room.game.Players)
+            {
+                if (PlayerDeadOrMissing(p) || p.pos.room != self.room.abstractRoom.index) continue;
+                if (self.letThroughDir ? p.pos.x < middle + 3 : p.pos.x > middle - 4) return false;
+            }
+            return true;
         }
 
 
@@ -123,6 +183,8 @@ namespace SplitScreenCoop
             if (self is Player pl && selfSufficientCoop && !pl.isNPC && carriedByOther) pl.Die();
             orig(self, carriedByOther);
         }
+
+        private readonly List<AbstractCreature> gatePlayersScratch = new List<AbstractCreature>(4);
 
         // vanilla assumes players[0].realizedcreature not null
         private void RegionGate_get_MeetRequirement(ILContext il)
@@ -142,7 +204,11 @@ namespace SplitScreenCoop
                 {
                     if (selfSufficientCoop)
                     {
-                        return players.Where(p => (!PlayerDeadOrMissing(p))).ToList();
+                        // Read at once by the getter; one list reused instead of one per call.
+                        gatePlayersScratch.Clear();
+                        foreach (AbstractCreature p in players)
+                            if (!PlayerDeadOrMissing(p)) gatePlayersScratch.Add(p);
+                        return gatePlayersScratch;
                     }
                     return players;
                 });
